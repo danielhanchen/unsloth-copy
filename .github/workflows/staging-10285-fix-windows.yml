@@ -93,7 +93,7 @@ jobs:
         timeout-minutes: 25
         continue-on-error: true
         run: |
-          python -m pytest -q -v --tb=line -o faulthandler_timeout=180 -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > shared_out.txt 2>&1
+          python -m pytest -v --tb=short --durations=25 -o faulthandler_timeout=300 -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > shared_out.txt 2>&1
           Select-String -Path shared_out.txt -Pattern '^(FAILED|ERROR)|passed|failed' | ForEach-Object { 'PR10285_SHARED ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
       - name: Shared suites tail (also after a timeout)
         if: always()

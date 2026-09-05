@@ -121,6 +121,7 @@ def escape() -> int:
             """
         )
     out = tools._bash_exec(term, session_id = "pr10285-escape", timeout = 90)
+    print("PR10285_ESC_RAW " + json.dumps(str(out)[:1500]), flush = True)
     for line in str(out).splitlines():
         if "PR10285_ESC" in line or "Execution error" in line or "Blocked" in line:
             print(line.strip()[:400], flush = True)
