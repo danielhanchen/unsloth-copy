@@ -231,7 +231,7 @@ def network_allowlist() -> int:
         direct = "python -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5); print('PR10285_NET direct=CONNECTED')\" 2>&1 | findstr /i \"PR10285 error\""
         envs = "set | findstr /i PROXY"
     else:
-        fetch = "python3 -c \"import urllib.request; print('PR10285_NET pypi=' + str(urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=30).status))\""
+        fetch = "python3 -c \"import urllib.request; print('PR10285_NET pypi=' + str(urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=30).status))\" 2>&1 | tail -1 | sed 's/^/PR10285_NET fetch=/'; curl -sS -o /dev/null -w 'PR10285_NET curl=%{http_code}\\n' https://pypi.org/simple/pip/ 2>&1 | tail -1; python3 -c \"import ssl,os; p=ssl.get_default_verify_paths(); print('PR10285_NET ssl=', p.cafile, os.path.exists(p.cafile or ''), p.capath, os.path.isdir(p.capath or ''))\""
         denied = "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com/', timeout=15)\" 2>&1 | tail -1 | sed 's/^/PR10285_NET denied=/'"
         direct = "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5); print('CONNECTED')\" 2>&1 | tail -1 | sed 's/^/PR10285_NET direct=/'"
         envs = "env | grep -i proxy | sed -E 's#//[^@]*@#//<cred>@#' | sed 's/^/PR10285_NET env=/'"
@@ -248,6 +248,7 @@ def network_allowlist() -> int:
     for line in str(out).splitlines():
         if "PR10285_NET" in line or "[network]" in line or "Execution error" in line:
             print(line.strip()[:300], flush = True)
+    print("PR10285_NET_RAW " + json.dumps(str(out)[:2500]), flush = True)
     for record in records:
         d = record.as_dict() if hasattr(record, "as_dict") else dict(record)
         print("PR10285_NET_RECORD " + json.dumps({k: d.get(k) for k in ("backend", "profile_id", "network_policy", "network_allowlist")})[:400], flush = True)
