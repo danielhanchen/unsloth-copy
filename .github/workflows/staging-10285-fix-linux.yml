@@ -97,6 +97,9 @@ jobs:
       - name: Python tool escape probe
         working-directory: studio/backend
         run: python /tmp/pr10285_probe.py python-escape
+      - name: Network allowlist probe (proxy inside the sandbox)
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py network-allowlist || true
       - name: IPv6 disabled on the host, then probe
         working-directory: studio/backend
         run: |

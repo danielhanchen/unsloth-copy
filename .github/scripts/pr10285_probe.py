@@ -205,6 +205,125 @@ def limited_survivor() -> int:
     return 0
 
 
+def _record_collector():
+    records = []
+    return records, records.append
+
+
+def network_allowlist() -> int:
+    """Required mode with the allowlist proxy: approved host reachable, others refused."""
+    _bootstrap()
+    from core.inference import tools
+    from core.inference.os_sandbox import capability_snapshot
+
+    c = capability_snapshot(force = True)
+    policies = list(getattr(c, "network_policies", ()) or ())
+    print("PR10285_NET_CAP " + json.dumps({
+        "protection_state": c.protection_state, "network_policies": policies,
+        "allowlist": list(getattr(c, "network_allowlist", ()) or ())[:6],
+    }), flush = True)
+    if "allowlist" not in policies:
+        print("PR10285_NET " + json.dumps({"skipped": "allowlist not offered here"}), flush = True)
+        return 0
+    if sys.platform == "win32":
+        fetch = "python -c \"import urllib.request; print('PR10285_NET pypi=' + str(urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=30).status))\""
+        denied = "python -c \"import urllib.request; urllib.request.urlopen('https://example.com/', timeout=15)\" 2>&1 | findstr /i \"403 error\""
+        direct = "python -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5); print('PR10285_NET direct=CONNECTED')\" 2>&1 | findstr /i \"PR10285 error\""
+        envs = "set | findstr /i PROXY"
+    else:
+        fetch = "python3 -c \"import urllib.request; print('PR10285_NET pypi=' + str(urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=30).status))\""
+        denied = "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com/', timeout=15)\" 2>&1 | tail -1 | sed 's/^/PR10285_NET denied=/'"
+        direct = "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5); print('CONNECTED')\" 2>&1 | tail -1 | sed 's/^/PR10285_NET direct=/'"
+        envs = "env | grep -i proxy | sed -E 's#//[^@]*@#//<cred>@#' | sed 's/^/PR10285_NET env=/'"
+    script = "\n".join([fetch, denied, direct, envs])
+    records, collect = _record_collector()
+    try:
+        out = tools._bash_exec(
+            script, session_id = "pr10285-net", timeout = 120,
+            network_policy = "allowlist", launch_record_callback = collect,
+        )
+    except TypeError as exc:
+        print("PR10285_NET " + json.dumps({"skipped": f"signature: {exc}"[:200]}), flush = True)
+        return 0
+    for line in str(out).splitlines():
+        if "PR10285_NET" in line or "[network]" in line or "Execution error" in line:
+            print(line.strip()[:300], flush = True)
+    for record in records:
+        d = record.as_dict() if hasattr(record, "as_dict") else dict(record)
+        print("PR10285_NET_RECORD " + json.dumps({k: d.get(k) for k in ("backend", "profile_id", "network_policy", "network_allowlist")})[:400], flush = True)
+    # Deny policy: the same fetch must fail.
+    out2 = tools._bash_exec(fetch, session_id = "pr10285-net-deny", timeout = 60, network_policy = "deny")
+    print("PR10285_NET_DENY " + json.dumps(str(out2)[-200:]), flush = True)
+    return 0
+
+
+def limited_token() -> int:
+    """Windows Limited mode under the restricted token: reads stay, writes are fenced."""
+    _bootstrap()
+    from core.inference import tools, tool_isolation
+    from core.inference.os_sandbox import capability_snapshot
+
+    c = capability_snapshot(force = True)
+    print("PR10285_LT_CAP " + json.dumps({
+        "limited_backend": getattr(c, "limited_backend", None),
+        "limited_profile_id": getattr(c, "limited_profile_id", None),
+        "limited_limitations": list(getattr(c, "limited_limitations", ()) or ()),
+        "available": c.available,
+    }), flush = True)
+    if c.available:
+        print("PR10285_LT " + json.dumps({"note": "OS isolation available; Limited grants require unavailable capability"}), flush = True)
+        return 0
+    ui = "pr10285-ui-lt"
+    grant = tool_isolation._LIMITED_GRANTS.issue(current_subject = "pr10285", tool_ui_session_id = ui, probe_generation = c.probe_generation)
+    common = dict(tool_execution_mode = "limited", limited_grant = grant.token, current_subject = "pr10285", tool_ui_session_id = ui)
+    records, collect = _record_collector()
+    secret = os.path.join(os.path.expanduser("~"), "pr10285-secret.txt")
+    with open(secret, "w") as fh:
+        fh.write("SECRET")
+    code = f"""
+import os, multiprocessing.connection as mc, subprocess, sys
+r = {{}}
+r['read_profile'] = open({secret!r}).read()
+try:
+    open({secret!r}, 'a').write('x'); r['write_profile'] = 'WRITTEN'
+except PermissionError: r['write_profile'] = 'denied'
+try:
+    os.remove({secret!r}); r['delete_profile'] = 'DELETED'
+except PermissionError: r['delete_profile'] = 'denied'
+open('ok.txt', 'w').write('x'); r['write_workdir'] = 'ok'
+open(os.devnull, 'rb').close(); r['devnull'] = 'ok'
+a, b = mc.Pipe(); a.close(); b.close(); r['pipe'] = 'ok'
+try:
+    open(os.path.join(os.environ['SystemRoot'], 'Temp', 'pr10285.txt'), 'w').write('x'); r['write_windows_temp'] = 'WRITTEN'
+except PermissionError: r['write_windows_temp'] = 'denied'
+r['git'] = subprocess.run(['git', '--version'], capture_output=True, text=True).stdout.strip()[:40]
+try:
+    import torch; r['torch'] = torch.__version__
+except Exception as e: r['torch'] = 'no: ' + type(e).__name__
+print('PR10285_LT ' + repr(r))
+"""
+    try:
+        out = tools._python_exec(code, session_id = "pr10285-lt", timeout = 180, launch_record_callback = collect, **common)
+    except TypeError as exc:
+        print("PR10285_LT " + json.dumps({"skipped": f"signature: {exc}"[:200]}), flush = True)
+        return 0
+    for line in str(out).splitlines():
+        if "PR10285_LT" in line or "Execution error" in line:
+            print(line.strip()[:600], flush = True)
+    out2 = tools._bash_exec("echo PR10285_LT bash=ok && git --version", session_id = "pr10285-lt2", timeout = 60, launch_record_callback = collect, **common)
+    for line in str(out2).splitlines():
+        if "PR10285_LT" in line or "git version" in line or "Execution error" in line:
+            print(("PR10285_LT " + line.strip())[:300], flush = True)
+    for record in records:
+        d = record.as_dict() if hasattr(record, "as_dict") else dict(record)
+        print("PR10285_LT_RECORD " + json.dumps({k: d.get(k) for k in ("backend", "profile_id", "os_isolation", "limitations")})[:400], flush = True)
+    try:
+        os.remove(secret)
+    except OSError:
+        pass
+    return 0
+
+
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "capability"
     label = "default"
@@ -218,6 +337,10 @@ def main() -> int:
         return python_escape()
     if cmd == "limited-survivor":
         return limited_survivor()
+    if cmd == "network-allowlist":
+        return network_allowlist()
+    if cmd == "limited-token":
+        return limited_token()
     print(f"unknown command {cmd}")
     return 2
 
