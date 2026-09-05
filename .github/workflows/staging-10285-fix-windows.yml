@@ -94,9 +94,7 @@ jobs:
         continue-on-error: true
       - name: Limited mode under the restricted token
         working-directory: studio/backend
-        run: |
-          $env:UNSLOTH_STUDIO_FORCE_OS_ISOLATION_UNAVAILABLE = "1"
-          python "$env:RUNNER_TEMP\pr10285_probe.py" limited-token
+        run: python "$env:RUNNER_TEMP\pr10285_probe.py" limited-token
         continue-on-error: true
       - name: Shared suites (existing tests at both refs)
         working-directory: studio/backend

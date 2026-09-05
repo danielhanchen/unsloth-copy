@@ -263,16 +263,24 @@ def limited_token() -> int:
     from core.inference import tools, tool_isolation
     from core.inference.os_sandbox import capability_snapshot
 
-    c = capability_snapshot(force = True)
+    from dataclasses import replace
+    from core.inference import os_sandbox
+    real = capability_snapshot(force = True)
     print("PR10285_LT_CAP " + json.dumps({
-        "limited_backend": getattr(c, "limited_backend", None),
-        "limited_profile_id": getattr(c, "limited_profile_id", None),
-        "limited_limitations": list(getattr(c, "limited_limitations", ()) or ()),
-        "available": c.available,
+        "limited_backend": getattr(real, "limited_backend", None),
+        "limited_profile_id": getattr(real, "limited_profile_id", None),
+        "limited_limitations": list(getattr(real, "limited_limitations", ()) or ()),
+        "available": real.available,
     }), flush = True)
-    if c.available:
-        print("PR10285_LT " + json.dumps({"note": "OS isolation available; Limited grants require unavailable capability"}), flush = True)
-        return 0
+    # Hosted runners qualify the AppContainer, and Limited is only offered where OS
+    # isolation is unavailable; present the capability as unavailable in-process so the
+    # Limited path (restricted token) can be exercised on this host.
+    c = replace(real, available = False, qualified = False, protection_state = "unavailable",
+                reason = "staging probe: forced unavailable to exercise Limited")
+    os_sandbox.capability_snapshot = lambda *a, **k: c
+    tool_isolation.capability_snapshot = lambda *a, **k: tool_isolation.ToolIsolationCapability(**{
+        f: getattr(c, f, None) for f in tool_isolation.ToolIsolationCapability.__dataclass_fields__
+    }) if hasattr(tool_isolation, "ToolIsolationCapability") else c
     ui = "pr10285-ui-lt"
     grant = tool_isolation._LIMITED_GRANTS.issue(current_subject = "pr10285", tool_ui_session_id = ui, probe_generation = c.probe_generation)
     common = dict(tool_execution_mode = "limited", limited_grant = grant.token, current_subject = "pr10285", tool_ui_session_id = ui)
