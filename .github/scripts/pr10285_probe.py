@@ -237,6 +237,11 @@ def network_allowlist() -> int:
         envs = "env | grep -i proxy | sed -E 's#//[^@]*@#//<cred>@#' | sed 's/^/PR10285_NET env=/'"
     if sys.platform != "win32":
         fetch += "; git --version 2>&1 | tail -1 | sed 's/^/PR10285_NET gitver=/'"
+    if sys.platform == "darwin":
+        fetch += ("; echo \"PR10285_NET devdir=$DEVELOPER_DIR\"; ls -la /var/db/xcode_select_link 2>&1 | tail -1 | sed 's/^/PR10285_NET xclink=/'"
+                  "; xcode-select -p 2>&1 | tail -1 | sed 's/^/PR10285_NET xcsel=/'"
+                  "; \"$DEVELOPER_DIR/usr/bin/git\" --version 2>&1 | tail -1 | sed 's/^/PR10285_NET devgit=/'"
+                  "; ls \"$DEVELOPER_DIR/usr/bin/git\" 2>&1 | tail -1 | sed 's/^/PR10285_NET devgitls=/'")
     script = "\n".join([fetch, denied, direct, envs])
     # Host-side reference outside any sandbox: does this interpreter verify TLS at all?
     import subprocess as _sp
