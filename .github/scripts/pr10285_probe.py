@@ -235,7 +235,13 @@ def network_allowlist() -> int:
         denied = "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com/', timeout=15)\" 2>&1 | tail -1 | sed 's/^/PR10285_NET denied=/'"
         direct = "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=5); print('CONNECTED')\" 2>&1 | tail -1 | sed 's/^/PR10285_NET direct=/'"
         envs = "env | grep -i proxy | sed -E 's#//[^@]*@#//<cred>@#' | sed 's/^/PR10285_NET env=/'"
+    if sys.platform != "win32":
+        fetch += "; git --version 2>&1 | tail -1 | sed 's/^/PR10285_NET gitver=/'"
     script = "\n".join([fetch, denied, direct, envs])
+    # Host-side reference outside any sandbox: does this interpreter verify TLS at all?
+    import subprocess as _sp
+    _host = _sp.run([sys.executable, "-c", "import ssl, urllib.request\np = ssl.get_default_verify_paths()\nprint('raw', p.openssl_cafile, p.openssl_capath, p.cafile, p.capath)\ntry:\n    import certifi; print('certifi', certifi.where())\nexcept Exception as e:\n    print('certifi', 'missing', e)\ntry:\n    print('host_fetch', urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=30).status)\nexcept Exception as e:\n    print('host_fetch', str(e)[:160])"], capture_output = True, text = True, timeout = 90)
+    print("PR10285_NET_HOST " + json.dumps((_host.stdout + _host.stderr)[-600:]), flush = True)
     records, collect = _record_collector()
     try:
         out = tools._bash_exec(
