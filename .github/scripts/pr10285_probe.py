@@ -270,45 +270,64 @@ def network_allowlist() -> int:
 
 
 def cmd_diag() -> int:
-    """Why does cmd inside the AppContainer say "Access is denied" for the batch file?
+    """Why does the isolated Terminal say "Access is denied" for its batch file?
 
-    A .cmd is created in the workdir the way tools._bash_exec does (mkstemp, before the
-    launch grants the package SID on the workdir); the Python tool then reads and runs it
-    inside the sandbox by relative and absolute path and prints the ACL it sees.
+    Everything runs host-side (the Python tool's blocklist refuses subprocess and
+    icacls): the same .cmd file the Terminal writes is created in the workdir and
+    launched through prepare_tool_launch in several shapes, and the tool path is
+    exercised directly.
     """
-    import tempfile
     _bootstrap()
+    import subprocess as sp
+    import tempfile
     from core.inference import tools
+    from core.inference import os_sandbox
+
     workdir = tools._get_workdir("pr10285-cmddiag")
     fd, path = tempfile.mkstemp(suffix = ".cmd", prefix = "studio_exec_", dir = workdir)
     with os.fdopen(fd, "w", encoding = "utf-8", newline = "") as handle:
-        handle.write("@echo off\r\necho PR10285_CMD ran_from_batch\r\n")
+        handle.write("@echo off\r\necho PR10285_CMD ran_from_batch\r\necho PR10285_CMD temp=%TEMP%\r\n")
     base = os.path.basename(path)
-    code = f"""
-import os, subprocess, sys
-out = {{}}
-p = {path!r}; b = {base!r}
-try:
-    out['read'] = open(p, 'rb').read()[:12]
-except Exception as e:
-    out['read'] = repr(e)[:120]
-for label, argv in (('rel', ['cmd', '/d', '/c', b]), ('abs', ['cmd', '/d', '/c', p]), ('type', ['cmd', '/d', '/c', 'type', p]), ('call', ['cmd', '/d', '/c', 'call', p]), ('echo', ['cmd', '/d', '/c', 'echo', 'plain'])):
+    for label, argv in (
+        ("inline", ("cmd", "/d", "/c", "echo PR10285_CMD inline")),
+        ("abs", ("cmd", "/d", "/c", path)),
+        ("rel", ("cmd", "/d", "/c", base)),
+        ("call_abs", ("cmd", "/d", "/c", "call", path)),
+        ("type_abs", ("cmd", "/d", "/c", "type", path)),
+        ("dir", ("cmd", "/d", "/c", "dir", "/b")),
+    ):
+        prepared = None
+        try:
+            prepared = os_sandbox.prepare_tool_launch(
+                os_sandbox.ToolLaunchPlan(
+                    argv = argv,
+                    workdir = workdir,
+                    env = tools._build_safe_env(workdir),
+                    requested_mode = "os_isolation_required",
+                )
+            )
+            proc = os_sandbox.spawn_prepared_launch(
+                prepared,
+                stdout = sp.PIPE, stderr = sp.STDOUT, stdin = sp.DEVNULL,
+                text = True, close_fds = True,
+            )
+            out = proc.stdout.read() if proc.stdout else ""
+            proc.wait(timeout = 60)
+            print("PR10285_CMDDIAG " + json.dumps({"variant": label, "rc": proc.returncode, "out": out.strip()[:200]}), flush = True)
+        except Exception as exc:  # noqa: BLE001
+            print("PR10285_CMDDIAG " + json.dumps({"variant": label, "error": f"{type(exc).__name__}: {exc}"[:240]}), flush = True)
+        finally:
+            if prepared is not None:
+                prepared.cleanup()
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30, cwd=os.getcwd())
-        out[label] = (r.returncode, (r.stdout + r.stderr).strip()[:100])
-    except Exception as e:
-        out[label] = repr(e)[:120]
-try:
-    r = subprocess.run(['icacls', p], capture_output=True, text=True, timeout=30)
-    out['icacls'] = (r.stdout + r.stderr).strip()[:400]
-except Exception as e:
-    out['icacls'] = repr(e)[:120]
-out['cwd'] = os.getcwd(); out['listdir'] = [n for n in os.listdir('.') if n.endswith('.cmd')][:5]
-print('PR10285_CMDDIAG', out)
-"""
-    out = tools._python_exec(code, session_id = "pr10285-cmddiag", timeout = 120)
-    for line in str(out).splitlines():
-        print(line[:900], flush = True)
+        acl = sp.run(["icacls", path], capture_output = True, text = True, timeout = 30)
+        print("PR10285_CMDDIAG_ACL " + json.dumps((acl.stdout + acl.stderr)[:600]), flush = True)
+        acl = sp.run(["icacls", workdir], capture_output = True, text = True, timeout = 30)
+        print("PR10285_CMDDIAG_WORKDIR_ACL " + json.dumps((acl.stdout + acl.stderr)[:600]), flush = True)
+    except Exception as exc:  # noqa: BLE001
+        print("PR10285_CMDDIAG_ACL " + json.dumps(repr(exc)[:200]), flush = True)
+    out = tools._bash_exec("echo PR10285_CMD from_tool", session_id = "pr10285-cmddiag", timeout = 90)
+    print("PR10285_CMDDIAG_TOOL " + json.dumps(str(out)[:400]), flush = True)
     try:
         os.remove(path)
     except OSError:
