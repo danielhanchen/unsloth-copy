@@ -90,7 +90,7 @@ def escape() -> int:
             echo PR10285_ESC appcontainer=& whoami /groups | findstr /i "APPLICATION PACKAGE" 2>&1
             start /b cmd /c "ping -n 1285 127.0.0.1 > nul"
             echo PR10285_ESC detached_spawned=yes
-            """
+            """.strip("\n")
         )
     else:
         term = textwrap.dedent(
@@ -267,9 +267,21 @@ def limited_token() -> int:
     from dataclasses import replace
     from core.inference import os_sandbox
     real = capability_snapshot(force = True)
+    try:
+        from core.inference import windows_restricted_token as _wrt
+        _direct = _wrt.WindowsRestrictedTokenBackend().probe(force = True)
+        print("PR10285_LT_DIRECT " + json.dumps({
+            "available": bool(getattr(_direct, "available", False)),
+            "reason": str(getattr(_direct, "reason", ""))[:600],
+            "profile_id": getattr(_direct, "profile_id", None),
+            "limitations": list(getattr(_direct, "limitations", ()) or ()),
+        }), flush = True)
+    except Exception as exc:  # noqa: BLE001
+        print("PR10285_LT_DIRECT " + json.dumps({"error": f"{type(exc).__name__}: {exc}"[:600]}), flush = True)
     print("PR10285_LT_CAP " + json.dumps({
         "limited_backend": getattr(real, "limited_backend", None),
         "limited_profile_id": getattr(real, "limited_profile_id", None),
+        "limited_reason": str(getattr(real, "limited_reason", "") or "")[:600],
         "limited_limitations": list(getattr(real, "limited_limitations", ()) or ()),
         "available": real.available,
     }), flush = True)
