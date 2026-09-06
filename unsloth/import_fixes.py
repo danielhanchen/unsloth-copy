@@ -2444,14 +2444,29 @@ def patch_torchcodec_audio_decoder():
 
 
 # torch.minor -> compatible torchcodec.minor strings (see notebook_validator.py).
+# torchcodec ships no `Requires-Dist: torch`, so pip cannot catch a mismatch and this table
+# is the only check. Lockstep releases only; 0.12+ is the ABI-stable rule below.
 _TORCH_TORCHCODEC_MINORS: dict[str, set[str]] = {
+    "2.11": {"0.11"},
     "2.10": {"0.10"},
     "2.9": {"0.8", "0.9"},
     "2.8": {"0.6", "0.7"},
     "2.7": {"0.3", "0.4", "0.5"},
-    "2.6": {"0.2", "0.3"},
-    "2.5": {"0.1", "0.2"},
+    "2.6": {"0.2"},
+    "2.5": {"0.1"},
 }
+
+
+# torch.minor -> the pyproject extra that pins the matching torchcodec line.
+_TORCH_TORCHCODEC_EXTRAS: dict[str, str] = {
+    "2.11": "audio-torch211",
+    "2.10": "audio-torch210",
+}
+
+# torchcodec 0.12+ is ABI-stable against torch >=2.11 (its build sets TORCH_TARGET_VERSION
+# to 2.11), so that half of the matrix is open-ended rather than a finite set of minors.
+_TORCHCODEC_ABI_STABLE_TORCH = (2, 11)
+_TORCHCODEC_ABI_STABLE_CODEC = (0, 12)
 
 
 def _torchcodec_exclusive_upper(pin: str) -> str:
@@ -2471,25 +2486,62 @@ def _torchcodec_version_mismatch_hint() -> str | None:
     except Exception:
         return None
 
-    def _minor(version: str) -> str:
+    def _release(version: str) -> tuple:
         parts = Version(version.split("+", 1)[0]).release
-        return ".".join(str(p) for p in parts[:2])
+        return tuple(parts[:2]) + (0,) * (2 - len(parts[:2]))
 
     try:
-        torch_minor = _minor(torch.__version__)
-        codec_minor = _minor(torchcodec_version)
+        torch_release = _release(torch.__version__)
+        codec_release = _release(torchcodec_version)
     except Exception:
         # Non-PEP440 version strings must never break `import unsloth`.
         return None
-    allowed = _TORCH_TORCHCODEC_MINORS.get(torch_minor)
-    if allowed is None or codec_minor in allowed:
-        return None
+    if (
+        torch_release >= _TORCHCODEC_ABI_STABLE_TORCH
+        and codec_release >= _TORCHCODEC_ABI_STABLE_CODEC
+    ):
+        return None  # ABI-stable pairing, not locked to one torch minor
+    torch_minor = ".".join(str(p) for p in torch_release)
+    codec_minor = ".".join(str(p) for p in codec_release)
 
-    pin = sorted(allowed)[-1]
-    upper = _torchcodec_exclusive_upper(pin)
-    install_hint = f"`pip install 'torchcodec>={pin},{upper}'`"
-    if torch_minor == "2.10":
-        install_hint += " or `pip install 'unsloth[audio-torch210]'`"
+    def _index_flag(recommended: "tuple[int, ...]") -> str:
+        """`--index-url ...` when torch carries an accelerator tag, else "".
+
+        torchcodec ships one wheel per accelerator, so a remedy that installs the right
+        version from the default index still lands a codec that cannot dlopen on a cu126 or
+        cu128 venv. Mirrors install_python_stack._torchcodec_index_url, including the lines
+        it will not pin: torchcodec 0.1 and 0.2 exist on PyPI only.
+        """
+        if recommended < (0, 3):
+            return ""
+        local = str(getattr(torch, "__version__", "")).partition("+")[2].strip().lower()
+        if local == "cpu" or re.fullmatch(r"cu\d+", local or ""):
+            return f"--index-url https://download.pytorch.org/whl/{local} "
+        return ""
+
+    allowed = _TORCH_TORCHCODEC_MINORS.get(torch_minor)
+    if allowed is None:
+        # No lockstep row: below the table stays silent; at or past the ABI floor this is a
+        # pre-0.12 codec, since 0.12+ already returned above.
+        if torch_release < _TORCHCODEC_ABI_STABLE_TORCH:
+            return None
+        abi_pin = ".".join(str(p) for p in _TORCHCODEC_ABI_STABLE_CODEC)
+        install_hint = (
+            f"`pip install {_index_flag(_TORCHCODEC_ABI_STABLE_CODEC)}'torchcodec>={abi_pin}.0'`"
+        )
+    elif codec_minor in allowed:
+        return None
+    else:
+        pin = sorted(allowed)[-1]
+        upper = _torchcodec_exclusive_upper(pin)
+        install_hint = f"`pip install {_index_flag(tuple(int(x) for x in pin.split('.')))}'torchcodec>={pin},{upper}'`"
+        extra = _TORCH_TORCHCODEC_EXTRAS.get(torch_minor)
+        # Only offer the extra when no index pin is needed. An extra cannot carry one: the
+        # marker picks the version, not the index, and putting --index-url on the whole
+        # command would resolve unsloth itself from the torch index too. On a +cuNNN or +cpu
+        # venv it would hand back the same unloadable wheel this warning is about.
+        if extra is not None and not _index_flag(tuple(int(x) for x in pin.split("."))):
+            install_hint += f" or `pip install 'unsloth[{extra}]'`"
     return (
         f"torchcodec {torchcodec_version} is incompatible with torch {torch.__version__}; "
         f"install a matching build with {install_hint}."
