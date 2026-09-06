@@ -96,6 +96,10 @@ jobs:
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" network-allowlist
         continue-on-error: true
+      - name: Restricted token diagnostics (session objects, token variants)
+        working-directory: studio/backend
+        run: python "$env:RUNNER_TEMP\pr10285_probe.py" token-diag
+        continue-on-error: true
       - name: Limited mode under the restricted token
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" limited-token

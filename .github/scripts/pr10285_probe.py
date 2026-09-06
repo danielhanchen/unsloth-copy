@@ -277,6 +277,7 @@ def cmd_diag() -> int:
     inside the sandbox by relative and absolute path and prints the ACL it sees.
     """
     import tempfile
+    _bootstrap()
     from core.inference import tools
     workdir = tools._get_workdir("pr10285-cmddiag")
     fd, path = tempfile.mkstemp(suffix = ".cmd", prefix = "studio_exec_", dir = workdir)
@@ -312,6 +313,137 @@ print('PR10285_CMDDIAG', out)
         os.remove(path)
     except OSError:
         pass
+    return 0
+
+
+def token_diag() -> int:
+    """Why does the restricted-token probe child die with 0xC0000142 on this host?
+
+    Prints the session facts (window station and desktop names and DACLs, logon SID,
+    session id) and then starts a trivial child under several token variants so the
+    failing ingredient can be told apart: the module's own token, one that keeps
+    Administrators, one with extra restricting SIDs, one without LUA and privilege
+    stripping, and a plain duplicate of the process token.
+    """
+    _bootstrap()
+    import ctypes
+    from ctypes import wintypes
+    from core.inference import windows_lpac as lpac
+    from core.inference import windows_restricted_token as wrt
+    api = lpac._api()
+    k32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    u32 = ctypes.WinDLL("user32", use_last_error = True)
+    adv = ctypes.WinDLL("advapi32", use_last_error = True)
+    facts = {}
+    try:
+        sid = wintypes.DWORD()
+        k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid))
+        facts["session"] = sid.value
+    except Exception as exc:  # noqa: BLE001
+        facts["session"] = repr(exc)[:80]
+    def obj_facts(handle, label):
+        name = ctypes.create_unicode_buffer(256)
+        need = wintypes.DWORD()
+        u32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        u32.GetUserObjectInformationW(handle, 2, name, 512, ctypes.byref(need))
+        facts[label + "_name"] = name.value
+        u32.GetUserObjectSecurity.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        info = wintypes.DWORD(4 | 1 | 2)
+        needed = wintypes.DWORD()
+        u32.GetUserObjectSecurity(handle, ctypes.byref(info), None, 0, ctypes.byref(needed))
+        buf = ctypes.create_string_buffer(max(needed.value, 8))
+        if not u32.GetUserObjectSecurity(handle, ctypes.byref(info), buf, len(buf), ctypes.byref(needed)):
+            facts[label + "_sddl"] = f"GetUserObjectSecurity failed {ctypes.get_last_error()}"
+            return
+        text = ctypes.c_wchar_p()
+        adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(wintypes.ULONG)]
+        if adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(buf, 1, 4 | 1 | 2, ctypes.byref(text), None):
+            facts[label + "_sddl"] = text.value[:700]
+            k32.LocalFree(text)
+        else:
+            facts[label + "_sddl"] = f"sddl failed {ctypes.get_last_error()}"
+    try:
+        u32.GetProcessWindowStation.restype = wintypes.HANDLE
+        u32.GetThreadDesktop.restype = wintypes.HANDLE
+        obj_facts(u32.GetProcessWindowStation(), "winsta")
+        obj_facts(u32.GetThreadDesktop(k32.GetCurrentThreadId()), "desktop")
+    except Exception as exc:  # noqa: BLE001
+        facts["userobj"] = repr(exc)[:160]
+    source = wintypes.HANDLE()
+    api.advapi32.OpenProcessToken(api.kernel32.GetCurrentProcess(), wrt._TOKEN_ACCESS, ctypes.byref(source))
+    try:
+        facts["logon_sids"] = wrt._token_group_sids(api, source, wrt._TOKEN_LOGON_SID)
+        groups = wrt._token_group_sids(api, source, wrt._TOKEN_GROUPS)
+        facts["groups_count"] = len(groups)
+        facts["has_admins"] = wrt._ADMINISTRATORS_SID in groups
+        facts["has_interactive"] = "S-1-5-4" in groups
+    except Exception as exc:  # noqa: BLE001
+        facts["token"] = repr(exc)[:160]
+    print("PR10285_TOKDIAG_FACTS " + json.dumps(facts), flush = True)
+
+    def build_token(flags, restrict_texts, disable_admins):
+        restrict = (wrt._SID_AND_ATTRIBUTES * len(restrict_texts))()
+        owned = []
+        for index, text in enumerate(restrict_texts):
+            s_ = wrt._sid_from_text(text); owned.append(s_)
+            restrict[index].Sid = s_.value; restrict[index].Attributes = 0
+        disable = (wrt._SID_AND_ATTRIBUTES * 1)()
+        count = 0
+        if disable_admins:
+            a = wrt._sid_from_text(wrt._ADMINISTRATORS_SID); owned.append(a)
+            disable[0].Sid = a.value; count = 1
+        out = wintypes.HANDLE()
+        ok = api.advapi32.CreateRestrictedToken(source, flags, count, disable if count else None, 0, None, len(restrict_texts), restrict, ctypes.byref(out))
+        for s_ in owned:
+            api.kernel32.LocalFree(s_)
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "CreateRestrictedToken")
+        return out
+
+    def run_child(token, desktop, label):
+        startup = lpac._STARTUPINFOW() if hasattr(lpac, "_STARTUPINFOW") else None
+        if startup is None:
+            print("PR10285_TOKDIAG " + json.dumps({"variant": label, "error": "no STARTUPINFOW"}), flush = True)
+            return
+        startup.cb = ctypes.sizeof(startup)
+        if desktop is not None:
+            startup.lpDesktop = desktop
+        info = lpac._PROCESS_INFORMATION()
+        cmdline = ctypes.create_unicode_buffer(f'"{sys.executable}" -c "print(1)"')
+        flags = 0x08000000 | 0x00000400
+        env_block = lpac._environment_block({"SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"), "PATH": os.environ.get("PATH", ""), "TEMP": os.environ.get("TEMP", ""), "TMP": os.environ.get("TMP", "")})
+        ok = api.advapi32.CreateProcessAsUserW(token, sys.executable, cmdline, None, None, False, flags, env_block, os.getcwd(), ctypes.byref(startup), ctypes.byref(info))
+        if not ok:
+            print("PR10285_TOKDIAG " + json.dumps({"variant": label, "create_failed": ctypes.get_last_error()}), flush = True)
+            return
+        api.kernel32.WaitForSingleObject(info.hProcess, 20000)
+        code = wintypes.DWORD()
+        api.kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        api.kernel32.CloseHandle(info.hThread); api.kernel32.CloseHandle(info.hProcess)
+        print("PR10285_TOKDIAG " + json.dumps({"variant": label, "exit": ctypes.c_int32(code.value).value, "exit_hex": hex(code.value)}), flush = True)
+
+    launch_sid = wrt._random_domain_sid_text() if hasattr(wrt, "_random_domain_sid_text") else "S-1-5-21-1111-2222-3333-4444"
+    logon = facts.get("logon_sids") or []
+    base = [launch_sid, *logon[:1], wrt._EVERYONE_SID]
+    variants = [
+        ("module_flags_admins_disabled", wrt._RESTRICTED_TOKEN_FLAGS, base, True, None),
+        ("module_flags_admins_kept", wrt._RESTRICTED_TOKEN_FLAGS, base, False, None),
+        ("module_flags_plus_users_authusers_interactive", wrt._RESTRICTED_TOKEN_FLAGS, [*base, "S-1-5-32-545", "S-1-5-11", "S-1-5-4"], True, None),
+        ("write_restricted_only", 0x8, base, False, None),
+        ("module_flags_explicit_desktop", wrt._RESTRICTED_TOKEN_FLAGS, base, True, "winsta0\\default"),
+        ("no_restricting_sids_lua_only", 0x4 | 0x1, [], False, None),
+    ]
+    for label, flags, texts, disable_admins, desktop in variants:
+        try:
+            tok = build_token(flags, texts, disable_admins)
+        except OSError as exc:
+            print("PR10285_TOKDIAG " + json.dumps({"variant": label, "token_failed": str(exc)[:120]}), flush = True)
+            continue
+        try:
+            run_child(tok, desktop, label)
+        finally:
+            api.kernel32.CloseHandle(tok)
+    api.kernel32.CloseHandle(source)
     return 0
 
 
@@ -421,6 +553,8 @@ def main() -> int:
         return limited_token()
     if cmd == "cmd-diag":
         return cmd_diag()
+    if cmd == "token-diag":
+        return token_diag()
     print(f"unknown command {cmd}")
     return 2
 
