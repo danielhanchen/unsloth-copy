@@ -11,15 +11,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup
         with:
           python-version: "3.12"
-      - name: arch
+      - name: arch + interpreter
         run: |
-          uname -m; sysctl -n machdep.cpu.brand_string || true
-      - name: install torch
-        run: python -m pip install --upgrade pip && python -m pip install torch
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          echo "resolved python-path: ${{ steps.setup.outputs.python-path }}"
+          "${{ steps.setup.outputs.python-path }}" -c "import sys,platform;print(sys.executable, platform.machine())"
+      - name: install torch + pytest
+        run: |
+          P="${{ steps.setup.outputs.python-path }}"
+          "$P" -m pip install --upgrade pip
+          "$P" -m pip install pytest torch
       - name: install mlx + unsloth (best effort)
         continue-on-error: true
-        run: python -m pip install mlx mlx-lm unsloth unsloth_zoo
+        run: |
+          P="${{ steps.setup.outputs.python-path }}"
+          "$P" -m pip install mlx mlx-lm unsloth unsloth_zoo
       - name: probe
-        run: python -m pytest tests/apple_probe/test_apple_probe.py -s -v
+        run: |
+          P="${{ steps.setup.outputs.python-path }}"
+          "$P" -m pytest tests/apple_probe/test_apple_probe.py -s -v
