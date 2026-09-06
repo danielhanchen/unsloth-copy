@@ -264,6 +264,52 @@ def network_allowlist() -> int:
     return 0
 
 
+def cmd_diag() -> int:
+    """Why does cmd inside the AppContainer say "Access is denied" for the batch file?
+
+    A .cmd is created in the workdir the way tools._bash_exec does (mkstemp, before the
+    launch grants the package SID on the workdir); the Python tool then reads and runs it
+    inside the sandbox by relative and absolute path and prints the ACL it sees.
+    """
+    import tempfile
+    from core.inference import tools
+    workdir = tools._get_workdir("pr10285-cmddiag")
+    fd, path = tempfile.mkstemp(suffix = ".cmd", prefix = "studio_exec_", dir = workdir)
+    with os.fdopen(fd, "w", encoding = "utf-8", newline = "") as handle:
+        handle.write("@echo off\r\necho PR10285_CMD ran_from_batch\r\n")
+    base = os.path.basename(path)
+    code = f"""
+import os, subprocess, sys
+out = {{}}
+p = {path!r}; b = {base!r}
+try:
+    out['read'] = open(p, 'rb').read()[:12]
+except Exception as e:
+    out['read'] = repr(e)[:120]
+for label, argv in (('rel', ['cmd', '/d', '/c', b]), ('abs', ['cmd', '/d', '/c', p]), ('type', ['cmd', '/d', '/c', 'type', p]), ('call', ['cmd', '/d', '/c', 'call', p]), ('echo', ['cmd', '/d', '/c', 'echo', 'plain'])):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30, cwd=os.getcwd())
+        out[label] = (r.returncode, (r.stdout + r.stderr).strip()[:100])
+    except Exception as e:
+        out[label] = repr(e)[:120]
+try:
+    r = subprocess.run(['icacls', p], capture_output=True, text=True, timeout=30)
+    out['icacls'] = (r.stdout + r.stderr).strip()[:400]
+except Exception as e:
+    out['icacls'] = repr(e)[:120]
+out['cwd'] = os.getcwd(); out['listdir'] = [n for n in os.listdir('.') if n.endswith('.cmd')][:5]
+print('PR10285_CMDDIAG', out)
+"""
+    out = tools._python_exec(code, session_id = "pr10285-cmddiag", timeout = 120)
+    for line in str(out).splitlines():
+        print(line[:900], flush = True)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return 0
+
+
 def limited_token() -> int:
     """Windows Limited mode under the restricted token: reads stay, writes are fenced."""
     _bootstrap()
@@ -368,6 +414,8 @@ def main() -> int:
         return network_allowlist()
     if cmd == "limited-token":
         return limited_token()
+    if cmd == "cmd-diag":
+        return cmd_diag()
     print(f"unknown command {cmd}")
     return 2
 

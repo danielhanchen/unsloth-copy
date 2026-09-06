@@ -80,6 +80,10 @@ jobs:
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" escape
         continue-on-error: true
+      - name: cmd batch-file diagnostics inside the sandbox
+        working-directory: studio/backend
+        run: python "$env:RUNNER_TEMP\pr10285_probe.py" cmd-diag
+        continue-on-error: true
       - name: Python tool escape probe
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" python-escape
