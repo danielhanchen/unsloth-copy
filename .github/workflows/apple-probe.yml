@@ -37,4 +37,4 @@ jobs:
       - name: probe
         run: |
           P="${{ steps.setup.outputs.python-path }}"
-          "$P" -m pytest tests/apple_probe/test_apple_probe.py -s -v
+          "$P" -m pytest tests/apple_probe/ -s -v
