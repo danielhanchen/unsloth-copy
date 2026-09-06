@@ -98,10 +98,14 @@ jobs:
         continue-on-error: true
       - name: Shared suites (existing tests at both refs)
         working-directory: studio/backend
-        timeout-minutes: 25
+        timeout-minutes: 22
         continue-on-error: true
         run: |
-          python -m pytest -v --tb=short --durations=25 -o faulthandler_timeout=300 -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > shared_out.txt 2>&1
+          # Streamed to the job log as well: a step that times out otherwise leaves no
+          # trace of which test was running. Per-test wall clock is stamped by the plugin
+          # below so slow launches show up even when the run never reaches --durations.
+          $env:PYTHONUNBUFFERED = '1'
+          python -u -m pytest -v --tb=short --durations=40 -o faulthandler_timeout=120 -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' 2>&1 | ForEach-Object { "$(Get-Date -Format HH:mm:ss) $_" } | Tee-Object -FilePath shared_out.txt
           Select-String -Path shared_out.txt -Pattern '^(FAILED|ERROR)|passed|failed' | ForEach-Object { 'PR10285_SHARED ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
       - name: Shared suites tail (also after a timeout)
         if: always()
