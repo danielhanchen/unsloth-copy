@@ -31,9 +31,10 @@ def test_attention_bench():
     import torch.nn.functional as F
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
     import mlx.core as mx
-    import mlx.nn as mnn
 
     REPORT["torch_version"] = torch.__version__
+    torch._dynamo.config.recompile_limit = 128
+    torch._dynamo.config.accumulated_recompile_limit = 512
     torch.manual_seed(0)
     H, D, WINDOW = 8, 64, 512
     sync_t = torch.mps.synchronize
@@ -62,7 +63,13 @@ def test_attention_bench():
                     def mm(b, h, qi, ki): return (qi >= ki) & (qi - ki < WINDOW)
                 bm = create_block_mask(mm, B=None, H=None, Q_LEN=T, KV_LEN=T, device="mps")
                 row["block_sparsity_pct"] = float(bm.sparsity())
-                row["flex_ms"] = _bench(lambda: flex_attention(q, k, v, block_mask=bm), sync_t)
+                # MUST be compiled. Bare flex_attention() falls back to an unfused path
+                # that materialises the full score matrix -- which measures the opposite
+                # of what FlexAttention is for.
+                flex_c = torch.compile(flex_attention, dynamic=False)
+                flex_c(q, k, v, block_mask=bm)          # compile before timing
+                sync_t()
+                row["flex_ms"] = _bench(lambda: flex_c(q, k, v, block_mask=bm), sync_t)
 
                 # MLX: fp16, same shapes. mlx uses [B, H, T, D] too.
                 mq = mx.random.normal((1, H, T, D)).astype(mx.float16)
@@ -77,7 +84,7 @@ def test_attention_bench():
                     mmask = mx.where((md >= 0) & (md < WINDOW), mx.array(0.0, mx.float16),
                                      mx.array(-6e4, mx.float16))
                 def mlx_run():
-                    o = mnn.fast.scaled_dot_product_attention(mq, mk, mv, scale=scale, mask=mmask)
+                    o = mx.fast.scaled_dot_product_attention(mq, mk, mv, scale=scale, mask=mmask)
                     mx.eval(o)
                 row["mlx_ms"] = _bench(mlx_run, mx.synchronize)
 
