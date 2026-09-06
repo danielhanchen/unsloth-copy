@@ -97,13 +97,19 @@ COLAB_ORACLE_BASE_URL = "https://raw.githubusercontent.com/googlecolab/backend-i
 # torch.minor -> compatible torchcodec.minor strings. Source: pytorch/torchcodec README compatibility matrix.
 # ----- Compat tables. PRs add rows as new releases land. ----- #
 
+# Lockstep rows only: torchcodec 0.12+ is ABI-stable against torch >=2.11 and is handled by
+# the short-circuit in rule_inst_004_torchcodec_torch rather than by a row here.
+TORCHCODEC_ABI_STABLE_TORCH = "2.11"
+TORCHCODEC_ABI_STABLE_CODEC = "0.12"
+
 TORCH_TORCHCODEC: dict[str, set[str]] = {
+    "2.11": {"0.11"},
     "2.10": {"0.10"},
     "2.9": {"0.8", "0.9"},
     "2.8": {"0.6", "0.7"},
     "2.7": {"0.3", "0.4", "0.5"},
-    "2.6": {"0.2", "0.3"},
-    "2.5": {"0.1", "0.2"},
+    "2.6": {"0.2"},
+    "2.5": {"0.1"},
 }
 
 # When peft >= trigger is on the resolved set, torchao >= floor must also be.
@@ -599,6 +605,114 @@ def rule_inst_003_peft_torchao(
     return findings
 
 
+def _compatible_release_ceiling(version: str) -> str:
+    """The exclusive upper bound `~=version` implies: `~=0.12.0` -> `0.13`, `~=0.12` -> `1`.
+
+    PEP 440 drops the last component and increments the one before it. A single component
+    (`~=1`) is invalid, so it names no ceiling.
+    """
+    parts = [p for p in re.split(r"[.]", version.strip()) if p.isdigit()]
+    if len(parts) < 2:
+        return ""
+    head = [int(p) for p in parts[:-1]]
+    head[-1] += 1
+    return ".".join(str(p) for p in head)
+
+
+def _requested_bounds(install_cell: str, package: str) -> tuple[str, str, str, bool]:
+    """Floor, exclusive ceiling, inclusive cap and removed-flag from the LAST invocation
+    naming `package`.
+
+    Order matters and intersecting does not: pip runs the commands in sequence, so
+    `torchcodec>=0.12.0` followed by `torchcodec<0.12.0` ends on a pre-0.12 codec, while
+    taking the highest floor and lowest ceiling across both would invent a 0.12 that was
+    never installed. Only the last command decides, and if that command is an uninstall the
+    package is gone rather than pinned.
+
+    Names are matched the way pip compares them, case-insensitively (PEP 503), which is what
+    parse_spec already does: `TorchCodec>=0.12.0` is the same requirement as the lowercase
+    spelling and must move the version too.
+
+    A requirement carrying a PEP 508 marker is skipped. Evaluating one needs the image's
+    interpreter, which this branch has no oracle for, and guessing against the runner would
+    move the answer between machines. Skipping leaves such a cell judged on the preinstalled
+    version, which is what it was judged on before this function existed.
+    """
+    floor = ceiling = cap = ""
+    removed = False
+    for invocation in iter_pip_invocations(install_cell):
+        uninstall = re.search(r"\bpip\s+uninstall\b", invocation.raw, re.IGNORECASE) is not None
+        current_floor = current_ceiling = current_cap = ""
+        named = False
+        for requirement in invocation.packages:
+            if ";" in requirement:
+                continue
+            spec = parse_spec(requirement)
+            if spec is None or spec.name != package.lower():
+                continue
+            named = True
+            for operator, version in spec.pins:
+                if operator == "~=":
+                    # PEP 440 compatible release: `~=0.12.0` is `>=0.12.0,<0.13.0`, and
+                    # `~=0.12` is `>=0.12,<1`. The last component is dropped and the one
+                    # before it incremented.
+                    lower, upper = version, _compatible_release_ceiling(version)
+                    if not current_floor or cmp_versions(lower, current_floor) > 0:
+                        current_floor = lower
+                    if upper and (not current_ceiling or cmp_versions(upper, current_ceiling) < 0):
+                        current_ceiling = upper
+                elif operator == ">=" and (
+                    not current_floor or cmp_versions(version, current_floor) > 0
+                ):
+                    current_floor = version
+                elif operator == "<" and (
+                    not current_ceiling or cmp_versions(version, current_ceiling) < 0
+                ):
+                    current_ceiling = version
+                elif operator == "<=" and (
+                    not current_cap or cmp_versions(version, current_cap) < 0
+                ):
+                    # `<=V` allows V, so V is the version pip lands on when the installed
+                    # one is above it. Unlike an exclusive ceiling this NAMES the landing.
+                    current_cap = version
+        if named:
+            floor, ceiling, cap, removed = (
+                current_floor,
+                current_ceiling,
+                current_cap,
+                uninstall,
+            )
+    return floor, ceiling, cap, removed
+
+
+def _effective_requested_version(install_cell: str, package: str, oracle: str) -> str:
+    """What pip actually leaves installed, when the cell's range rules the oracle out.
+
+    resolved_set only overrides the oracle on an exact `==` pin, so a range such as
+    `torchcodec>=0.10.0,<0.11.0` still reads as whatever the image preinstalled. When the
+    oracle satisfies the range it does survive; otherwise pip must move, and the floor is
+    the version it moves to for the one-minor-wide ranges these rules care about.
+    """
+    floor, ceiling, cap, removed = _requested_bounds(install_cell, package)
+    if removed:
+        # Uninstalled and not put back, so there is nothing left to judge. Reporting the
+        # oracle here flagged a package the cell had just deleted.
+        return ""
+    if not floor and not ceiling and not cap:
+        return oracle
+    if cap and cmp_versions(oracle, cap) > 0:
+        return cap  # `<=V` allows V, so V is what pip picks
+    if floor and cmp_versions(oracle, floor) < 0:
+        return floor
+    if ceiling and cmp_versions(oracle, ceiling) >= 0:
+        # The request excludes what is installed, so pip moves. With a floor the window
+        # names where; without one (`torchcodec<0.10.0`) only the index does, and returning
+        # the excluded oracle would report a pairing the cell just ruled out. Unknown is the
+        # honest answer, and it makes the caller fall silent rather than invent a finding.
+        return floor
+    return oracle
+
+
 def rule_inst_004_torchcodec_torch(
     install_cell: str, colab: dict[str, str], file: str, cell_idx: int
 ) -> list[Finding]:
@@ -608,11 +722,42 @@ def rule_inst_004_torchcodec_torch(
     codec_v = res.get("torchcodec")
     if not torch_v or not codec_v:
         return findings
+    # resolved_set keeps the oracle's preinstalled version for anything the cell does not pin
+    # exactly, so a cell asking for `torchcodec>=0.12.0` still reads as Colab's 0.11 and the
+    # branches below report a mismatch pip would never produce. Judge what pip installs.
+    codec_v = _effective_requested_version(install_cell, "torchcodec", codec_v)
+    if not codec_v:
+        return findings  # the cell moved it somewhere only the index names
+    # torchcodec 0.12+ is ABI-stable against torch >=2.11 (its build sets TORCH_TARGET_VERSION
+    # to 2.11), so that half of the matrix is open-ended and cannot be a finite set of minors.
+    # Without this, adding the 2.11 row below would flag torch 2.11 with torchcodec 0.12
+    # through 0.15, all of which upstream supports, and R-INST-004 is an error.
+    if (
+        cmp_versions(torch_v, TORCHCODEC_ABI_STABLE_TORCH) >= 0
+        and cmp_versions(codec_v, TORCHCODEC_ABI_STABLE_CODEC) >= 0
+    ):
+        return findings
     t_minor = version_minor(torch_v)
     c_minor = version_minor(codec_v)
     allowed = TORCH_TORCHCODEC.get(t_minor)
     if allowed is None:
-        return findings  # unknown torch minor, don't flag
+        if cmp_versions(torch_v, TORCHCODEC_ABI_STABLE_TORCH) < 0:
+            return findings  # older than the table, and no row to judge it by
+        # Past the ABI floor with no lockstep row, and the exemption above already returned
+        # for every 0.12+, so this codec is pre-0.12: built against a single older torch
+        # minor, and this torch is newer than any of them. Silence here would mean the
+        # table's last row decides how far the rule can see.
+        findings.append(
+            Finding(
+                rule = "R-INST-004",
+                file = file,
+                cell = cell_idx,
+                severity = "error",
+                message = f"torch=={torch_v} (minor {t_minor}) is incompatible with torchcodec=={codec_v} (minor {c_minor}); torchcodec <{TORCHCODEC_ABI_STABLE_CODEC} is built against a single older torch minor",
+                hint = f"pin `torchcodec>={TORCHCODEC_ABI_STABLE_CODEC}.0` (the ABI-stable line, which targets torch >={TORCHCODEC_ABI_STABLE_TORCH})",
+            )
+        )
+        return findings
     if c_minor not in allowed:
         findings.append(
             Finding(
