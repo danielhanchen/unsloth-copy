@@ -1,0 +1,133 @@
+# Staging-only: build the win_arm64 pyarrow wheels the WoA wheelhouse needs, one per
+# supported minor, on GitHub's hosted windows-11-arm runner. Uses Apache Arrow's own
+# Windows ARM64 build script from apache/arrow#48539 (branch MugundanMCW:Pyarrow_WoA),
+# trimmed to what `datasets` uses: compute, csv, json, dataset, acero, parquet and the
+# compression codecs. Flight, S3, GCS, Azure, ORC, HDFS, Substrait, TensorFlow and
+# OpenTelemetry are switched off, which removes gRPC, the cloud SDKs and their vcpkg
+# build time. Output: artifact `pyarrow-win_arm64-cp3XX` holding the repaired wheel.
+name: Build pyarrow win_arm64
+
+on:
+  push:
+    branches: [woa-pyarrow-cp313]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: pyarrow win_arm64 / cp${{ matrix.python }}
+    runs-on: windows-11-arm
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.13', '3.12', '3.11']
+    env:
+      CMAKE_BUILD_TYPE: release
+      ARCH: ARM64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MugundanMCW/arrow
+          ref: Pyarrow_WoA
+          path: arrow
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: arm64
+
+      - name: Python build dependencies
+        shell: pwsh
+        run: |
+          python -c "import sys, sysconfig; print(sys.version, sysconfig.get_platform())"
+          python -m pip install --upgrade pip
+          python -m pip install -r arrow/python/requirements-wheel-build.txt
+          "PYTHON_CMD=$env:pythonLocation\python.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Version from the C++ tree
+        shell: pwsh
+        run: |
+          $cm = Get-Content arrow/cpp/CMakeLists.txt -Raw
+          if ($cm -notmatch 'set\(ARROW_VERSION "([0-9.]+)(-SNAPSHOT)?"\)') { throw 'no ARROW_VERSION' }
+          $v = $Matches[1]; if ($Matches[2]) { $v = "$v.dev${{ github.run_number }}" }
+          Write-Host "pyarrow version: $v"
+          "SETUPTOOLS_SCM_PRETEND_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Trim the build to what datasets needs
+        shell: pwsh
+        run: |
+          $bat = 'arrow/ci/scripts/python_wheel_windows_build.bat'
+          $t = Get-Content $bat -Raw
+          foreach ($flag in 'ARROW_AZURE','ARROW_FLIGHT','ARROW_GCS','ARROW_HDFS','ARROW_ORC','ARROW_S3','ARROW_SUBSTRAIT','ARROW_TENSORFLOW','ARROW_WITH_OPENTELEMETRY') {
+            $before = $t
+            $t = $t -replace "set $flag=ON", "set $flag=OFF"
+            if ($t -eq $before) { throw "did not find 'set $flag=ON'" }
+          }
+          Set-Content $bat -Value $t -Encoding ascii
+          Select-String -Path $bat -Pattern '^set ARROW_' | ForEach-Object { $_.Line }
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-arm64-static-md-trimmed-${{ hashFiles('arrow/ci/vcpkg/vcpkg.json') }}
+          restore-keys: vcpkg-arm64-static-md-trimmed-
+
+      - name: vcpkg dependencies (base + json + parquet)
+        shell: cmd
+        run: |
+          cd arrow\ci\vcpkg
+          C:\vcpkg\vcpkg.exe install ^
+            --triplet arm64-windows-static-md ^
+            --x-install-root=C:\vcpkg\installed ^
+            --x-manifest-root=. ^
+            --x-feature=json ^
+            --x-feature=parquet
+
+      - name: Build Arrow C++ and the pyarrow wheel
+        shell: cmd
+        run: |
+          call "arrow\ci\scripts\python_wheel_windows_build.bat"
+
+      - name: Smoke test the repaired wheel in a fresh venv
+        shell: pwsh
+        run: |
+          $whl = Get-ChildItem arrow/python/repaired_wheels/*.whl | Select-Object -First 1
+          Write-Host "wheel: $($whl.Name) ($([math]::Round($whl.Length/1MB)) MB)"
+          python -m venv smoke
+          smoke\Scripts\python.exe -m pip install --quiet $whl.FullName numpy
+          smoke\Scripts\python.exe -c @"
+          import pyarrow as pa, pyarrow.parquet as pq, pyarrow.dataset as ds, pyarrow.compute as pc, pyarrow.csv, pyarrow.json, sysconfig
+          print('pyarrow', pa.__version__, sysconfig.get_platform())
+          t = pa.table({'a': [1, 2, 3], 'b': ['x', 'y', 'z']})
+          pq.write_table(t, 'smoke.parquet')
+          back = pq.read_table('smoke.parquet')
+          assert back.equals(t), back
+          print('sum a =', pc.sum(back['a']).as_py())
+          print('dataset rows =', ds.dataset('smoke.parquet').count_rows())
+          print('compression:', [c for c in ('snappy','zstd','lz4','brotli','gzip','bz2') if pa.Codec.is_available(c)])
+          "@
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Does datasets work on it (the reason the wheel exists)
+        shell: pwsh
+        run: |
+          smoke\Scripts\python.exe -m pip install --quiet datasets
+          smoke\Scripts\python.exe -c @"
+          from datasets import Dataset
+          d = Dataset.from_dict({'text': ['hello', 'world'], 'n': [1, 2]})
+          d = d.map(lambda r: {'len': len(r['text'])})
+          d.to_parquet('ds.parquet')
+          print(Dataset.from_parquet('ds.parquet'))
+          "@
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyarrow-win_arm64-cp${{ matrix.python }}
+          path: arrow/python/repaired_wheels/*.whl
+          if-no-files-found: error
