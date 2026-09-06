@@ -43,6 +43,8 @@ def test_attention_bench():
     for T in (1024, 2048, 4096):
         for pattern in ("causal", "sliding_window"):
             row = {"T": T, "pattern": pattern}
+            # Each arm gets its own try: a torch.compile failure must not delete the MLX
+            # numbers, which is exactly what a single shared try did on the previous run.
             try:
                 q = torch.randn(1, H, T, D, device="mps", dtype=torch.float16)
                 k = torch.randn(1, H, T, D, device="mps", dtype=torch.float16)
@@ -70,7 +72,12 @@ def test_attention_bench():
                 flex_c(q, k, v, block_mask=bm)          # compile before timing
                 sync_t()
                 row["flex_ms"] = _bench(lambda: flex_c(q, k, v, block_mask=bm), sync_t)
+                del q, k, v, dense, bm
+                torch.mps.empty_cache()
+            except BaseException as e:
+                row["torch_error"] = f"{type(e).__name__}: {e}"
 
+            try:
                 # MLX: fp16, same shapes. mlx uses [B, H, T, D] too.
                 mq = mx.random.normal((1, H, T, D)).astype(mx.float16)
                 mk = mx.random.normal((1, H, T, D)).astype(mx.float16)
@@ -87,13 +94,15 @@ def test_attention_bench():
                     o = mx.fast.scaled_dot_product_attention(mq, mk, mv, scale=scale, mask=mmask)
                     mx.eval(o)
                 row["mlx_ms"] = _bench(mlx_run, mx.synchronize)
-
-                row["flex_vs_sdpa"] = row["sdpa_dense_ms"] / row["flex_ms"]
-                row["mlx_vs_flex"] = row["flex_ms"] / row["mlx_ms"]
-                del q, k, v, dense, bm
-                torch.mps.empty_cache()
             except BaseException as e:
-                row["error"] = f"{type(e).__name__}: {e}"
+                row["mlx_error"] = f"{type(e).__name__}: {e}"
+
+            if "flex_ms" in row:
+                row["flex_vs_sdpa"] = row["sdpa_dense_ms"] / row["flex_ms"]
+            if "flex_ms" in row and "mlx_ms" in row:
+                row["mlx_vs_flex"] = row["flex_ms"] / row["mlx_ms"]
+            if "sdpa_dense_ms" in row and "mlx_ms" in row:
+                row["mlx_vs_sdpa"] = row["sdpa_dense_ms"] / row["mlx_ms"]
             rows.append(row)
 
     REPORT["rows"] = rows
