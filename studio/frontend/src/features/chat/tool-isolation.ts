@@ -2,8 +2,18 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
+import { backendLabel, limitedBackendLabel } from "./tool-isolation-labels";
 
 export type ToolExecutionMode = "os_isolation_required" | "limited" | "full";
+
+/** Outbound network for an OS-isolated launch: nothing, or the backend's fixed host allowlist
+ *  through its local proxy. Only Required mode can enforce either. */
+export type ToolNetworkPolicy = "deny" | "allowlist";
+
+export const TOOL_NETWORK_POLICIES: readonly ToolNetworkPolicy[] = [
+  "deny",
+  "allowlist",
+];
 
 export type ToolIsolationProtectionState =
   | "protected"
@@ -24,6 +34,15 @@ export type ToolIsolationCapability = {
   available: boolean;
   qualified: boolean;
   limitations: string[];
+  /** Network policies the Required-mode backend can enforce; always contains "deny". */
+  network_policies: ToolNetworkPolicy[];
+  /** Hosts an "allowlist" launch may reach. Empty when the host offers only "deny". */
+  network_allowlist: string[];
+  /** How Limited runs here when it is more than the software safeguards (Windows restricted
+   *  token), else null. */
+  limited_backend: string | null;
+  limited_profile_id: string | null;
+  limited_limitations: string[];
 };
 
 /** Opaque, backend-issued consent proof. Never persist this value. */
@@ -38,29 +57,6 @@ export type ToolIsolationPresentation = {
   label: string;
   description: string;
 };
-
-function backendLabel(backend: string | null, environment: string): string {
-  if (backend === "windows-lpac") {
-    return "LPAC (Windows)";
-  }
-  if (backend === "macos-seatbelt") {
-    return "Seatbelt (lifecycle unverified)";
-  }
-  if (!backend?.toLowerCase().includes("bubblewrap")) {
-    return backend || "OS sandbox";
-  }
-  const normalized = environment.toLowerCase();
-  if (normalized.includes("wsl")) {
-    return "Bubblewrap (WSL2)";
-  }
-  if (normalized.includes("colab")) {
-    return "Bubblewrap (Colab)";
-  }
-  if (normalized.includes("container")) {
-    return "Bubblewrap (Container)";
-  }
-  return "Bubblewrap";
-}
 
 export function isLimitedGrantCurrent(
   grant: LimitedToolGrant | null,
@@ -95,11 +91,21 @@ export function toolIsolationPresentation(
     };
   }
   if (mode === "limited" && isLimitedGrantCurrent(grant, capability)) {
+    // Only the Windows write-restricted token earns the write-confinement wording; any
+    // other advertised Limited backend keeps the plain description.
+    if (capability?.limited_backend === "windows-restricted-token") {
+      return {
+        state: "limited",
+        label: `Limited · ${limitedBackendLabel(capability.limited_backend)}`,
+        description:
+          "Writes outside the sandbox directory are refused by the restricted token; each execution record says whether it applied. Reads, the network and other processes are not isolated.",
+      };
+    }
     return {
       state: "limited",
       label: "Limited · no OS isolation",
       description:
-        "Software safeguards remain active, but Limited is not an OS sandbox.",
+        "Software safeguards remain active and code is analysed before it runs, but that analysis is best effort and Limited is not an OS sandbox.",
     };
   }
   if (!capability) {
@@ -112,14 +118,14 @@ export function toolIsolationPresentation(
   if (capability?.protection_state === "protected") {
     return {
       state: "protected",
-      label: `Protected · ${backendLabel(capability.backend, capability.environment)}`,
+      label: `Protected · ${backendLabel(capability.backend, capability.environment, capability.profile_id)}`,
       description: "Python and Terminal use qualified OS isolation.",
     };
   }
   if (capability?.protection_state === "preview") {
     return {
       state: "preview",
-      label: `Preview OS isolation · ${backendLabel(capability.backend, capability.environment)}`,
+      label: `Preview OS isolation · ${backendLabel(capability.backend, capability.environment, capability.profile_id)}`,
       description:
         "Python and Terminal use a preview sandbox whose live enforcement probe passed.",
     };
@@ -188,12 +194,35 @@ function parseCapability(body: unknown): ToolIsolationCapability {
     retryable: value.retryable === true,
     available: value.available === true,
     qualified: value.qualified === true,
-    limitations: Array.isArray(value.limitations)
-      ? value.limitations.filter(
-          (item): item is string => typeof item === "string",
-        )
-      : [],
+    limitations: stringList(value.limitations),
+    // Additive fields: a backend that predates the network proxy or the Windows
+    // restricted token simply omits them, and the UI then offers neither.
+    network_policies: networkPolicyList(value.network_policies),
+    network_allowlist: stringList(value.network_allowlist),
+    limited_backend:
+      typeof value.limited_backend === "string" && value.limited_backend
+        ? value.limited_backend
+        : null,
+    limited_profile_id:
+      typeof value.limited_profile_id === "string" && value.limited_profile_id
+        ? value.limited_profile_id
+        : null,
+    limited_limitations: stringList(value.limited_limitations),
   };
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function networkPolicyList(value: unknown): ToolNetworkPolicy[] {
+  const known = stringList(value).filter((item): item is ToolNetworkPolicy =>
+    (TOOL_NETWORK_POLICIES as readonly string[]).includes(item),
+  );
+  // "deny" is always enforceable; an allowlist is offered only when the backend says so.
+  return known.includes("deny") ? known : ["deny", ...known];
 }
 
 function parseGrant(body: unknown): LimitedToolGrant {

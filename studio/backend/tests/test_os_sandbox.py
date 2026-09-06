@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import math
+import ntpath
 import os
+import posixpath
+from types import SimpleNamespace
 import shlex
 import shutil
 import socket
@@ -18,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -306,10 +311,88 @@ def test_mount_topology_changes_environment_fingerprint(monkeypatch):
 
     before = os_sandbox._environment_fingerprint(None)
     mounts.append(
-        os_sandbox._LinuxMount("2", "1", "0:2", "/", "/run/secrets", "ro", "tmpfs", "tmpfs", "ro")
+        os_sandbox._LinuxMount("2", "1", "0:2", "/", "/usr/share/secrets", "ro", "tmpfs", "tmpfs", "ro")
     )
 
     assert os_sandbox._environment_fingerprint(None) != before
+
+
+def test_unrelated_mounts_do_not_change_environment_fingerprint(monkeypatch):
+    """A USB stick, a container volume or a gvfs mount never enter the sandbox."""
+    monkeypatch.setattr(os_sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(os_sandbox, "_environment_class", lambda: "container")
+    monkeypatch.setattr(os_sandbox.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(os_sandbox, "_runtime_read_paths", lambda: ("/opt/python/bin/python",))
+    mounts = [os_sandbox._LinuxMount("1", "0", "0:1", "/", "/", "rw", "overlay", "overlay", "rw")]
+    monkeypatch.setattr(os_sandbox, "_linux_mounts", lambda: tuple(mounts))
+
+    before = os_sandbox._environment_fingerprint(None)
+    for point in ("/media/usb", "/run/user/1000/gvfs", "/var/lib/docker/overlay2/abc/merged", "/mnt/data"):
+        mounts.append(os_sandbox._LinuxMount("9", "1", "0:9", "/", point, "rw", "ext4", "/dev/sdb1", "rw"))
+    assert os_sandbox._environment_fingerprint(None) == before
+
+    # A mount that contains the interpreter is relevant, as is one under a system root.
+    mounts.append(os_sandbox._LinuxMount("3", "1", "0:3", "/", "/opt", "rw", "ext4", "/dev/sdc1", "rw"))
+    after_runtime_mount = os_sandbox._environment_fingerprint(None)
+    assert after_runtime_mount != before
+    mounts.append(os_sandbox._LinuxMount("4", "1", "0:4", "/", "/usr/lib/x", "ro", "squashfs", "loop0", "ro"))
+    assert os_sandbox._environment_fingerprint(None) != after_runtime_mount
+
+
+def test_probe_generation_ignores_reason_wording(monkeypatch, isolated_capability_cache):
+    """Grants are bound to security facts, not to the text of a diagnostic."""
+    monkeypatch.setattr(os_sandbox, "_environment_class", lambda: "container")
+    monkeypatch.setattr(os_sandbox, "_environment_fingerprint", lambda _backend: "fingerprint")
+    first = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability("linux-bubblewrap", False, "probe failed: /tmp/a1b2/host"),
+        environment = "container",
+        fingerprint = "fingerprint",
+    )
+    second = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability("linux-bubblewrap", False, "probe failed: /tmp/z9y8/host"),
+        environment = "container",
+        fingerprint = "fingerprint",
+    )
+    assert first.probe_generation == second.probe_generation
+    qualified = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability("linux-bubblewrap", True, "restrictive live probe passed"),
+        environment = "container",
+        fingerprint = "fingerprint",
+    )
+    assert qualified.probe_generation != first.probe_generation
+    with_limitation = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability(
+            "linux-bubblewrap", True, "restrictive live probe passed",
+            limitations = (os_sandbox._LIMITATION_NESTED_USERNS_SECCOMP,),
+        ),
+        environment = "container",
+        fingerprint = "fingerprint",
+    )
+    assert with_limitation.probe_generation != qualified.probe_generation
+
+
+def test_backend_remediation_survives_identity_stamping():
+    generic = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability("linux-bubblewrap", False, "no bwrap"),
+        environment = "native_linux",
+        fingerprint = "fp",
+    )
+    assert "Limited mode" in generic.remediation
+    specific = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability(
+            "linux-bubblewrap", False, "blocked", remediation = "install the profile"
+        ),
+        environment = "native_linux",
+        fingerprint = "fp",
+    )
+    assert specific.remediation == "install the profile"
+    assert specific.probe_generation == generic.probe_generation
+    available = os_sandbox._capability_with_identity(
+        os_sandbox.SandboxCapability("linux-bubblewrap", True, "ok", remediation = "ignored"),
+        environment = "native_linux",
+        fingerprint = "fp",
+    )
+    assert available.remediation == "No remediation required."
 
 
 @pytest.mark.parametrize("field", ["close_fds", "terminate_descendants"])
@@ -413,8 +496,9 @@ def test_prepare_revalidates_runtime_roots_before_mounts(monkeypatch, tmp_path):
 def test_unsafe_runtime_socket_never_reaches_bwrap_argv(monkeypatch, tmp_path):
     workdir = tmp_path / "session"
     workdir.mkdir()
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    # A short root keeps the socket path under sun_path's 108 bytes on any checkout.
+    runtime_dir = tempfile.TemporaryDirectory(prefix = "us-rt-", dir = "/tmp")
+    runtime = Path(runtime_dir.name)
     server = socket.socket(socket.AF_UNIX)
     server.bind(str(runtime / "host.sock"))
     monkeypatch.setattr(os_sandbox, "_runtime_read_paths", lambda: (str(runtime),))
@@ -430,6 +514,7 @@ def test_unsafe_runtime_socket_never_reaches_bwrap_argv(monkeypatch, tmp_path):
             backend.prepare(_spec(workdir))
     finally:
         server.close()
+        runtime_dir.cleanup()
     mount_construction.assert_not_called()
 
 
@@ -662,8 +747,9 @@ def test_linux_system_root_scan_does_not_prune_searchable_directory(monkeypatch,
     reason = "the trusted /usr/bin/find fast path is Linux-specific",
 )
 def test_find_fast_path_rejects_bound_runtime_unix_socket(monkeypatch, tmp_path):
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    # A short root keeps the socket path under sun_path's 108 bytes on any checkout.
+    runtime_dir = tempfile.TemporaryDirectory(prefix = "us-rt-", dir = "/tmp")
+    runtime = Path(runtime_dir.name)
     workdir = tmp_path / "work"
     workdir.mkdir()
     server = socket.socket(socket.AF_UNIX)
@@ -683,6 +769,7 @@ def test_find_fast_path_rejects_bound_runtime_unix_socket(monkeypatch, tmp_path)
             os_sandbox._validate_runtime_paths((str(runtime),), str(workdir))
     finally:
         server.close()
+        runtime_dir.cleanup()
 
     assert commands and commands[0][0] == "/usr/bin/find"
     assert ("-type", "s") in tuple(zip(commands[0], commands[0][1:]))
@@ -1012,13 +1099,53 @@ def test_real_tool_path_prepares_before_launch_and_never_popen_inner_argv(
     assert launched_kwargs["env"] == {"MODE": "prepared"}
     assert launched_kwargs["close_fds"] is True
     assert launched_kwargs["stdin"] is subprocess.DEVNULL
-    assert prepared.cleanup.call_count == 1
+    # The result path releases the launch before it finalises the result, so the
+    # cleanup diagnostics can be reported; the finally block calls it again and
+    # that second call is a no-op, since every cleanup list is popped.
+    assert prepared.cleanup.call_count in (1, 2)
     assert lifecycle_events == ["popen", prepared.execution_record]
     if kind == "python":
         assert specs[0].argv[0:2] == (sys.executable, "-u")
         assert specs[0].argv[2].endswith(".py")
     else:
-        assert specs[0].argv == tuple(inference_tools._get_shell_cmd("printf ok"))
+        # Required mode: on Windows this is cmd even when Git bash exists.
+        if sys.platform == "win32":
+            # The isolated Terminal hands cmd a batch file written in the workdir.
+            # call, not the bare path: cmd's search for a command named like a
+            # batch file is refused inside the container.
+            assert specs[0].argv[:4] == ("cmd", "/d", "/c", "call")
+            assert specs[0].argv[4].endswith(".cmd")
+            assert os.path.dirname(specs[0].argv[4]) == os.path.normpath(specs[0].workdir)
+        else:
+            assert specs[0].argv == tuple(inference_tools._get_shell_cmd("printf ok", os_isolated = True))
+
+
+def test_prepared_launch_cleanup_is_idempotent_and_records_its_failures(tmp_path):
+    """The tool result path calls cleanup, then the finally calls it again."""
+    calls: list[str] = []
+    private = tmp_path / "private"
+    private.mkdir()
+
+    def failing() -> None:
+        calls.append("failing")
+        raise RuntimeError("the private mount is still busy")
+
+    prepared = os_sandbox.PreparedSandboxLaunch(
+        argv = ("true",),
+        workdir = str(tmp_path),
+        env = {},
+        preexec_fn = None,
+        backend = "test-native",
+        cleanup_paths = [str(private)],
+        cleanup_callbacks = [failing],
+    )
+    prepared.cleanup()
+    assert calls == ["failing"]
+    assert prepared.cleanup_diagnostics == ["RuntimeError: the private mount is still busy"]
+    assert not private.exists()
+    prepared.cleanup()
+    assert calls == ["failing"], "the second cleanup has nothing left to do"
+    assert len(prepared.cleanup_diagnostics) == 1
 
 
 @pytest.mark.parametrize("kind", ["python", "terminal"])
@@ -1091,7 +1218,52 @@ def test_popen_failure_emits_no_execution_record(kind, monkeypatch, tmp_path):
     assert "launcher failed before payload" in result
     assert records == []
     assert not sentinel.exists()
-    prepared.cleanup.assert_called_once()
+    # Cleanup runs on the exception path before the result is built, so its
+    # diagnostics reach the caller, and again in the finally, which is
+    # idempotent. The same one-or-two shape as every other exit path.
+    assert prepared.cleanup.call_count in (1, 2)
+
+
+@pytest.mark.parametrize("kind", ["python", "terminal"])
+def test_a_failed_launch_still_reports_what_cleanup_could_not_undo(kind, monkeypatch, tmp_path):
+    # The exception path used to return before the finally cleaned up, so a
+    # launch that failed AND left ACEs or a temp behind told the caller only
+    # about the first failure. That is the case where the second one matters
+    # most, since nothing else will mention it.
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _patch_tool_harness(monkeypatch, workdir)
+    prepared = os_sandbox.PreparedSandboxLaunch(
+        argv = ("qualified-native-sandbox", "opaque-inner-command"),
+        workdir = str(workdir),
+        env = {"MODE": "prepared"},
+        preexec_fn = None,
+        backend = "test-native",
+        execution_record = os_sandbox.ToolExecutionRecord(
+            requested_mode = "os_isolation_required",
+            effective_mode = "os_isolation_required",
+            environment = "native_linux",
+            backend = "test-native",
+            profile_id = "test-v1",
+            probe_generation = "generation",
+            os_isolation = True,
+            retained_safeguards = ("os_isolation",),
+        ),
+    )
+    prepared.cleanup = Mock(side_effect = lambda: prepared.cleanup_diagnostics.append(
+        "the workdir grant could not be revoked"
+    ))
+    monkeypatch.setattr(inference_tools, "prepare_tool_launch", lambda _spec: prepared)
+    monkeypatch.setattr(
+        inference_tools.subprocess,
+        "Popen",
+        Mock(side_effect = OSError("launcher failed before payload")),
+    )
+
+    result = _invoke_tool(kind)
+
+    assert "launcher failed before payload" in result
+    assert "the workdir grant could not be revoked" in result
 
 
 @pytest.mark.parametrize("kind", ["python", "terminal"])
@@ -1197,7 +1369,12 @@ def test_windows_limited_resource_setup_fails_before_payload_runs(
         limited_grant = grant.token,
     )
 
-    assert "could not establish Windows process resource limits" in result
+    # The process guard reports the failed job; the write-restricted token
+    # launcher creates its job before the process and reports the invalid limit.
+    assert (
+        "could not establish Windows process resource limits" in result
+        or "Windows sandbox resource limits are invalid" in result
+    )
     assert not sentinel.exists()
 
 
@@ -1229,6 +1406,515 @@ def test_posix_limited_resource_setup_fails_before_payload_runs(
 
     assert "Limited mode resource-limit configuration is invalid" in result
     assert not sentinel.exists()
+
+
+_LINUX_ONLY = pytest.mark.skipif(sys.platform != "linux", reason = "Linux Bubblewrap backend")
+
+
+def _fake_prepare_environment(monkeypatch, tmp_path, *, identity_only: bool = False):
+    """The monkeypatch set the existing argv tests use so prepare() runs without bwrap."""
+    identity = tmp_path / "identity"
+    identity.mkdir(exist_ok = True)
+    passwd = identity / "passwd"
+    group = identity / "group"
+    passwd.touch()
+    group.touch()
+    monkeypatch.setattr(
+        os_sandbox, "_identity_files", lambda: (str(identity), str(passwd), str(group))
+    )
+    if identity_only:
+        return
+    monkeypatch.setattr(os_sandbox, "_runtime_read_paths", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_linux_mounts", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_validate_runtime_paths", lambda *args, **kwargs: None)
+    monkeypatch.setattr(os_sandbox, "_LINUX_SYSTEM_ROOTS", ())
+    monkeypatch.setattr(os_sandbox, "_LINUX_ETC_FILES", ())
+
+
+@_LINUX_ONLY
+def test_system_root_scan_timeout_is_transient_and_never_cached(
+    monkeypatch, tmp_path, isolated_capability_cache
+):
+    def timing_out(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(os_sandbox, "_trusted_linux_executable", lambda _path: True)
+    monkeypatch.setattr(os_sandbox, "_linux_mount_points", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_linux_mounts", lambda: ())
+    monkeypatch.setattr(os_sandbox.subprocess, "run", timing_out)
+    os_sandbox._forget_system_scan_memo()
+
+    with pytest.raises(os_sandbox.SandboxUnavailableError) as excinfo:
+        os_sandbox._validate_runtime_paths(
+            ("/usr/lib",), str(tmp_path), include_system_roots = True, allow_nested_mounts = True
+        )
+    assert excinfo.value.transient is True
+    assert f"exceeded {os_sandbox._SYSTEM_SCAN_TIMEOUT_SECONDS} s" in str(excinfo.value)
+
+    # Interpreter roots keep the short budget and the same transient marker.
+    # (An explicit user-writable root: a venv interpreter that resolves into
+    # /usr/bin is a system root and would not be scanned at all.)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    with pytest.raises(os_sandbox.SandboxUnavailableError) as excinfo:
+        os_sandbox._validate_runtime_paths((str(runtime),), str(workdir), allow_nested_mounts = True)
+    assert excinfo.value.transient is True
+    assert f"exceeded {os_sandbox._RUNTIME_SCAN_TIMEOUT_SECONDS} s" in str(excinfo.value)
+
+    # Through the backend and the snapshot: retryable, and nothing is cached.
+    monkeypatch.setattr(os_sandbox.shutil, "which", lambda _name: "/usr/bin/bwrap")
+    monkeypatch.setattr(os_sandbox, "_bwrap_supported_options", lambda _p: frozenset({"--disable-userns"}))
+    backend = os_sandbox.LinuxBubblewrapBackend()
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    monkeypatch.setattr(os_sandbox, "_environment_class", lambda **_k: "native_linux")
+    monkeypatch.setattr(os_sandbox, "_environment_fingerprint", lambda _b, **_k: "fp-timeout")
+    capability = os_sandbox.capability_snapshot(force = True)
+    assert not capability.available
+    assert capability.transient is True and capability.retryable is True
+    assert "unsafe to expose" in capability.reason and "exceeded" in capability.reason
+    assert os_sandbox._capability_cache == {}
+
+
+@_LINUX_ONLY
+def test_system_root_scan_is_memoized_but_interpreter_scan_is_not(monkeypatch, tmp_path):
+    calls: list[tuple[str, ...]] = []
+
+    def recording_run(command, **kwargs):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(os_sandbox, "_trusted_linux_executable", lambda _path: True)
+    monkeypatch.setattr(os_sandbox, "_linux_mount_points", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_linux_mounts", lambda: ())
+    monkeypatch.setattr(os_sandbox.subprocess, "run", recording_run)
+    os_sandbox._forget_system_scan_memo()
+    try:
+        for _ in range(3):
+            os_sandbox._validate_runtime_paths(
+                ("/usr/lib",), str(tmp_path), include_system_roots = True, allow_nested_mounts = True
+            )
+        assert len(calls) == 1, "a passed system-root scan is remembered"
+        assert "-executable" in calls[0]
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        for _ in range(2):
+            os_sandbox._validate_runtime_paths((str(runtime),), str(workdir), allow_nested_mounts = True)
+        assert len(calls) == 3, "user-writable interpreter roots are scanned every launch"
+
+        # A mount change under the roots invalidates the memo.
+        monkeypatch.setattr(
+            os_sandbox,
+            "_linux_mounts",
+            lambda: (os_sandbox._LinuxMount("7", "1", "0:7", "/", "/usr/lib/x", "ro", "squashfs", "loop0", "ro"),),
+        )
+        os_sandbox._validate_runtime_paths(
+            ("/usr/lib",), str(tmp_path), include_system_roots = True, allow_nested_mounts = True
+        )
+        assert len(calls) == 4
+        os_sandbox._forget_system_scan_memo()
+        os_sandbox._validate_runtime_paths(
+            ("/usr/lib",), str(tmp_path), include_system_roots = True, allow_nested_mounts = True
+        )
+        assert len(calls) == 5
+    finally:
+        os_sandbox._forget_system_scan_memo()
+
+
+@_LINUX_ONLY
+def test_bwrap_supported_options_parses_usage_and_caches(monkeypatch, tmp_path):
+    bwrap = tmp_path / "bwrap"
+    bwrap.write_text("#!/bin/sh\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        usage = (
+            "usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n\n"
+            "    --unshare-all                Unshare every namespace we support by default\n"
+            "    --disable-userns             Disable further use of user namespaces inside sandbox\n"
+            "    --cap-drop CAP               Drop cap CAP when running as privileged user\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout = "", stderr = usage)
+
+    monkeypatch.setattr(os_sandbox.subprocess, "run", fake_run)
+    os_sandbox._bwrap_options_cache.clear()
+    options = os_sandbox._bwrap_supported_options(str(bwrap))
+    assert {"--unshare-all", "--disable-userns", "--cap-drop"} <= options
+    assert os_sandbox._bwrap_supported_options(str(bwrap)) is options
+    assert calls == [(str(bwrap), "--help")]
+
+    def old_run(command, **kwargs):
+        usage = "usage: bwrap [OPTIONS...]\n    --unshare-all    Unshare every namespace\n"
+        return subprocess.CompletedProcess(command, 0, stdout = "", stderr = usage)
+
+    monkeypatch.setattr(os_sandbox.subprocess, "run", old_run)
+    os_sandbox._bwrap_options_cache.clear()
+    assert "--disable-userns" not in os_sandbox._bwrap_supported_options(str(bwrap))
+
+    def failing_run(command, **kwargs):
+        raise OSError("cannot execute")
+
+    monkeypatch.setattr(os_sandbox.subprocess, "run", failing_run)
+    os_sandbox._bwrap_options_cache.clear()
+    assert os_sandbox._bwrap_supported_options(str(bwrap)) == frozenset()
+    os_sandbox._bwrap_options_cache.clear()
+
+
+@_LINUX_ONLY
+def test_bwrap_argv_is_unchanged_when_disable_userns_is_supported(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _fake_prepare_environment(monkeypatch, tmp_path)
+    backend = os_sandbox.LinuxBubblewrapBackend()
+    backend._bwrap = "/usr/bin/bwrap"
+    prepared = backend.prepare(_spec(workdir))
+    try:
+        argv = prepared.argv
+        assert argv[:6] == (
+            "/usr/bin/bwrap", "--die-with-parent", "--new-session", "--unshare-all",
+            "--unshare-user", "--disable-userns",
+        )
+        assert prepared.execution_record is None
+        assert backend._limitations() == ()
+        seccomp = prepared.owned_files[0]
+        seccomp.seek(0)
+        assert seccomp.read() == os_sandbox._linux_seccomp_program()
+    finally:
+        prepared.cleanup()
+
+
+@_LINUX_ONLY
+def test_bwrap_without_disable_userns_uses_seccomp_fallback(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _fake_prepare_environment(monkeypatch, tmp_path)
+    backend = os_sandbox.LinuxBubblewrapBackend()
+    backend._bwrap = "/usr/bin/bwrap"
+    backend._disable_userns_supported = False
+    prepared = backend.prepare(_spec(workdir))
+    try:
+        argv = prepared.argv
+        assert "--disable-userns" not in argv
+        assert argv[:5] == (
+            "/usr/bin/bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--unshare-user",
+        )
+        assert argv[5:7] == ("--cap-drop", "ALL")
+        assert backend._limitations() == (os_sandbox._LIMITATION_NESTED_USERNS_SECCOMP,)
+        seccomp = prepared.owned_files[0]
+        seccomp.seek(0)
+        assert seccomp.read() == os_sandbox._linux_seccomp_program(block_userns = True)
+    finally:
+        prepared.cleanup()
+
+
+@_LINUX_ONLY
+def test_seccomp_fallback_program_denies_nested_user_namespaces():
+    base = os_sandbox._linux_seccomp_program()
+    fallback = os_sandbox._linux_seccomp_program(block_userns = True)
+    decode = lambda program: [struct.unpack("=HBBI", program[i:i + 8]) for i in range(0, len(program), 8)]
+    base_ops = decode(base)
+    fallback_ops = decode(fallback)
+    assert len(base_ops) == 14
+    assert len(fallback_ops) == 14 + 9
+    # Prefix (arch check + nr load) is shared, the socket/io_uring tail is identical.
+    assert fallback_ops[:4] == base_ops[:4]
+    assert fallback_ops[-10:] == base_ops[-10:]
+    clone_nr, unshare_nr, clone3_nr = os_sandbox._LINUX_USERNS_SYSCALLS[os_sandbox.platform.machine().lower()]
+    eperm = 0x00050000 | os_sandbox.errno.EPERM
+    enosys = 0x00050000 | os_sandbox.errno.ENOSYS
+    middle = fallback_ops[4:13]
+    assert middle[0][3] == unshare_nr and middle[1][3] == eperm
+    assert middle[2][3] == clone3_nr and middle[3][3] == enosys
+    assert middle[4][3] == clone_nr
+    assert middle[5] == (0x20, 0, 0, 16)  # load args[0] (clone flags)
+    assert middle[6][3] == os_sandbox._CLONE_NEWUSER and middle[7][3] == eperm
+    assert middle[8] == (0x20, 0, 0, 0)  # reload nr for the socket checks
+    # Every jump target stays inside the program.
+    for index, (code, jt, jf, _k) in enumerate(fallback_ops):
+        if code in (0x15, 0x45):
+            assert index + 1 + jt < len(fallback_ops) and index + 1 + jf < len(fallback_ops)
+
+
+def _run_seccomp_program(program: bytes, *, nr: int, arch: int, arg0: int = 0) -> str:
+    """Interpret the classic-BPF seccomp program the way the kernel would, for one syscall."""
+    ops = [struct.unpack_from("=HBBI", program, i) for i in range(0, len(program), 8)]
+    data = {0: nr, 4: arch, 16: arg0 & 0xFFFFFFFF, 20: arg0 >> 32}
+    verdicts = {
+        0x80000000: "KILL",
+        0x7FFF0000: "ALLOW",
+        0x00050000 | errno.EPERM: "EPERM",
+        0x00050000 | errno.ENOSYS: "ENOSYS",
+    }
+    accumulator = 0
+    pc = 0
+    for _ in range(64):
+        assert pc < len(ops), "program fell off its end"
+        code, jt, jf, k = ops[pc]
+        if code == 0x20:
+            accumulator = data[k]
+            pc += 1
+        elif code == 0x15:
+            pc += 1 + (jt if accumulator == k else jf)
+        elif code == 0x45:
+            pc += 1 + (jt if accumulator & k else jf)
+        elif code == 0x06:
+            return verdicts[k]
+        else:
+            raise AssertionError(f"unexpected BPF opcode {code:#x}")
+    raise AssertionError("program did not terminate")
+
+
+@pytest.mark.parametrize(
+    "machine, arch, syscalls",
+    [
+        ("x86_64", 0xC000003E, {"read": 0, "socket": 41, "socketpair": 53, "clone": 56, "unshare": 272}),
+        ("aarch64", 0xC00000B7, {"read": 63, "socket": 198, "socketpair": 199, "clone": 220, "unshare": 97}),
+    ],
+)
+def test_seccomp_programs_decide_each_syscall_as_documented(monkeypatch, machine, arch, syscalls):
+    monkeypatch.setattr(os_sandbox.platform, "machine", lambda: machine)
+    for block_userns in (False, True):
+        program = os_sandbox._linux_seccomp_program(block_userns = block_userns)
+        run = lambda nr, arg0 = 0, arch = arch: _run_seccomp_program(program, nr = nr, arch = arch, arg0 = arg0)
+        assert run(syscalls["read"], arch = 0x1234) == "KILL"
+        assert run(syscalls["read"]) == "ALLOW"
+        assert run(syscalls["socket"], 2) == "ALLOW"  # AF_INET
+        assert run(syscalls["socket"], os_sandbox._AF_VSOCK) == "EPERM"
+        assert run(syscalls["socketpair"], os_sandbox._AF_VSOCK) == "EPERM"
+        assert run(425) == "EPERM"  # io_uring_setup
+        if machine == "x86_64":
+            assert run(syscalls["read"] | 0x40000000) == "EPERM"  # x32 ABI bit
+        nested = "EPERM" if block_userns else "ALLOW"
+        assert run(syscalls["unshare"], os_sandbox._CLONE_NEWUSER) == nested
+        assert run(syscalls["clone"], os_sandbox._CLONE_NEWUSER | 17) == nested
+        assert run(435) == ("ENOSYS" if block_userns else "ALLOW")  # clone3
+        # A plain fork-style clone keeps working under the fallback filter.
+        assert run(syscalls["clone"], 17) == "ALLOW"
+
+
+@_LINUX_ONLY
+def test_apparmor_userns_restriction_gets_profile_remediation(monkeypatch, isolated_capability_cache):
+    raw = os_sandbox.SandboxCapability(
+        "linux-bubblewrap",
+        False,
+        "the restrictive live probe failed (1): bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+    )
+    monkeypatch.setattr(
+        os_sandbox, "_read_text",
+        lambda path: "1\n" if path == os_sandbox._APPARMOR_USERNS_SYSCTL else "",
+    )
+    explained = os_sandbox._explain_linux_probe_failure(raw)
+    assert explained.reason.startswith("AppArmor restricts unprivileged user namespaces")
+    assert "the restrictive live probe failed (1)" in explained.reason
+    assert "/etc/apparmor.d/bwrap" in explained.remediation
+    assert "apparmor_parser -r" in explained.remediation
+    assert "Limited mode" in explained.remediation
+    stamped = os_sandbox._capability_with_identity(
+        explained, environment = "native_linux", fingerprint = "fp"
+    )
+    assert stamped.remediation == os_sandbox._APPARMOR_USERNS_REMEDIATION
+    assert stamped.protection_state == "unavailable"
+
+    # The profile names the binary that was probed, not always /usr/bin/bwrap.
+    local = os_sandbox._explain_linux_probe_failure(raw, "/usr/local/bin/bwrap")
+    assert "profile bwrap /usr/local/bin/bwrap flags=(unconfined)" in local.remediation
+    assert "/usr/bin/bwrap" not in local.remediation
+
+    # Same symptom without the sysctl: the explanation is not attached.
+    monkeypatch.setattr(os_sandbox, "_read_text", lambda path: "0\n")
+    assert os_sandbox._explain_linux_probe_failure(raw) == raw
+    # A qualified result or an unrelated failure is never rewritten.
+    monkeypatch.setattr(os_sandbox, "_read_text", lambda path: "1\n")
+    other = os_sandbox.SandboxCapability("linux-bubblewrap", False, "Bubblewrap is not installed")
+    assert os_sandbox._explain_linux_probe_failure(other) == other
+    passed = os_sandbox.SandboxCapability("linux-bubblewrap", True, "restrictive live probe passed")
+    assert os_sandbox._explain_linux_probe_failure(passed) == passed
+
+
+def test_runtime_read_paths_include_every_symlink_hop(monkeypatch, tmp_path):
+    real = Path(os.path.realpath(sys.executable))
+    hop_c = tmp_path / "c" / "bin"
+    hop_b = tmp_path / "b" / "bin"
+    hop_a = tmp_path / "a" / "bin"
+    for hop in (hop_a, hop_b, hop_c):
+        hop.mkdir(parents = True)
+    (hop_c / "python3.12").symlink_to(real)
+    (hop_b / "python3").symlink_to(hop_c / "python3.12")
+    (hop_a / "python").symlink_to(os.path.join("..", "..", "b", "bin", "python3"))  # relative link
+    chain = os_sandbox._symlink_chain(str(hop_a / "python"))
+    assert chain == [str(hop_a / "python"), str(hop_b / "python3"), str(hop_c / "python3.12"), str(real)]
+
+    monkeypatch.setattr(os_sandbox.sys, "executable", str(hop_a / "python"))
+    paths = os_sandbox._runtime_read_paths()
+    for expected in (
+        hop_a / "python", hop_b / "python3", hop_c / "python3.12", real,
+        hop_a, hop_b, hop_c, real.parent,
+    ):
+        assert str(expected) in paths, expected
+    assert os.path.join(sys.prefix, "bin") in paths or not os.path.isdir(os.path.join(sys.prefix, "bin"))
+
+    # A link loop terminates.
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop.name)
+    assert os_sandbox._symlink_chain(str(loop)) == [str(loop)]
+
+
+class _TokenPrintingBackend:
+    """Stands in for a qualified backend: the probe child only has to print the token."""
+
+    identity = "test-token-backend"
+    profile_id = "test-token-profile-v1"
+
+    def __init__(self):
+        self.specs = []
+
+    def prepare(self, spec):
+        self.specs.append(spec)
+        return os_sandbox.PreparedSandboxLaunch(
+            argv = (sys.executable, "-c", f"print({os_sandbox._PROBE_TOKEN!r})"),
+            workdir = spec.workdir,
+            env = spec.env,
+            preexec_fn = None,
+            backend = self.identity,
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason = "POSIX live probe (Windows has its own)")
+def test_live_probe_tolerates_missing_ipv6_loopback(monkeypatch):
+    real_socket = socket.socket
+
+    class NoIPv6Socket(real_socket):
+        def __init__(self, family = -1, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+            super().__init__(family, *args, **kwargs)
+
+    monkeypatch.setattr(os_sandbox.socket, "socket", NoIPv6Socket)
+    backend = _TokenPrintingBackend()
+    result = os_sandbox._live_probe(backend)
+    assert result.qualified, result
+    assert result.limitations == (os_sandbox._LIMITATION_IPV6_UNAVAILABLE,)
+    payload = backend.specs[0].argv[-1]
+    assert "::1" not in payload
+    assert "127.0.0.1" in payload
+    assert "libc.unshare(" in payload
+
+    backend = _TokenPrintingBackend()
+    monkeypatch.setattr(os_sandbox.socket, "socket", real_socket)
+    result = os_sandbox._live_probe(backend)
+    assert result.qualified, result
+    assert result.limitations == ()
+    if socket.has_ipv6:
+        try:
+            probe6 = real_socket(socket.AF_INET6)
+            probe6.bind(("::1", 0))
+            probe6.close()
+        except OSError:
+            pass
+        else:
+            assert "::1" in backend.specs[0].argv[-1]
+
+
+@_LINUX_ONLY
+def test_limited_mode_sweeps_marked_setsid_descendants(monkeypatch, tmp_path, isolated_capability_cache):
+    """A `setsid` grandchild escapes the process group; the run marker sweep still reaps it."""
+    if not shutil.which("setsid") or not shutil.which("sleep"):
+        pytest.skip("setsid and sleep are required")
+    workdir = tmp_path / "limited-work"
+    workdir.mkdir()
+    monkeypatch.setattr(inference_tools, "_get_workdir", lambda _session: str(workdir))
+    unavailable = os_sandbox.SandboxCapability(
+        "linux-bubblewrap", False, "test: forced unavailable", available = False,
+        environment = "native_linux", protection_state = "unavailable",
+        probe_generation = "sweep-generation", environment_fingerprint = "fp",
+    )
+    monkeypatch.setattr(os_sandbox, "capability_snapshot", lambda **_k: unavailable)
+    grant = tool_isolation.issue_limited_grant(
+        current_subject = "test:limited-user",
+        tool_ui_session_id = "test-page",
+        probe_generation = unavailable.probe_generation,
+    )
+    swept: list[str] = []
+    real_sweep = inference_tools._sweep_marked_descendants
+
+    def recording_sweep(marker):
+        swept.append(marker)
+        return real_sweep(marker)
+
+    monkeypatch.setattr(inference_tools, "_sweep_marked_descendants", recording_sweep)
+    duration = 1285
+    result = inference_tools._bash_exec(
+        f"setsid sleep {duration} >/dev/null 2>&1 < /dev/null & echo started; "
+        f"printf '%s' \"${inference_tools._LIMITED_RUN_MARKER_ENV}\" > marker.txt",
+        None,
+        20,
+        "t",
+        tool_execution_mode = "limited",
+        current_subject = "test:limited-user",
+        tool_ui_session_id = "test-page",
+        limited_grant = grant.token,
+    )
+    assert "started" in result, result
+    assert len(swept) == 1
+    marker = swept[0]
+    assert (workdir / "marker.txt").read_text() == marker, "the marker reached the child environment"
+    time.sleep(0.2)
+    needle = f"{inference_tools._LIMITED_RUN_MARKER_ENV}={marker}".encode()
+    survivors = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/environ", "rb") as stream:
+                if needle in stream.read().split(b"\0"):
+                    survivors.append(entry)
+        except OSError:
+            continue
+    assert survivors == [], survivors
+    pgrep = subprocess.run(["pgrep", "-f", f"sleep {duration}$"], capture_output = True, text = True)
+    assert pgrep.stdout.strip() == "", pgrep.stdout
+
+
+@_LINUX_ONLY
+def test_limited_child_has_no_new_privs_and_marker(monkeypatch, tmp_path, isolated_capability_cache):
+    workdir = tmp_path / "limited-work"
+    workdir.mkdir()
+    monkeypatch.setattr(inference_tools, "_get_workdir", lambda _session: str(workdir))
+    unavailable = os_sandbox.SandboxCapability(
+        "linux-bubblewrap", False, "test: forced unavailable", available = False,
+        environment = "native_linux", protection_state = "unavailable",
+        probe_generation = "nnp-generation", environment_fingerprint = "fp",
+    )
+    monkeypatch.setattr(os_sandbox, "capability_snapshot", lambda **_k: unavailable)
+    grant = tool_isolation.issue_limited_grant(
+        current_subject = "test:limited-user",
+        tool_ui_session_id = "test-page",
+        probe_generation = unavailable.probe_generation,
+    )
+    records = []
+    result = inference_tools._python_exec(
+        "import ctypes, os\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "print('NNP', libc.prctl(39, 0, 0, 0, 0))\n"
+        f"print('MARKER', len(os.environ.get({inference_tools._LIMITED_RUN_MARKER_ENV!r}, '')))\n",
+        None,
+        20,
+        "t",
+        tool_execution_mode = "limited",
+        current_subject = "test:limited-user",
+        tool_ui_session_id = "test-page",
+        limited_grant = grant.token,
+        launch_record_callback = records.append,
+    )
+    assert "NNP 1" in result, result
+    assert "MARKER 32" in result, result
+    assert records and records[0].effective_mode == "limited"
+    assert records[0].limitations == ()
 
 
 @pytest.fixture(scope = "module")
@@ -1727,6 +2413,67 @@ print('SYMLINK_VENV_SANDBOX_OK')
     assert "escape" not in runtime_config.read_text(encoding = "utf-8")
 
 
+def test_live_pyenv_style_symlink_chain_runs_inside_sandbox(qualified_native_capability, tmp_path):
+    """`versions/3.x/bin/python -> python3 -> python3.x -> real` must exec inside the jail.
+
+    Hosted toolcaches, pyenv and many venvs reach the interpreter through more
+    than one link; each hop has to be visible inside the sandbox.
+    """
+    real = Path(os.path.realpath(sys.executable))
+    version_bin = tmp_path / "versions" / "3.x" / "bin"
+    version_bin.mkdir(parents = True)
+    (version_bin / "python3.x").symlink_to(real)
+    (version_bin / "python3").symlink_to("python3.x")
+    (version_bin / "python").symlink_to("python3")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    backend_root = str(Path(__file__).resolve().parents[1])
+    helper = f"""
+import os, subprocess, sys, types
+logger = types.SimpleNamespace(warning=lambda *args, **kwargs: None)
+loggers = types.ModuleType('loggers')
+loggers.get_logger = lambda name: logger
+sys.modules['loggers'] = loggers
+from core.inference import os_sandbox
+assert os.path.abspath(sys.executable) == {str(version_bin / "python")!r}, sys.executable
+capability = os_sandbox.sandbox_capability()
+assert capability.qualified, capability
+spec = os_sandbox.SandboxLaunchSpec(
+    argv=(sys.executable, '-I', '-c', 'import sys; print("CHAIN_OK", sys.executable)'),
+    workdir={str(workdir)!r},
+    env={{'HOME': {str(workdir)!r}, 'TMPDIR': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8'}},
+)
+prepared = os_sandbox.prepare_tool_launch(spec)
+try:
+    for hop in ({str(version_bin / "python")!r}, {str(version_bin / "python3")!r}, {str(version_bin / "python3.x")!r}):
+        assert hop in prepared.argv, hop
+    completed = subprocess.run(
+        prepared.argv, cwd=prepared.workdir, env=prepared.env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=20, close_fds=True, preexec_fn=prepared.preexec_fn,
+        pass_fds=prepared.pass_fds,
+    )
+finally:
+    prepared.cleanup()
+assert completed.returncode == 0, completed.stderr
+assert 'CHAIN_OK' in completed.stdout, completed.stdout
+print('SYMLINK_CHAIN_SANDBOX_OK')
+"""
+    completed = subprocess.run(
+        [str(version_bin / "python"), "-c", helper],
+        cwd = backend_root,
+        env = {**os.environ, "PYTHONPATH": backend_root},
+        stdin = subprocess.DEVNULL,
+        stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE,
+        text = True,
+        timeout = 90,
+        close_fds = True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "SYMLINK_CHAIN_SANDBOX_OK" in completed.stdout
+
+
 def test_live_twenty_launch_startup_measurement(
     qualified_native_capability, tmp_path, record_property
 ):
@@ -1747,3 +2494,828 @@ def test_live_twenty_launch_startup_measurement(
     record_property("sandbox_startup_median_ms", round(median_ms, 3))
     record_property("sandbox_startup_p95_ms", round(p95_ms, 3))
     print(f"sandbox startup over 20 launches: median={median_ms:.3f}ms p95={p95_ms:.3f}ms")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason = "Windows extended-length link targets")
+def test_symlink_chain_strips_windows_extended_length_prefixes(monkeypatch, tmp_path):
+    """os.readlink on Windows reports absolute targets as \\\\?\\C:\\...; hops keep the plain spelling."""
+    links = {
+        str(tmp_path / "python"): "\\\\?\\" + str(tmp_path / "python3"),
+        str(tmp_path / "python3"): "\\\\?\\UNC\\server\\share\\python3.12",
+    }
+
+    def fake_readlink(path):
+        try:
+            return links[path]
+        except KeyError:
+            raise OSError("not a link")
+
+    monkeypatch.setattr(os_sandbox.os, "readlink", fake_readlink)
+    chain = os_sandbox._symlink_chain(str(tmp_path / "python"))
+    assert chain[0] == str(tmp_path / "python")
+    assert chain[1] == os.path.normpath(str(tmp_path / "python3"))
+    assert chain[2] == os.path.normpath("\\\\server\\share\\python3.12")
+    assert not any(hop.startswith("\\\\?\\") for hop in chain)
+
+
+# --- network allowlist policy -------------------------------------------------
+
+
+def _bridge_argv_test_setup(monkeypatch, tmp_path):
+    workdir = tmp_path / "session"
+    workdir.mkdir()
+    identity = tmp_path / "identity"
+    identity.mkdir()
+    (identity / "passwd").write_text("studio:x:1:1::/nonexistent:/bin/sh\n", encoding = "utf-8")
+    (identity / "group").write_text("studio:x:1:\n", encoding = "utf-8")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setattr(os_sandbox, "_linux_mounts", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_LINUX_SYSTEM_ROOTS", ())
+    monkeypatch.setattr(os_sandbox, "_LINUX_ETC_FILES", ())
+    monkeypatch.setattr(os_sandbox, "_runtime_read_paths", lambda: (str(runtime),))
+    monkeypatch.setattr(
+        os_sandbox,
+        "_identity_files",
+        lambda: (str(identity), str(identity / "passwd"), str(identity / "group")),
+    )
+    backend = os_sandbox.LinuxBubblewrapBackend()
+    backend._bwrap = "/usr/bin/bwrap"
+    return backend, workdir
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "Bubblewrap argv is Linux-only")
+def test_linux_deny_policy_argv_carries_no_bridge(monkeypatch, tmp_path):
+    backend, workdir = _bridge_argv_test_setup(monkeypatch, tmp_path)
+    prepared = backend.prepare(_spec(workdir, sys.executable, "-c", "pass"))
+    try:
+        assert os_sandbox._NETWORK_BRIDGE_ENV not in prepared.argv
+        assert "SSL_CERT_FILE" not in prepared.env
+        # Without a network the CA bundles stay outside the sandbox.
+        assert not any(path in prepared.argv for path in os_sandbox._LINUX_CA_TRUST_PATHS)
+        assert len(prepared.pass_fds) == 1
+        assert prepared.spawn_callback is None
+        assert prepared.network_audit is None
+        wrapper = prepared.argv[prepared.argv.index("-c") + 1]
+        assert "send_fds" not in wrapper
+        assert "os.execvpe" in wrapper
+    finally:
+        prepared.cleanup()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "Bubblewrap argv is Linux-only")
+def test_linux_allowlist_policy_argv_adds_control_fd_bridge_and_proxy(monkeypatch, tmp_path):
+    backend, workdir = _bridge_argv_test_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        os_sandbox,
+        "tls_trust_environment",
+        lambda base = None: {"SSL_CERT_FILE": "/fake/certifi/cacert.pem"},
+    )
+    # One store outside every bound tree (kept), one under /etc/ssl (already bound,
+    # skipped: mounting again on a bound tree made bwrap exit on staging).
+    monkeypatch.setattr(os_sandbox, "tls_trust_paths", lambda: ("/fake/openssl", "/etc/ssl/certs"))
+    plan = os_sandbox.replace(
+        _spec(workdir, sys.executable, "-c", "pass"), network_policy = "allowlist"
+    )
+    prepared = backend.prepare(plan)
+    try:
+        argv = prepared.argv
+        control_fd = int(argv[argv.index(os_sandbox._NETWORK_BRIDGE_ENV) + 1])
+        assert argv[argv.index(os_sandbox._NETWORK_BRIDGE_ENV) - 1] == "--setenv"
+        assert control_fd in prepared.pass_fds
+        assert len(prepared.pass_fds) == 2
+        assert prepared.spawn_callback is not None
+        assert prepared.network_audit is not None
+        wrapper = argv[argv.index("-c") + 1]
+        assert "send_fds" in wrapper
+        assert '("127.0.0.1", 0)' in wrapper
+        # The bridge runs before the exec and after the nproc clamp.
+        assert wrapper.index("setrlimit") < wrapper.index("send_fds") < wrapper.index("os.execvpe")
+        # No proxy variables leak in through the host environment: the wrapper
+        # sets them inside the namespace once the handshake completed.
+        assert "HTTPS_PROXY" not in prepared.env
+        # The trust bundle (when the interpreter needs one) rides in the host-side env.
+        assert prepared.env.get("SSL_CERT_FILE") == "/fake/certifi/cacert.pem"
+        assert "--unshare-all" in argv
+        # The CA bundles ride along, or TLS through the proxy fails verification.
+        for path in (*os_sandbox._LINUX_CA_TRUST_PATHS, "/fake/openssl"):
+            assert argv[argv.index(path) - 1] == "--ro-bind-try"
+        assert "/etc/ssl/certs" not in argv
+        # The uncovered store is bound after the runtime paths so nothing shadows it.
+        assert argv.index("/fake/openssl") > argv.index("/etc/ssl")
+    finally:
+        prepared.cleanup()
+    # Cleanup closed both socketpair ends and the proxy.
+    with pytest.raises(OSError):
+        os.fstat(control_fd)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "Bubblewrap argv is Linux-only")
+def test_linux_prepare_closes_the_proxy_and_the_bridge_when_it_fails(monkeypatch, tmp_path):
+    """Nothing owns the proxy until PreparedSandboxLaunch does, so prepare must."""
+    backend, workdir = _bridge_argv_test_setup(monkeypatch, tmp_path)
+    from core.inference import network_proxy
+
+    created: list[network_proxy.AllowlistProxy] = []
+    closed: list[network_proxy.AllowlistProxy] = []
+
+    class _RecordingProxy(network_proxy.AllowlistProxy):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    pairs: list[tuple[socket.socket, socket.socket]] = []
+    real_socketpair = socket.socketpair
+
+    def recording_socketpair(*args, **kwargs):
+        pair = real_socketpair(*args, **kwargs)
+        pairs.append(pair)
+        return pair
+
+    def unusable_wrapper(**kwargs):
+        raise RuntimeError("the wrapper source could not be built")
+
+    monkeypatch.setattr(os_sandbox, "AllowlistProxy", _RecordingProxy)
+    monkeypatch.setattr(os_sandbox.socket, "socketpair", recording_socketpair)
+    monkeypatch.setattr(os_sandbox, "_linux_wrapper_source", unusable_wrapper)
+    plan = os_sandbox.replace(
+        _spec(workdir, sys.executable, "-c", "pass"), network_policy = "allowlist"
+    )
+    with pytest.raises(RuntimeError):
+        backend.prepare(plan)
+    assert created and closed == created
+    assert pairs, "the bridge socketpair was never created"
+    for end in pairs[0]:
+        assert end.fileno() == -1, "a socketpair end outlived the failed prepare"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "the wrapper uses socket.send_fds on Linux")
+def test_linux_bridge_wrapper_hands_over_a_loopback_listener_and_publishes_the_proxy(tmp_path):
+    """Run the real wrapper (no Bubblewrap) against the real host-side handshake."""
+    wrapper = os_sandbox._linux_wrapper_source(limit = 4096, network_bridge = True)
+    host_end, sandbox_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    payload = (
+        "import os, json, sys; print(json.dumps({k: os.environ.get(k) for k in "
+        "('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', "
+        f"'{os_sandbox._NETWORK_BRIDGE_ENV}')}}))"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        os_sandbox._NETWORK_BRIDGE_ENV: str(sandbox_end.fileno()),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", wrapper, sys.executable, "-I", "-c", payload],
+        env = env,
+        pass_fds = (sandbox_end.fileno(),),
+        stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE,
+        text = True,
+    )
+    sandbox_end.close()
+    proxy = None
+    try:
+        listener = os_sandbox._receive_bridge_listener(host_end, timeout = 20)
+        assert listener.getsockname()[0] == "127.0.0.1"
+        port = listener.getsockname()[1]
+        proxy = os_sandbox.AllowlistProxy(
+            os_sandbox.NetworkAllowlist.from_entries(["pypi.org"])
+        )
+        proxy.serve_listener(listener)
+        host_end.sendall(b"K " + proxy.credential.token.encode() + b"\n")
+        out, err = proc.communicate(timeout = 30)
+        assert proc.returncode == 0, err
+        import json
+
+        published = json.loads(out.strip().splitlines()[-1])
+        expected = f"http://sandbox:{proxy.credential.token}@127.0.0.1:{port}"
+        assert published["HTTPS_PROXY"] == expected
+        assert published["https_proxy"] == expected
+        assert published["HTTP_PROXY"] == expected
+        assert published["ALL_PROXY"] == expected
+        assert published["NO_PROXY"] == "localhost,127.0.0.1,::1"
+        assert published[os_sandbox._NETWORK_BRIDGE_ENV] is None
+        # The listener the child created is now served by the host proxy: an
+        # unauthenticated CONNECT gets the proxy's 407, proving the handover.
+        client = socket.create_connection(("127.0.0.1", port), timeout = 5)
+        client.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org\r\n\r\n")
+        response = client.recv(4096)
+        client.close()
+        assert response.startswith(b"HTTP/1.1 407")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proxy is not None:
+            proxy.close()
+        host_end.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "the handshake is Linux-only")
+def test_bridge_listener_handover_rejects_wrong_socket_kinds(tmp_path):
+    host_end, sandbox_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        # A non-listening socket bound to a non-loopback address must be refused.
+        bad = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        bad.bind(("0.0.0.0", 0))
+        bad.listen(1)
+        socket.send_fds(sandbox_end, [b"L"], [bad.fileno()])
+        bad.close()
+        with pytest.raises(os_sandbox.SandboxUnavailableError, match = "not loopback"):
+            os_sandbox._receive_bridge_listener(host_end, timeout = 5)
+
+        unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        socket.send_fds(sandbox_end, [b"L"], [unix_listener.fileno()])
+        unix_listener.close()
+        with pytest.raises(os_sandbox.SandboxUnavailableError, match = "not a TCP socket"):
+            os_sandbox._receive_bridge_listener(host_end, timeout = 5)
+
+        not_listening = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        not_listening.bind(("127.0.0.1", 0))
+        socket.send_fds(sandbox_end, [b"L"], [not_listening.fileno()])
+        not_listening.close()
+        with pytest.raises(os_sandbox.SandboxUnavailableError, match = "not listening"):
+            os_sandbox._receive_bridge_listener(host_end, timeout = 5)
+
+        sandbox_end.sendall(b"X")
+        with pytest.raises(os_sandbox.SandboxUnavailableError, match = "unexpected message"):
+            os_sandbox._receive_bridge_listener(host_end, timeout = 5)
+
+        sandbox_end.close()
+        with pytest.raises(os_sandbox.SandboxUnavailableError):
+            os_sandbox._receive_bridge_listener(host_end, timeout = 5)
+    finally:
+        host_end.close()
+        try:
+            sandbox_end.close()
+        except OSError:
+            pass
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason = "the handshake is Linux-only")
+def test_bridged_spawn_kills_a_child_that_never_hands_over(monkeypatch, tmp_path):
+    monkeypatch.setattr(os_sandbox, "_NETWORK_BRIDGE_TIMEOUT_SECONDS", 1.0)
+    proxy = os_sandbox.AllowlistProxy(os_sandbox.NetworkAllowlist.from_entries(["pypi.org"]))
+    host_end, sandbox_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    spawn = os_sandbox._bridged_spawn(proxy, host_end, sandbox_end)
+    # The marker is unique to this run: the scan below reads every process on the
+    # machine, and a concurrent copy of this suite would otherwise be mistaken
+    # for a child that outlived its launch.
+    marker = f"unsloth-bridge-{uuid.uuid4().hex}"
+    prepared = os_sandbox.PreparedSandboxLaunch(
+        argv = (sys.executable, "-c", f"import time; time.sleep(30)  # {marker}"),
+        workdir = str(tmp_path),
+        env = {},
+        preexec_fn = None,
+        backend = "linux-bubblewrap",
+    )
+    kwargs = dict(pass_fds = (sandbox_end.fileno(),), stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+    started = time.monotonic()
+    with pytest.raises(os_sandbox.SandboxUnavailableError) as excinfo:
+        spawn(prepared, kwargs)
+    assert excinfo.value.transient is True
+    assert time.monotonic() - started < 15
+    # The child was killed, both socketpair ends are closed and the proxy is down.
+    with pytest.raises(OSError):
+        os.fstat(host_end.fileno())
+    assert not any(
+        p.info.get("cmdline") and marker in " ".join(p.info["cmdline"])
+        for p in _iter_python_processes()
+    )
+
+
+def _iter_python_processes():
+    try:
+        import psutil
+    except ImportError:
+        return []
+    return list(psutil.process_iter(["cmdline"]))
+
+
+def test_capability_advertises_allowlist_only_for_a_bridge_capable_backend(
+    monkeypatch, isolated_capability_cache
+):
+    backend = _RecordingBackend()
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    capability = os_sandbox.capability_snapshot()
+    assert capability.available is True
+    assert capability.network_policies == ("deny",)
+    assert capability.network_allowlist == ()
+
+    backend.supports_network_allowlist = True
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "mirror.example.org,*.hf.co")
+    capability = os_sandbox.capability_snapshot(force = True)
+    assert capability.network_policies == ("deny", "allowlist")
+    assert capability.network_allowlist == ("mirror.example.org", "*.hf.co")
+    # The network fields are advisory and do not enter the grant generation.
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "other.example.org")
+    again = os_sandbox.capability_snapshot(force = True)
+    assert again.probe_generation == capability.probe_generation
+    assert again.network_allowlist == ("other.example.org",)
+
+    api_view = tool_isolation.capability_snapshot(force = True)
+    assert api_view.network_policies == ("deny", "allowlist")
+    assert api_view.network_allowlist == ("other.example.org",)
+
+
+def test_broken_allowlist_env_is_not_advertised_as_a_working_allowlist(
+    monkeypatch, isolated_capability_cache
+):
+    backend = _RecordingBackend()
+    backend.supports_network_allowlist = True
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "pypi.org")
+    healthy = os_sandbox.capability_snapshot(force = True)
+    assert healthy.network_policies == ("deny", "allowlist")
+    assert "network_allowlist_invalid" not in healthy.limitations
+
+    for broken in ("http://pypi.org", "1.2.3.4", "localhost"):
+        monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, broken)
+        capability = os_sandbox.capability_snapshot(force = True)
+        assert capability.available is True
+        assert capability.network_policies == ("deny",), broken
+        assert capability.network_allowlist == ()
+        assert "network_allowlist_invalid" in capability.limitations
+        # Display-only: the grant generation does not rotate with the env.
+        assert capability.probe_generation == healthy.probe_generation
+        with pytest.raises(os_sandbox.SandboxUnavailableError, match = "not available"):
+            os_sandbox.prepare_tool_launch(
+                os_sandbox.ToolLaunchPlan(
+                    argv = (sys.executable, "-c", "pass"),
+                    workdir = os.getcwd(),
+                    env = {},
+                    requested_mode = "os_isolation_required",
+                    network_policy = "allowlist",
+                )
+            )
+
+
+def test_unavailable_capability_never_advertises_allowlist(monkeypatch, isolated_capability_cache):
+    backend = _RecordingBackend(
+        [os_sandbox.SandboxCapability("test-recording-backend", False, "no")]
+    )
+    backend.supports_network_allowlist = True
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    capability = os_sandbox.capability_snapshot()
+    assert capability.available is False
+    assert capability.network_policies == ("deny",)
+
+
+def test_prepare_refuses_allowlist_on_a_backend_without_a_bridge(
+    monkeypatch, tmp_path, isolated_capability_cache
+):
+    backend = _RecordingBackend()
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    plan = os_sandbox.replace(_spec(tmp_path), network_policy = "allowlist")
+    with pytest.raises(os_sandbox.SandboxUnavailableError, match = "not available with"):
+        os_sandbox.prepare_tool_launch(plan)
+    assert backend.prepared_specs == []
+
+
+def test_prepare_refuses_unknown_network_policy(monkeypatch, tmp_path, isolated_capability_cache):
+    backend = _RecordingBackend()
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    plan = os_sandbox.replace(_spec(tmp_path), network_policy = "everything")
+    with pytest.raises(os_sandbox.SandboxUnavailableError, match = "unknown network policy"):
+        os_sandbox.prepare_tool_launch(plan)
+
+
+def test_prepare_records_the_allowlist_policy_and_hosts(monkeypatch, tmp_path, isolated_capability_cache):
+    backend = _RecordingBackend()
+    backend.supports_network_allowlist = True
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "pypi.org, *.hf.co")
+    deny = os_sandbox.prepare_tool_launch(_spec(tmp_path))
+    assert deny.execution_record.network_policy == "deny"
+    assert deny.execution_record.network_allowlist == ()
+    assert deny.execution_record.as_dict()["network_policy"] == "deny"
+
+    prepared = os_sandbox.prepare_tool_launch(
+        os_sandbox.replace(_spec(tmp_path), network_policy = "allowlist")
+    )
+    record = prepared.execution_record
+    assert record.network_policy == "allowlist"
+    assert record.network_allowlist == ("pypi.org", "*.hf.co")
+    assert record.os_isolation is True
+    assert record.as_dict()["network_allowlist"] == ["pypi.org", "*.hf.co"]
+    assert backend.prepared_specs[-1].network_policy == "allowlist"
+
+
+def test_prepare_refuses_allowlist_when_the_env_override_is_invalid(
+    monkeypatch, tmp_path, isolated_capability_cache
+):
+    backend = _RecordingBackend()
+    backend.supports_network_allowlist = True
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: backend)
+    # The snapshot was taken with a healthy list; the override breaks afterwards
+    # (an operator edits the environment of a running Studio) and the cached
+    # capability still advertises the allowlist. The launch re-parses and refuses.
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "mirror.example.org")
+    capability = os_sandbox.capability_snapshot()
+    assert capability.network_policies == ("deny", "allowlist")
+    assert capability.network_allowlist == ("mirror.example.org",)
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "10.0.0.5")
+    with pytest.raises(os_sandbox.SandboxUnavailableError, match = "network allowlist is invalid"):
+        os_sandbox.prepare_tool_launch(
+            os_sandbox.replace(_spec(tmp_path), network_policy = "allowlist")
+        )
+
+
+def test_limited_mode_refuses_the_allowlist_and_records_unrestricted(
+    monkeypatch, tmp_path, isolated_capability_cache
+):
+    store = tool_isolation.LimitedGrantStore(ttl_seconds = 60, max_entries = 4)
+    monkeypatch.setattr(tool_isolation, "_LIMITED_GRANTS", store)
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: None)
+    capability = os_sandbox.capability_snapshot()
+    grant = tool_isolation.issue_limited_grant(
+        current_subject = "actor-a",
+        tool_ui_session_id = "page-a",
+        probe_generation = capability.probe_generation,
+    )
+    plan = os_sandbox.replace(
+        _spec(tmp_path),
+        requested_mode = "limited",
+        current_subject = "actor-a",
+        tool_ui_session_id = "page-a",
+        limited_grant = grant.token,
+    )
+    prepared = os_sandbox.prepare_tool_launch(plan)
+    assert prepared.execution_record.network_policy == "unrestricted"
+    assert prepared.execution_record.network_allowlist == ()
+    with pytest.raises(os_sandbox.SandboxUnavailableError, match = "requires OS isolation"):
+        os_sandbox.prepare_tool_launch(os_sandbox.replace(plan, network_policy = "allowlist"))
+
+
+def test_full_mode_records_unrestricted_network(monkeypatch, tmp_path, isolated_capability_cache):
+    monkeypatch.setattr(os_sandbox, "_platform_backend", lambda: None)
+    prepared = os_sandbox.prepare_tool_launch(
+        os_sandbox.replace(_spec(tmp_path), requested_mode = "full", network_policy = "allowlist")
+    )
+    assert prepared.execution_record.network_policy == "unrestricted"
+    assert prepared.network_audit is None
+
+
+def test_the_optional_literal_ancestors_are_walked_with_posix_rules(tmp_path):
+    # The walk used os.path, so on Windows it stepped from "/" to "/" forever
+    # (ntpath.dirname("/") is "/" while os.path.sep is a backslash there) and
+    # hung the whole test run before reaching any macOS assertion. These are
+    # sandbox profile paths, always POSIX, whatever the host is.
+    source = Path(os_sandbox.__file__).read_text(encoding = "utf-8")
+    walk = source.split("The optional literals may not exist", 1)[1].split("write_filters", 1)[0]
+    code = "\n".join(
+        line for line in walk.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "posixpath.dirname" in code
+    assert "os.path" not in code
+    # And the walk terminates: ntpath would spin here, posixpath reaches "/".
+    current = ntpath.dirname("/usr/local/etc/gitconfig")
+    steps = 0
+    while current and current != "/" and steps < 100:
+        parent = posixpath.dirname(current)
+        if parent == current:
+            break
+        current = parent
+        steps += 1
+    assert current == "/" and steps < 100
+
+
+def test_macos_profile_admits_only_the_proxy_port_when_given(tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    private_tmp = tmp_path / "us-seatbelt-x"
+    private_tmp.mkdir()
+    base = os_sandbox._macos_seatbelt_profile(
+        workdir = str(workdir), private_tmp = str(private_tmp), runtime_paths = ()
+    )
+    assert "remote ip" not in base
+    # git probes these on every run; absent files must read as absent, not denied.
+    for literal in os_sandbox._MACOS_OPTIONAL_READ_LITERALS:
+        assert f'(literal "{literal}")' in base
+    # Their ancestors are searchable even when the files are absent, and the /etc
+    # symlink spelling resolves (round 10 on macOS: EPERM on /etc/gitconfig).
+    metadata = base.split("(allow file-read-metadata ", 1)[1].split(")\n", 1)[0]
+    for ancestor in (
+        '"/etc"',
+        '"/private/etc"',
+        '"/Library/Preferences"',
+        '"/Library"',
+        # A Homebrew git reads its own prefix, not /etc (round 15 on macOS Intel:
+        # EPERM on /usr/local/etc/gitconfig aborted git before it ran).
+        '"/usr/local/etc"',
+        '"/usr/local"',
+        '"/opt/homebrew/etc"',
+        '"/opt/homebrew"',
+    ):
+        assert f"(literal {ancestor})" in metadata, ancestor
+    with_proxy = os_sandbox._macos_seatbelt_profile(
+        workdir = str(workdir),
+        private_tmp = str(private_tmp),
+        runtime_paths = (),
+        proxy_port = 43111,
+    )
+    assert '(allow network-outbound (remote ip "localhost:43111"))' in with_proxy
+    assert with_proxy.count("remote ip") == 1
+    assert "(deny default)" in with_proxy
+    # TLS trust: the OpenSSL bundle and the Security.framework services ride along
+    # with the proxy only; a no-network launch keeps them out of reach.
+    # The filter keeps only paths that exist on this host; on macOS they all do, on a
+    # Linux test host the set is usually empty, so the assertion tracks existence.
+    for path in os_sandbox._MACOS_TLS_TRUST_PATHS:
+        assert (path in with_proxy) is os.path.exists(path)
+        assert path not in base
+    for name in os_sandbox._MACOS_TLS_MACH_SERVICES:
+        assert f'(global-name "{name}")' in with_proxy
+        assert name not in base
+
+
+def test_macos_prepare_starts_a_proxy_and_publishes_it_in_the_environment(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    monkeypatch.setattr(os_sandbox, "_runtime_read_paths", lambda: ())
+    monkeypatch.setattr(os_sandbox, "_validate_runtime_paths", lambda *a, **k: None)
+    monkeypatch.setattr(os_sandbox, "_validate_workdir", lambda path: str(path))
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "pypi.org")
+    backend = os_sandbox.MacOSSeatbeltBackend()
+    backend._sandbox_exec = "/usr/bin/sandbox-exec"
+    plan = os_sandbox.replace(
+        _spec(workdir, sys.executable, "-c", "pass"), network_policy = "allowlist"
+    )
+    prepared = backend.prepare(plan)
+    try:
+        profile = prepared.argv[2]
+        port = int(prepared.env["HTTPS_PROXY"].rsplit(":", 1)[1])
+        assert f'(allow network-outbound (remote ip "localhost:{port}"))' in profile
+        assert prepared.env["NO_PROXY"] == "localhost,127.0.0.1,::1"
+        assert prepared.network_audit is not None
+        # The proxy is live on the host loopback and authenticated.
+        client = socket.create_connection(("127.0.0.1", port), timeout = 5)
+        client.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org\r\n\r\n")
+        assert client.recv(4096).startswith(b"HTTP/1.1 407")
+        client.close()
+    finally:
+        prepared.cleanup()
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout = 1).close()
+
+    plain = backend.prepare(_spec(workdir, sys.executable, "-c", "pass"))
+    try:
+        assert "HTTPS_PROXY" not in plain.env
+        assert "remote ip" not in plain.argv[2]
+        assert plain.network_audit is None
+    finally:
+        plain.cleanup()
+
+
+def test_live_allowlist_proxy_reaches_only_allowlisted_hosts_from_inside_bubblewrap(
+    qualified_native_capability, tmp_path, monkeypatch
+):
+    """Inside the network namespace: the proxy port works, anything else does not."""
+    from core.inference import network_proxy
+
+    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(4)
+    upstream_port = upstream.getsockname()[1]
+    seen: list[bytes] = []
+
+    def serve():
+        upstream.settimeout(30)
+        try:
+            conn, _ = upstream.accept()
+        except OSError:
+            return
+        with conn:
+            seen.append(conn.recv(4096))
+            conn.sendall(b"pong-from-host")
+
+    thread = threading.Thread(target = serve, daemon = True)
+    thread.start()
+    monkeypatch.setattr(network_proxy, "REQUIRE_PUBLIC_ADDRESSES", False)
+    monkeypatch.setattr(network_proxy, "ALLOWED_PORTS", frozenset({upstream_port}))
+    monkeypatch.setattr(network_proxy, "DEFAULT_RESOLVER", lambda host, port: ["127.0.0.1"])
+    monkeypatch.setenv(os_sandbox.NETWORK_ALLOWLIST_ENV, "upstream.test")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    code = f"""
+import base64, json, os, socket, urllib.parse
+url = urllib.parse.urlsplit(os.environ["HTTPS_PROXY"])
+auth = base64.b64encode((url.username + ":" + url.password).encode()).decode()
+def tunnel(target):
+    s = socket.create_connection((url.hostname, url.port), timeout = 10)
+    s.sendall(("CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\nProxy-Authorization: Basic %s\\r\\n\\r\\n" % (target, target, auth)).encode())
+    head = b""
+    while b"\\r\\n\\r\\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return s, head.split(b"\\r\\n")[0].decode()
+def client_hello(name):
+    # The proxy refuses a tunnel whose stream is not TLS or whose hello does not
+    # name the CONNECT host, so the payload has to arrive behind a real hello.
+    host = name.encode()
+    entry = b"\\x00" + len(host).to_bytes(2, "big") + host
+    block = len(entry).to_bytes(2, "big") + entry
+    extensions = b"\\x00\\x00" + len(block).to_bytes(2, "big") + block
+    body = (
+        b"\\x03\\x03" + b"\\x2a" * 32 + b"\\x00" + b"\\x00\\x02\\x13\\x01" + b"\\x01\\x00"
+        + len(extensions).to_bytes(2, "big") + extensions
+    )
+    handshake = b"\\x01" + len(body).to_bytes(3, "big") + body
+    return b"\\x16\\x03\\x01" + len(handshake).to_bytes(2, "big") + handshake
+s, status = tunnel("upstream.test:{upstream_port}")
+s.sendall(client_hello("upstream.test") + b"ping-from-sandbox")
+echo = s.recv(4096).decode() if status.startswith("HTTP/1.1 200") else ""
+s.close()
+_, denied = tunnel("evil.example:{upstream_port}")
+_, ip_denied = tunnel("127.0.0.1:{upstream_port}")
+try:
+    socket.create_connection(("127.0.0.1", {upstream_port}), timeout = 3).close()
+    direct = "connected"
+except OSError as exc:
+    direct = type(exc).__name__
+print(json.dumps({{"status": status, "echo": echo, "denied": denied, "ip_denied": ip_denied, "direct": direct, "ctrl": os.environ.get("{os_sandbox._NETWORK_BRIDGE_ENV}")}}))
+"""
+    prepared = os_sandbox.prepare_tool_launch(
+        os_sandbox.replace(
+            _spec(workdir, sys.executable, "-I", "-c", code), network_policy = "allowlist"
+        )
+    )
+    try:
+        kwargs = dict(
+            cwd = prepared.workdir,
+            env = prepared.env,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+            close_fds = True,
+            stdin = subprocess.DEVNULL,
+            pass_fds = prepared.pass_fds,
+        )
+        if prepared.preexec_fn is not None:
+            kwargs["preexec_fn"] = prepared.preexec_fn
+        proc = os_sandbox.spawn_prepared_launch(prepared, **kwargs)
+        out, err = proc.communicate(timeout = 60)
+        assert proc.returncode == 0, err
+        import json
+
+        report = json.loads(out.strip().splitlines()[-1])
+        assert report["status"].startswith("HTTP/1.1 200"), report
+        assert report["echo"] == "pong-from-host"
+        assert report["denied"].startswith("HTTP/1.1 403")
+        assert report["ip_denied"].startswith("HTTP/1.1 403")
+        assert report["direct"] != "connected", "the namespace must not reach host loopback directly"
+        assert report["ctrl"] is None
+        assert seen and seen[0].endswith(b"ping-from-sandbox")
+        summary = prepared.network_audit.summary()
+        assert summary["allowed"] == {"upstream.test": 1}
+        assert "evil.example" in summary["denied"]
+        assert "evil.example" in network_proxy.format_denied_trailer(prepared.network_audit)
+        assert prepared.execution_record.network_policy == "allowlist"
+        assert prepared.execution_record.network_allowlist == ("upstream.test",)
+    finally:
+        prepared.cleanup()
+        upstream.close()
+        thread.join(timeout = 5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "the fake xcode-select path is POSIX shaped")
+def test_macos_developer_paths_include_the_enclosing_app_bundle(monkeypatch, tmp_path):
+    developer = tmp_path / "Xcode_16.4.app" / "Contents" / "Developer"
+    developer.mkdir(parents = True)
+    monkeypatch.setattr(os_sandbox, "_developer_paths_cache", None)
+    monkeypatch.setattr(os_sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(os_sandbox.os.path, "exists", lambda path: True if path == "/usr/bin/xcode-select" else os.path.lexists(path))
+    fake = SimpleNamespace(returncode = 0, stdout = str(developer) + "\n")
+    monkeypatch.setattr(os_sandbox.subprocess, "run", lambda *a, **k: fake)
+    paths = os_sandbox._macos_developer_paths()
+    assert paths[0] == os.path.realpath(str(developer))
+    assert str(tmp_path / "Xcode_16.4.app") in paths or os.path.realpath(str(tmp_path / "Xcode_16.4.app")) in paths
+    monkeypatch.setattr(os_sandbox, "_developer_paths_cache", None)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason = "/private symlinks exist on macOS only")
+def test_sbpl_spellings_alias_the_private_symlinks():
+    assert "/etc" in os_sandbox._sbpl_path_spellings("/private/etc")
+    assert "/var/db" in os_sandbox._sbpl_path_spellings("/private/var/db")
+    assert "/tmp" in os_sandbox._sbpl_path_spellings("/private/tmp")
+
+
+def test_editable_install_source_trees_are_readable(monkeypatch, tmp_path):
+    """A pip install -e checkout is bound, so the tool can import Studio itself."""
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    checkout = tmp_path / "checkout" / "src"
+    (checkout / "unsloth").mkdir(parents = True)
+    (site / "__editable__.unsloth.pth").write_text(f"{checkout}\n")
+    (site / "distutils-precedence.pth").write_text("import os; os.environ\n")
+    (site / "relative.pth").write_text("../relative-tree\n")
+    (tmp_path / "relative-tree" / "unsloth_zoo").mkdir(parents = True)
+    monkeypatch.setattr(
+        os_sandbox.sysconfig,
+        "get_paths",
+        lambda: {"purelib": str(site), "platlib": str(site)},
+    )
+    found = os_sandbox._editable_install_paths()
+    assert str(checkout) in found
+    assert str(tmp_path / "relative-tree") in found
+    # The import line is code for the site module, not a path to bind.
+    assert not any("os.environ" in path for path in found)
+    # Every entry is a real directory and each appears once.
+    assert all(os.path.isdir(path) for path in found)
+    assert len(found) == len(set(found))
+
+
+def test_an_unrelated_pth_entry_is_not_bound_into_the_sandbox(monkeypatch, tmp_path):
+    # Any package may drop a legal absolute path into a .pth file. Binding it
+    # read-only would hand Required-mode tool code whatever it names, and a
+    # reviewer reproduced exactly this with a home directory.
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    home = tmp_path / "home" / "alice"
+    (home / ".ssh").mkdir(parents = True)
+    (home / ".ssh" / "id_rsa").write_text("PRIVATE KEY")
+    ours = tmp_path / "checkout"
+    (ours / "unsloth").mkdir(parents = True)
+    (site / "someone-else.pth").write_text(f"{home}\n")
+    (site / "__editable__.unsloth.pth").write_text(f"{ours}\n")
+    monkeypatch.setattr(
+        os_sandbox.sysconfig,
+        "get_paths",
+        lambda: {"purelib": str(site), "platlib": str(site)},
+    )
+    found = os_sandbox._editable_install_paths()
+    assert str(ours) in found
+    assert str(home) not in found
+    assert not any(str(home) in path for path in found)
+
+
+def test_a_pep_660_finder_module_is_read_as_data_not_imported(monkeypatch, tmp_path):
+    # setuptools' other editable shape writes no path at all, only a finder
+    # whose MAPPING names each package's directory, so a checkout installed
+    # that way used to be invisible. The module is parsed, never imported:
+    # importing one from site-packages would run its code in this process.
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    package = tmp_path / "checkout" / "unsloth_zoo"
+    package.mkdir(parents = True)
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    (site / "__editable___unsloth_zoo_2026_1_0_finder.py").write_text(
+        "import sys\n"
+        "raise SystemExit('importing this module must never happen')\n"
+        f"MAPPING = {{'unsloth_zoo': {str(package)!r}, 'other': {str(stranger)!r}}}\n"
+    )
+    monkeypatch.setattr(
+        os_sandbox.sysconfig,
+        "get_paths",
+        lambda: {"purelib": str(site), "platlib": str(site)},
+    )
+    found = os_sandbox._editable_install_paths()
+    assert str(package) in found
+    assert str(stranger) not in found
+
+
+def test_linux_system_roots_cover_libexec_and_usr_local():
+    for root in ("/usr/libexec", "/usr/local/bin", "/usr/local/lib"):
+        assert root in os_sandbox._LINUX_SYSTEM_ROOTS
+
+
+@pytest.mark.parametrize(
+    "release, wsl_env, expected",
+    [
+        ("5.15.153.1-microsoft-standard-wsl2", {}, "wsl2"),
+        ("4.4.0-19041-microsoft", {}, "wsl1"),
+        ("4.4.0-22621-microsoft", {"WSL_DISTRO_NAME": "Ubuntu"}, "wsl1"),
+        ("6.6.87.2-microsoft-standard-WSL2".lower(), {"WSL_INTEROP": "/run/WSL/1_interop"}, "wsl2"),
+    ],
+)
+def test_wsl1_is_told_apart_from_wsl2(monkeypatch, release, wsl_env, expected):
+    # WSL 1 translates syscalls and has no user namespaces, so its remediation is a
+    # distribution upgrade rather than a package or an AppArmor profile.
+    monkeypatch.setattr(
+        os_sandbox, "_read_text", lambda path: release if "osrelease" in path else ""
+    )
+    for key in ("WSL_INTEROP", "WSL_DISTRO_NAME"):
+        monkeypatch.delenv(key, raising = False)
+    for key, value in wsl_env.items():
+        monkeypatch.setenv(key, value)
+    assert os_sandbox._linux_environment(run_detector = False) == expected
+
+
+def test_wsl1_probe_failure_names_the_distribution_upgrade(monkeypatch):
+    monkeypatch.setattr(os_sandbox, "_linux_environment", lambda **_: "wsl1")
+    failure = os_sandbox.SandboxCapability(
+        "linux-bubblewrap", False, "bwrap: setting up uid map: Permission denied"
+    )
+    explained = os_sandbox._explain_linux_probe_failure(failure)
+    assert "WSL 1" in explained.reason
+    assert "wsl --set-version" in explained.remediation
+    assert "apparmor" not in explained.remediation.lower()
+    # A qualified capability is never rewritten.
+    good = os_sandbox.SandboxCapability("linux-bubblewrap", True, "ok")
+    assert os_sandbox._explain_linux_probe_failure(good) is good

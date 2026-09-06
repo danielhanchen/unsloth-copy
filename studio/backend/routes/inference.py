@@ -3089,6 +3089,7 @@ from auth.authentication import (
     authenticated_via_api_key,
     get_current_subject,
     require_ui_session_for_local_commands,
+    UI_ONLY_ACTION_DETAIL,
 )
 from state import active_generations
 
@@ -4857,6 +4858,7 @@ async def _select_request_tools(
         ALL_TOOLS,
         apply_full_access_tool_descriptions,
         apply_limited_tool_descriptions,
+        apply_os_isolated_tool_descriptions,
         get_enabled_mcp_tools,
     )
 
@@ -4899,6 +4901,10 @@ async def _select_request_tools(
         tools = apply_full_access_tool_descriptions(tools)
     elif getattr(payload, "tool_execution_mode", "os_isolation_required") == "limited":
         tools = apply_limited_tool_descriptions(tools)
+    else:
+        tools = apply_os_isolated_tool_descriptions(
+            tools, network_allowlist = _requested_network_allowlist(payload)
+        )
     if mcp_allowed:
         tools = tools + await get_enabled_mcp_tools()
     # getattr: callers hand in lighter payload objects than the request models, not all of
@@ -15908,6 +15914,31 @@ async def confirm_tool_call(
     return {"resolved": True}
 
 
+def _requested_network_allowlist(payload: Any) -> list[str] | None:
+    """Hosts an allowlist-policy Required turn may reach, else None.
+
+    Only Required mode can enforce a network policy, and the model should hear
+    about the allowlist only when this host's backend can honour it. Nothing here
+    forces a probe: the cached capability is enough for a description, and the
+    launch itself re-checks before opening any proxy.
+    """
+    if getattr(payload, "tool_network_policy", "deny") != "allowlist":
+        return None
+    if getattr(payload, "tool_execution_mode", "os_isolation_required") != "os_isolation_required":
+        return None
+    if bool(getattr(payload, "bypass_permissions", False)):
+        return None
+    try:
+        capability = tool_isolation_capability_snapshot(force = False)
+    except Exception:
+        logger.exception("tool_isolation.capability_probe_failed")
+        return None
+    policies = tuple(getattr(capability, "network_policies", ()) or ())
+    if "allowlist" not in policies:
+        return None
+    return list(getattr(capability, "network_allowlist", ()) or ())
+
+
 def _read_tool_isolation_capability(*, force: bool) -> Any:
     try:
         return tool_isolation_capability_snapshot(force = force)
@@ -15928,7 +15959,7 @@ def get_tool_isolation_capability(
     current_subject: str = Depends(get_current_subject),
     via_api_key: _ToolIsolationViaApiKey = False,
 ):
-    require_ui_session_for_local_commands(via_api_key)
+    require_ui_session_for_local_commands(via_api_key, UI_ONLY_ACTION_DETAIL)
     return _read_tool_isolation_capability(force = True)
 
 
@@ -15940,7 +15971,7 @@ def create_tool_isolation_limited_grant(
     current_subject: str = Depends(get_current_subject),
     via_api_key: _ToolIsolationViaApiKey = False,
 ):
-    require_ui_session_for_local_commands(via_api_key)
+    require_ui_session_for_local_commands(via_api_key, UI_ONLY_ACTION_DETAIL)
     snapshot = _read_tool_isolation_capability(force = True)
     if request.probe_generation != snapshot.probe_generation:
         raise HTTPException(
@@ -19710,6 +19741,7 @@ async def _proxy_to_external_provider(
                     confirm_calls = _permission_mode_confirm(payload),
                     bypass_permissions = bool(payload.bypass_permissions),
                     tool_execution_mode = payload.tool_execution_mode,
+                    network_policy = payload.tool_network_policy,
                     rag_scope = payload.rag_scope,
                     nudge_tool_calls = payload.nudge_tool_calls,
                 )
@@ -20042,6 +20074,7 @@ async def _proxy_to_external_provider(
                     confirm_calls = _permission_mode_confirm(payload),
                     bypass_permissions = bool(payload.bypass_permissions),
                     tool_execution_mode = payload.tool_execution_mode,
+                    network_policy = payload.tool_network_policy,
                     rag_scope = payload.rag_scope,
                     auto_heal = payload.auto_heal_tool_calls,
                     nudge_tool_calls = payload.nudge_tool_calls,
@@ -21653,6 +21686,7 @@ async def produce_openai_chat_completions(
                     bypass_permissions = bool(payload.bypass_permissions),
                     permission_mode = payload.permission_mode,
                     tool_execution_mode = payload.tool_execution_mode,
+                    network_policy = payload.tool_network_policy,
                     current_subject = current_subject,
                     tool_ui_session_id = payload.tool_ui_session_id,
                     limited_grant = payload.limited_grant,
@@ -23365,6 +23399,7 @@ async def produce_openai_chat_completions(
                 bypass_permissions = bool(payload.bypass_permissions),
                 permission_mode = payload.permission_mode,
                 tool_execution_mode = payload.tool_execution_mode,
+                network_policy = payload.tool_network_policy,
                 current_subject = current_subject,
                 tool_ui_session_id = payload.tool_ui_session_id,
                 limited_grant = payload.limited_grant,
@@ -26564,6 +26599,7 @@ def _build_chat_request(
         messages = messages,
         stream = stream,
         tool_execution_mode = payload.tool_execution_mode,
+        tool_network_policy = payload.tool_network_policy,
         limited_grant = payload.limited_grant,
         tool_ui_session_id = payload.tool_ui_session_id,
         permission_mode = payload.permission_mode,
@@ -29534,7 +29570,12 @@ async def anthropic_messages(
                     err_type = "invalid_request_error",
                 ),
             )
-        from core.inference.tools import ALL_TOOLS, apply_full_access_tool_descriptions
+        from core.inference.tools import (
+            ALL_TOOLS,
+            apply_full_access_tool_descriptions,
+            apply_limited_tool_descriptions,
+            apply_os_isolated_tool_descriptions,
+        )
 
         # ask/auto (and an omitted mode selecting a gate-needing terminal/python
         # tool) were already rejected before the auto-switch above, so an invalid
@@ -29552,6 +29593,12 @@ async def anthropic_messages(
         _full_access = bool(getattr(payload, "bypass_permissions", False))
         if _full_access:
             openai_tools = apply_full_access_tool_descriptions(openai_tools)
+        elif getattr(payload, "tool_execution_mode", "os_isolation_required") == "limited":
+            openai_tools = apply_limited_tool_descriptions(openai_tools)
+        else:
+            openai_tools = apply_os_isolated_tool_descriptions(
+                openai_tools, network_allowlist = _requested_network_allowlist(payload)
+            )
 
         server_tool_choice = openai_tool_choice
         if isinstance(server_tool_choice, dict):
@@ -29634,6 +29681,7 @@ async def anthropic_messages(
                 bypass_permissions = bool(payload.bypass_permissions),
                 permission_mode = getattr(payload, "permission_mode", None),
                 tool_execution_mode = payload.tool_execution_mode,
+                network_policy = payload.tool_network_policy,
                 current_subject = current_subject,
                 tool_ui_session_id = payload.tool_ui_session_id,
                 limited_grant = payload.limited_grant,

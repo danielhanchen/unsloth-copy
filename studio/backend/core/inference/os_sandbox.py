@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+import ast
 import errno
+import ctypes
 import hashlib
 import json
 import os
+import posixpath
 import platform
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -19,16 +23,91 @@ import sys
 import sysconfig
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, BinaryIO, Callable, Literal, Protocol
 
 from loggers import get_logger
+
+from .network_proxy import (
+    ALLOWLIST_ENV as NETWORK_ALLOWLIST_ENV,
+    NO_PROXY_VALUE as _NO_PROXY_VALUE,
+    PROXY_ENV_KEYS as _PROXY_ENV_KEYS,
+    AllowlistError,
+    AllowlistProxy,
+    NetworkAllowlist,
+    NetworkAudit,
+    proxy_environment,
+    tls_trust_environment,
+    tls_trust_paths,
+)
 
 logger = get_logger(__name__)
 
 _SCAN_ENTRY_LIMIT = 100_000
 _REJECTED_RUNTIME_ENTRY_TYPES = "Unix sockets, FIFOs, block devices, or character devices"
 _PROBE_TIMEOUT_SECONDS = 8
+# Interpreter roots are small and scanned on every launch. The read-only system
+# roots hold hundreds of thousands of entries on a developer machine or a CI
+# image and a cold page cache can take a minute to traverse them, so they get a
+# wider budget and a passed scan is remembered for a while (see
+# _system_scan_memo). A timeout is reported as transient so it is never cached
+# as a permanent "unavailable".
+_RUNTIME_SCAN_TIMEOUT_SECONDS = 8
+# Measured cold traversals of the hosted GitHub runner images took 44 s (Ubuntu
+# 22.04, 328k entries) and 76 s (Ubuntu 24.04, 271k entries); warm they take
+# about one second and the memo below makes later launches free.
+_SYSTEM_SCAN_TIMEOUT_SECONDS = 120
+_SYSTEM_SCAN_MEMO_SECONDS = 600
+_SYMLINK_CHAIN_LIMIT = 40
+_CLONE_NEWUSER = 0x10000000
+_LIMITATION_NESTED_USERNS_SECCOMP = "nested_userns_blocked_by_seccomp"
+_LIMITATION_IPV6_UNAVAILABLE = "ipv6_unavailable_on_host"
+_LIMITATION_NETWORK_ALLOWLIST_INVALID = "network_allowlist_invalid"
+_WSL1_REMEDIATION = (
+    "This distribution runs under WSL 1, which translates Linux syscalls instead of running a "
+    "kernel, so it has no user namespaces and Bubblewrap cannot create a sandbox here. Convert "
+    "the distribution to WSL 2 from Windows with `wsl --set-version <distro> 2` (check the "
+    "current version with `wsl -l -v`), then start Studio again and choose Check again. Until "
+    "then, use Limited mode only for a trusted task."
+)
+_GENERIC_REMEDIATION = (
+    "Use Limited mode only for a trusted task, or install and enable a qualified OS sandbox backend."
+)
+_APPARMOR_USERNS_SYSCTL = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+_DEFAULT_BWRAP_PATH = "/usr/bin/bwrap"
+
+
+def _apparmor_userns_remediation(bwrap_path: str = _DEFAULT_BWRAP_PATH) -> str:
+    """The profile text names the Bubblewrap binary that was actually probed.
+
+    AppArmor attaches profiles by executable path, so a profile for
+    /usr/bin/bwrap does nothing for a qualified /usr/local/bin/bwrap or a Nix
+    store path.
+    """
+    return (
+        "This host restricts unprivileged user namespaces with AppArmor "
+        "(kernel.apparmor_restrict_unprivileged_userns=1, the default on Ubuntu 24.04 and later), "
+        "so Bubblewrap cannot create its sandbox. Allow Bubblewrap with a profile: as root, create "
+        "/etc/apparmor.d/bwrap containing\n"
+        "  abi <abi/4.0>,\n"
+        "  include <tunables/global>\n"
+        f"  profile bwrap {bwrap_path} flags=(unconfined) {{\n"
+        "    userns,\n"
+        "    include if exists <local/bwrap>\n"
+        "  }\n"
+        "then run `apparmor_parser -r /etc/apparmor.d/bwrap` (or `systemctl reload apparmor`) and "
+        "choose Check again. Until then, use Limited mode only for a trusted task."
+    )
+
+
+_APPARMOR_USERNS_REMEDIATION = _apparmor_userns_remediation()
+_APPARMOR_USERNS_MARKERS = (
+    "RTM_NEWADDR",
+    "Operation not permitted",
+    "setting up uid map",
+    "No permissions to create",
+)
 _PROBE_TOKEN = "UNSLOTH_OS_SANDBOX_PROBE_OK"
 _PROBE_UDP_TOKEN = b"UNSLOTH_OS_SANDBOX_UDP_PROBE"
 _AF_VSOCK = 40
@@ -43,6 +122,16 @@ _LINUX_SYSTEM_ROOTS = (
     "/usr/sbin",
     "/usr/lib",
     "/usr/lib64",
+    # git keeps its helpers in /usr/libexec/git-core on Fedora and RHEL, and the
+    # sandbox PATH carries /usr/local/bin, so a tool installed there would be
+    # findable and then fail to execute.
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/usr/local/libexec",
+    "/usr/local/sbin",
+    "/usr/local/share",
     "/usr/share",
     "/bin",
     "/sbin",
@@ -57,11 +146,31 @@ _LINUX_ETC_FILES = (
     "/etc/localtime",
     "/etc/nsswitch.conf",
 )
+# CA trust roots, bound read-only only when the network allowlist is on: without
+# them OpenSSL inside the sandbox has no bundle (Debian keeps it under /etc/ssl,
+# Fedora and RHEL under /etc/pki) and every HTTPS fetch through the proxy fails
+# certificate verification. pip carries certifi, curl, git and urllib do not.
+_LINUX_CA_TRUST_PATHS = (
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/ca-certificates.conf",
+    "/etc/crypto-policies",
+)
 _WSL_HIDDEN_PATHS = ("/usr/lib/wsl",)
 
 
 class SandboxUnavailableError(RuntimeError):
-    """The required native sandbox cannot safely launch this tool call."""
+    """The required native sandbox cannot safely launch this tool call.
+
+    ``transient`` marks conditions that may clear on their own (a scan that ran
+    out of time on a cold disk cache); the capability layer reports those as
+    retryable instead of caching them as a permanent unavailability.
+    """
+
+    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 @dataclass(frozen = True)
@@ -79,6 +188,19 @@ class SandboxCapability:
     environment_fingerprint: str = ""
     remediation: str = "Use Limited mode only for a trusted task, or install a qualified backend."
     retryable: bool = False
+    # What a Limited launch on this host runs under. Everywhere but Windows this
+    # is the process guard alone; on Windows the write-restricted token launcher
+    # takes over once its own live probe passed. Not part of probe_generation:
+    # a grant issued before the launcher qualified stays valid.
+    limited_backend: str = "process-guard"
+    limited_profile_id: str = "limited-software-safeguards-v1"
+    limited_limitations: tuple[str, ...] = ()
+    limited_reason: str = ""
+    # Network policies the backend can enforce for an OS-isolated launch, and the
+    # hosts the "allowlist" policy would admit. "deny" is always present; a
+    # backend without a loopback bridge (Windows AppContainer) offers only that.
+    network_policies: tuple[str, ...] = ("deny",)
+    network_allowlist: tuple[str, ...] = ()
 
 
 ToolExecutionMode = Literal["os_isolation_required", "limited", "full"]
@@ -95,6 +217,11 @@ class ToolExecutionRecord:
     os_isolation: bool
     retained_safeguards: tuple[str, ...]
     limitations: tuple[str, ...] = ()
+    # "deny": no network path out of the sandbox. "allowlist": CONNECT tunnels to
+    # network_allowlist hosts through the per-launch loopback proxy.
+    # "unrestricted": the launch has the host's network (Limited and Full).
+    network_policy: str = "deny"
+    network_allowlist: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -107,6 +234,8 @@ class ToolExecutionRecord:
             "os_isolation": self.os_isolation,
             "retained_safeguards": list(self.retained_safeguards),
             "limitations": list(self.limitations),
+            "network_policy": self.network_policy,
+            "network_allowlist": list(self.network_allowlist),
         }
 
 
@@ -126,6 +255,12 @@ class ToolLaunchPlan:
     timeout_seconds: int | None = None
     close_fds: bool = True
     terminate_descendants: bool = True
+    # "deny" (default) or "allowlist". Only honored for os_isolation_required;
+    # Full has the host network anyway and Limited cannot enforce a proxy.
+    network_policy: str = "deny"
+
+
+NETWORK_POLICIES = ("deny", "allowlist")
 
 
 # Compatibility for focused tests and callers written against the first narrow
@@ -152,6 +287,9 @@ class PreparedSandboxLaunch:
     spawn_callback: Callable[["PreparedSandboxLaunch", dict[str, Any]], object] | None = None
     cleanup_callbacks: list[Callable[[], None]] = field(default_factory = list)
     cleanup_diagnostics: list[str] = field(default_factory = list)
+    # Set when the launch runs behind the allowlist proxy; tools.py reads the
+    # refused hosts from it for the result trailer.
+    network_audit: NetworkAudit | None = None
 
     def cleanup(self) -> None:
         while self.cleanup_callbacks:
@@ -193,9 +331,20 @@ class SandboxBackend(Protocol):
     def prepare(self, spec: ToolLaunchPlan) -> PreparedSandboxLaunch: ...
 
 
-def _linux_seccomp_filter() -> BinaryIO:
-    """Compile a minimal filter for host-channel socket families Bubblewrap cannot hide."""
-    abi = _LINUX_SECCOMP_ABIS.get(platform.machine().lower())
+# Syscall numbers for the user-namespace fallback filter (identical on the two
+# reviewed ABIs: x86_64 uses clone=56, unshare=272; aarch64 clone=220, unshare=97).
+_LINUX_USERNS_SYSCALLS = {
+    "aarch64": (220, 97, 435),
+    "arm64": (220, 97, 435),
+    "amd64": (56, 272, 435),
+    "x86_64": (56, 272, 435),
+}
+
+
+def _linux_seccomp_program(*, block_userns: bool = False) -> bytes:
+    """Build the BPF program used by _linux_seccomp_filter (kept separate for tests)."""
+    machine = platform.machine().lower()
+    abi = _LINUX_SECCOMP_ABIS.get(machine)
     if abi is None:
         raise SandboxUnavailableError(
             f"Linux architecture {platform.machine() or 'unknown'} is not qualified for seccomp"
@@ -209,33 +358,108 @@ def _linux_seccomp_filter() -> BinaryIO:
     return_value = 0x06
     kill_process = 0x80000000
     return_errno = 0x00050000 | errno.EPERM
+    return_enosys = 0x00050000 | errno.ENOSYS
     allow = 0x7FFF0000
     io_uring_setup_nr = 425
-    instructions = (
+    instructions: list[tuple[int, int, int, int]] = [
         (load_word, 0, 0, 4),
         (jump_equal, 1, 0, audit_arch),
         (return_value, 0, 0, kill_process),
         (load_word, 0, 0, 0),
-        (jump_bits_set, 7, 0, x32_syscall_bit),
-        (jump_equal, 6, 0, io_uring_setup_nr),
-        (jump_equal, 3, 0, socket_nr),
-        (jump_equal, 2, 0, socket_alt_nr),
-        (jump_equal, 1, 0, socketpair_nr),
-        (jump_equal, 0, 3, socketpair_alt_nr),
-        (load_word, 0, 0, 16),
-        (jump_equal, 0, 1, _AF_VSOCK),
-        (return_value, 0, 0, return_errno),
-        (return_value, 0, 0, allow),
+    ]
+    if block_userns:
+        # Bubblewrap older than 0.8.0 has no --disable-userns, so nested user
+        # namespaces are refused here instead: unshare() always fails, clone3()
+        # reports ENOSYS so libc falls back to clone(), and clone() with
+        # CLONE_NEWUSER in its flags word fails. Everything else falls through
+        # to the socket family checks below.
+        clone_nr, unshare_nr, clone3_nr = _LINUX_USERNS_SYSCALLS[machine]
+        instructions.extend(
+            [
+                (jump_equal, 0, 1, unshare_nr),
+                (return_value, 0, 0, return_errno),
+                (jump_equal, 0, 1, clone3_nr),
+                (return_value, 0, 0, return_enosys),
+                (jump_equal, 0, 4, clone_nr),
+                (load_word, 0, 0, 16),
+                (jump_bits_set, 0, 1, _CLONE_NEWUSER),
+                (return_value, 0, 0, return_errno),
+                (load_word, 0, 0, 0),
+            ]
+        )
+    instructions.extend(
+        [
+            (jump_bits_set, 7, 0, x32_syscall_bit),
+            (jump_equal, 6, 0, io_uring_setup_nr),
+            (jump_equal, 3, 0, socket_nr),
+            (jump_equal, 2, 0, socket_alt_nr),
+            (jump_equal, 1, 0, socketpair_nr),
+            (jump_equal, 0, 3, socketpair_alt_nr),
+            (load_word, 0, 0, 16),
+            (jump_equal, 0, 1, _AF_VSOCK),
+            (return_value, 0, 0, return_errno),
+            (return_value, 0, 0, allow),
+        ]
     )
+    return b"".join(struct.pack("=HBBI", *instruction) for instruction in instructions)
+
+
+def _linux_seccomp_filter(*, block_userns: bool = False) -> BinaryIO:
+    """Compile a minimal filter for host-channel socket families Bubblewrap cannot hide."""
+    program = _linux_seccomp_program(block_userns = block_userns)
     stream = tempfile.TemporaryFile(prefix = "unsloth-sandbox-seccomp-")
     try:
-        stream.write(b"".join(struct.pack("=HBBI", *instruction) for instruction in instructions))
+        stream.write(program)
         stream.flush()
         stream.seek(0)
     except Exception:
         stream.close()
         raise
     return stream
+
+
+_bwrap_options_cache: dict[tuple[str, int, int], frozenset[str]] = {}
+
+
+def _bwrap_supported_options(bwrap: str) -> frozenset[str]:
+    """Long options the installed Bubblewrap accepts, read once from its usage text.
+
+    Ubuntu 22.04 ships 0.6.1, which predates ``--disable-userns`` (0.8.0), so the
+    argv cannot assume it. The result is cached by path and file identity, the
+    same facts the environment fingerprint already tracks.
+    """
+    try:
+        info = os.stat(bwrap)
+        key = (bwrap, info.st_ino, info.st_mtime_ns)
+    except OSError:
+        key = (bwrap, 0, 0)
+    cached = _bwrap_options_cache.get(key)
+    if cached is not None:
+        return cached
+    text = ""
+    try:
+        completed = subprocess.run(
+            [bwrap, "--help"],
+            stdin = subprocess.DEVNULL,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 5,
+            close_fds = True,
+        )
+        text = f"{completed.stdout}\n{completed.stderr}"
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    options = frozenset(
+        token.strip().rstrip(",")
+        for line in text.splitlines()
+        for token in line.split()
+        if token.startswith("--")
+    )
+    _bwrap_options_cache[key] = options
+    return options
 
 
 def _contained(
@@ -391,6 +615,43 @@ def _linux_mount_points() -> tuple[str, ...]:
     return tuple(mount.mount_point for mount in _linux_mounts())
 
 
+def _fingerprint_roots() -> tuple[str, ...]:
+    """Paths whose mount topology the sandbox actually exposes or masks."""
+    roots: list[str] = [
+        "/", *_LINUX_SYSTEM_ROOTS, *_LINUX_ETC_FILES, *_LINUX_CA_TRUST_PATHS, "/etc", "/nix/store", "/tmp"
+    ]
+    try:
+        roots.extend(_runtime_read_paths())
+    except Exception:  # noqa: BLE001 - interpreter introspection must not break fingerprinting
+        pass
+    return tuple(roots)
+
+
+def _relevant_mounts(
+    mounts: tuple[_LinuxMount, ...], roots: tuple[str, ...]
+) -> tuple[_LinuxMount, ...]:
+    """Mounts that sit under, or contain, one of ``roots``.
+
+    A USB stick under /media, a container volume under /var/lib/docker or a
+    gvfs mount under /run/user never enter the sandbox, so they must not
+    invalidate the capability cache or outstanding Limited grants. The root
+    mount is always relevant.
+    """
+    relevant: list[_LinuxMount] = []
+    for mount in mounts:
+        point = mount.mount_point
+        if point == "/":
+            relevant.append(mount)
+            continue
+        for root in roots:
+            if root == "/":
+                continue
+            if _lexically_contained(point, root) or _lexically_contained(root, point):
+                relevant.append(mount)
+                break
+    return tuple(relevant)
+
+
 def _linux_mount_for_path(path: str) -> _LinuxMount | None:
     canonical = os.path.realpath(path)
     candidates = [
@@ -403,13 +664,163 @@ def _linux_mount_for_path(path: str) -> _LinuxMount | None:
     return max(candidates, key = lambda mount: len(mount.mount_point))
 
 
+def _symlink_chain(path: str) -> list[str]:
+    """Every path an exec of ``path`` resolves through, from the given spelling to the target.
+
+    A virtualenv's ``bin/python`` usually points at another link
+    (``.../bin/python -> python3 -> python3.12``, pyenv and hosted toolcaches
+    do the same). Inside the sandbox the exec follows the same hops, so each
+    one has to exist there; binding only the first and the last spelling leaves
+    a dangling link in between and ``execvp`` fails with ENOENT.
+    """
+    hops: list[str] = []
+    current = os.path.abspath(path)
+    for _ in range(_SYMLINK_CHAIN_LIMIT):
+        if current in hops:
+            break
+        hops.append(current)
+        try:
+            target = os.readlink(current)
+        except OSError:
+            break
+        if sys.platform == "win32":
+            # os.readlink reports absolute targets in extended-length form; keep
+            # the ordinary spelling so hops compare and bind like every other path.
+            if target.startswith("\\\\?\\UNC\\"):
+                target = "\\\\" + target[len("\\\\?\\UNC\\"):]
+            elif target.startswith("\\\\?\\"):
+                target = target[len("\\\\?\\"):]
+        current = os.path.normpath(os.path.join(os.path.dirname(current), target))
+    return hops
+
+
+def _editable_install_paths() -> list[str]:
+    """Source trees an editable install points at, so `import unsloth` works inside.
+
+    `pip install -e .` writes a .pth file (or a PEP 660 __editable__ finder) into
+    site-packages naming a checkout that lives outside every path above. Studio is
+    usually installed that way, so without these the Python tool cannot import the
+    package it is part of. Only existing directories are returned, and only from
+    site directories of the interpreter itself; file content is read as data,
+    never executed.
+
+    A .pth entry is only accepted when the directory it names actually holds one
+    of the packages this is for. Any package may drop a legal absolute path into
+    a .pth file, and an entry such as /home/alice would otherwise be bound
+    read-only into every Required-mode launch, handing tool code the user's whole
+    home. A reviewer reproduced exactly that.
+    """
+    found: list[str] = []
+    site_dirs: list[str] = []
+    try:
+        paths = sysconfig.get_paths()
+        site_dirs = [paths[key] for key in ("purelib", "platlib") if paths.get(key)]
+    except (KeyError, OSError):
+        return found
+    for directory in site_dirs:
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".pth"):
+                continue
+            try:
+                with open(os.path.join(directory, entry), "r", encoding = "utf-8") as handle:
+                    lines = handle.read(65536).splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line in lines:
+                line = line.strip()
+                # "import ..." lines are code the site module runs; the sandbox
+                # does not follow them, it only takes plain directory entries.
+                if not line or line.startswith("#") or line.startswith("import"):
+                    continue
+                if not os.path.isabs(line):
+                    line = os.path.join(directory, line)
+                path = os.path.abspath(line)
+                if path not in found and _holds_a_sandbox_package(path):
+                    found.append(path)
+        for entry in entries:
+            # PEP 660's other shape: setuptools writes a finder module whose
+            # MAPPING names each package's directory, and no .pth path at all,
+            # so a checkout installed that way was invisible here.
+            if not (entry.startswith("__editable___") and entry.endswith("_finder.py")):
+                continue
+            for path in _editable_finder_mapping(os.path.join(directory, entry)):
+                if path not in found:
+                    found.append(path)
+    return found
+
+
+# The packages an editable checkout has to expose for the tools to import what
+# Studio is part of. Anything else a .pth happens to name is not ours to bind.
+_SANDBOX_EDITABLE_PACKAGES = ("unsloth", "unsloth_zoo", "studio")
+
+
+def _holds_a_sandbox_package(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    for name in _SANDBOX_EDITABLE_PACKAGES:
+        if os.path.isdir(os.path.join(path, name)):
+            return True
+        if os.path.isfile(os.path.join(path, f"{name}.py")):
+            return True
+    return False
+
+
+def _editable_finder_mapping(path: str) -> list[str]:
+    """Directories a setuptools PEP 660 finder maps our packages to.
+
+    The module is parsed as data and never imported: it is written by pip into
+    site-packages, but so is every other package's, and importing one here would
+    run its code in the Studio process.
+    """
+    try:
+        with open(path, "r", encoding = "utf-8") as handle:
+            source = handle.read(262144)
+    except (OSError, UnicodeDecodeError):
+        return []
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    found: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "MAPPING" for t in node.targets):
+            continue
+        try:
+            mapping = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            continue
+        if not isinstance(mapping, dict):
+            continue
+        for name, target in mapping.items():
+            if not isinstance(name, str) or not isinstance(target, str):
+                continue
+            if name.split(".", 1)[0] not in _SANDBOX_EDITABLE_PACKAGES:
+                continue
+            resolved = os.path.abspath(target)
+            if os.path.isdir(resolved) and resolved not in found:
+                found.append(resolved)
+    return found
+
+
 def _runtime_read_paths() -> tuple[str, ...]:
     """Return selected interpreter/library roots, never arbitrary inherited sys.path."""
     executable = os.path.abspath(sys.executable)
+    chain = _symlink_chain(executable)
     candidates: list[str] = [
         executable,
+        *chain,
         os.path.realpath(executable),
         os.path.dirname(executable),
+        *(os.path.dirname(hop) for hop in chain),
+        os.path.dirname(os.path.realpath(executable)),
+        os.path.join(sys.prefix, "bin"),
+        os.path.join(sys.base_prefix, "bin"),
         os.path.join(sys.prefix, "pyvenv.cfg"),
         os.path.join(sys.prefix, "lib"),
         os.path.join(sys.prefix, "lib64"),
@@ -425,6 +836,7 @@ def _runtime_read_paths() -> tuple[str, ...]:
         )
     except (KeyError, OSError):
         pass
+    candidates.extend(_editable_install_paths())
 
     selected: list[str] = []
     for candidate in candidates:
@@ -436,6 +848,28 @@ def _runtime_read_paths() -> tuple[str, ...]:
         if os.path.exists(path) and path not in selected:
             selected.append(path)
     return tuple(selected)
+
+
+_system_scan_memo: dict[tuple[tuple[str, ...], str], float] = {}
+_system_scan_lock = threading.Lock()
+
+
+def _system_scan_signature(scan_roots: list[str]) -> str:
+    """Identity of the mount topology under the scanned roots (a memo key component)."""
+    try:
+        mounts = _linux_mounts()
+    except SandboxUnavailableError:
+        return "mounts-unreadable"
+    relevant = [
+        (mount.mount_point, mount.major_minor, mount.fs_type, mount.source, mount.mount_options)
+        for mount in _relevant_mounts(mounts, tuple(scan_roots))
+    ]
+    return hashlib.sha256(json.dumps(relevant, sort_keys = True).encode()).hexdigest()
+
+
+def _forget_system_scan_memo() -> None:
+    with _system_scan_lock:
+        _system_scan_memo.clear()
 
 
 def _validate_runtime_paths(
@@ -451,6 +885,12 @@ def _validate_runtime_paths(
     trusted same-UID host process can still mutate a bind source afterward;
     read-only binds are not immutable snapshots, and that race is outside the
     trusted-local threat boundary.
+
+    The root-owned system roots (``/usr`` and friends) are scanned with a wide
+    budget and a passed scan is remembered for ``_SYSTEM_SCAN_MEMO_SECONDS`` as
+    long as the mount topology under them is unchanged: only root can create a
+    device node or socket there, and root is outside this boundary. Interpreter
+    roots are user-writable and are re-scanned on every launch.
     """
     scan_roots: list[str] = []
     for root in paths:
@@ -486,11 +926,22 @@ def _validate_runtime_paths(
                     f"an interpreter/runtime path contains a nested host mount: {mount}"
                 )
 
+    memo_key: tuple[tuple[str, ...], str] | None = None
+    if include_system_roots and sys.platform == "linux" and scan_roots:
+        memo_key = (tuple(scan_roots), _system_scan_signature(scan_roots))
+        with _system_scan_lock:
+            passed_at = _system_scan_memo.get(memo_key)
+        if passed_at is not None and time.monotonic() - passed_at < _SYSTEM_SCAN_MEMO_SECONDS:
+            return
+    scan_timeout = (
+        _SYSTEM_SCAN_TIMEOUT_SECONDS if include_system_roots else _RUNTIME_SCAN_TIMEOUT_SECONDS
+    )
+
     find = "/usr/bin/find"
     if sys.platform == "linux" and scan_roots and _trusted_linux_executable(find):
         # Follow a symlink used as a scan root, but never links encountered below it.
         find_command = [find, "-H", *scan_roots]
-        find_command.append("-xdev" if sys.platform == "linux" else "-x")
+        find_command.append("-xdev")
         if include_system_roots:
             # Paths the sandbox UID cannot traverse cannot expose their contents.
             find_command.extend(
@@ -532,9 +983,16 @@ def _validate_runtime_paths(
                 text = True,
                 encoding = "utf-8",
                 errors = "replace",
-                timeout = 8,
+                timeout = scan_timeout,
                 close_fds = True,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxUnavailableError(
+                "cannot scan interpreter/runtime paths safely: the scan of "
+                f"{', '.join(scan_roots)} exceeded {scan_timeout} s (a cold disk cache or a very "
+                "large installation); this usually clears on retry",
+                transient = True,
+            ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise SandboxUnavailableError("cannot scan interpreter/runtime paths safely") from exc
         if result.returncode != 0:
@@ -546,8 +1004,13 @@ def _validate_runtime_paths(
                 f"an interpreter/runtime path contains {_REJECTED_RUNTIME_ENTRY_TYPES}: "
                 f"{result.stdout.strip().splitlines()[0]}"
             )
+        if memo_key is not None:
+            with _system_scan_lock:
+                _system_scan_memo.clear()
+                _system_scan_memo[memo_key] = time.monotonic()
         return
 
+    deadline = time.monotonic() + scan_timeout
     for root in scan_roots:
         entries = 0
         if os.path.isfile(root):
@@ -559,6 +1022,12 @@ def _validate_runtime_paths(
             ) from exc
 
         for base, dirs, names in os.walk(root, followlinks = False, onerror = walk_error):
+            if time.monotonic() > deadline:
+                raise SandboxUnavailableError(
+                    "cannot scan interpreter/runtime paths safely: the scan of "
+                    f"{', '.join(scan_roots)} exceeded {scan_timeout} s; retry the request",
+                    transient = True,
+                )
             for name in [*dirs, *names]:
                 entries += 1
                 if entries > _SCAN_ENTRY_LIMIT:
@@ -616,6 +1085,14 @@ def _linux_environment(*, run_detector: bool = True) -> str:
     release = ""
     release = _read_text("/proc/sys/kernel/osrelease").lower()
     if "microsoft" in release or os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        # WSL2 runs a real Linux kernel and reports "microsoft-standard-WSL2" or
+        # similar; WSL1 translates syscalls and its osrelease is "<ver>-Microsoft"
+        # with no standard suffix. WSL1 has no namespaces, so Bubblewrap can never
+        # work there and the remediation is a distro upgrade, not a package.
+        if release and "microsoft" in release and not (
+            "wsl2" in release or "microsoft-standard" in release
+        ):
+            return "wsl1"
         return "wsl2"
     if os.environ.get("COLAB_RELEASE_TAG") or "google.colab" in sys.modules:
         return "colab"
@@ -695,7 +1172,7 @@ def _environment_fingerprint(backend: "SandboxBackend | None", *, run_detector: 
             if os.path.exists(f"/proc/self/ns/{name}")
         }
         try:
-            data["mounts"] = [
+            data["mounts"] = sorted(
                 [
                     mount.mount_point,
                     mount.root,
@@ -704,8 +1181,8 @@ def _environment_fingerprint(backend: "SandboxBackend | None", *, run_detector: 
                     mount.mount_options,
                     mount.super_options,
                 ]
-                for mount in _linux_mounts()
-            ]
+                for mount in _relevant_mounts(_linux_mounts(), _fingerprint_roots())
+            )
         except SandboxUnavailableError as exc:
             data["mount_error"] = str(exc)
         data["namespace_policy"] = {
@@ -780,6 +1257,122 @@ except (AttributeError, OSError, ValueError):
 os.execvpe(sys.argv[1], sys.argv[1:], os.environ)
 """
 
+# Runs inside the sandbox (before the exec above) when the launch carries the
+# allowlist policy. The loopback listener has to be created here, inside the
+# new network namespace, because a socket belongs to the namespace it was
+# created in; the descriptor is handed to the host over an inherited AF_UNIX
+# socketpair and the host's proxy accepts on it. The wrapper then waits for the
+# host to confirm ("K <token>") before it publishes the proxy URL and execs.
+_NETWORK_BRIDGE_ENV = "UNSLOTH_STUDIO_NET_CTRL_FD"
+_NETWORK_BRIDGE_TIMEOUT_SECONDS = 30.0
+_NETWORK_BRIDGE_BLOCK = """import socket
+_ctrl_fd = int(os.environ.pop({ctrl_env!r}))
+_ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno = _ctrl_fd)
+_ctrl.settimeout({timeout!r})
+_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+_listener.bind(("127.0.0.1", 0))
+_listener.listen(64)
+socket.send_fds(_ctrl, [b"L"], [_listener.fileno()])
+_reply = b""
+while not _reply.endswith(b"\\n"):
+    _chunk = _ctrl.recv(512)
+    if not _chunk:
+        raise SystemExit("sandbox network bridge: the host closed the control channel")
+    _reply += _chunk
+    if len(_reply) > 4096:
+        raise SystemExit("sandbox network bridge: oversized reply")
+_fields = _reply.strip().split(b" ")
+if len(_fields) != 2 or _fields[0] != b"K":
+    raise SystemExit("sandbox network bridge: unexpected reply")
+_url = "http://sandbox:" + _fields[1].decode("ascii") + "@127.0.0.1:" + str(_listener.getsockname()[1])
+for _key in {proxy_keys!r}:
+    os.environ[_key] = _url
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = {no_proxy!r}
+_listener.close()
+_ctrl.close()
+del _ctrl_fd, _ctrl, _listener, _reply, _chunk, _fields, _url, _key
+"""
+
+
+def _linux_wrapper_source(*, limit: int, network_bridge: bool) -> str:
+    wrapper = _NPROC_WRAPPER.format(limit = limit)
+    if not network_bridge:
+        return wrapper
+    block = _NETWORK_BRIDGE_BLOCK.format(
+        ctrl_env = _NETWORK_BRIDGE_ENV,
+        timeout = _NETWORK_BRIDGE_TIMEOUT_SECONDS,
+        proxy_keys = tuple(_PROXY_ENV_KEYS),
+        no_proxy = _NO_PROXY_VALUE,
+    )
+    marker = "os.execvpe("
+    assert wrapper.count(marker) == 1
+    return wrapper.replace(marker, block + marker)
+
+
+def _receive_bridge_listener(
+    host_end: socket.socket, timeout: float | None = None
+) -> socket.socket:
+    """Take the loopback listener the sandboxed wrapper created and vet it."""
+    host_end.settimeout(_NETWORK_BRIDGE_TIMEOUT_SECONDS if timeout is None else timeout)
+    try:
+        message, fds, _flags, _addr = socket.recv_fds(host_end, 16, 1)
+    except socket.timeout as exc:
+        raise SandboxUnavailableError(
+            "the sandboxed process did not hand over its network listener in time",
+            transient = True,
+        ) from exc
+    except OSError as exc:
+        raise SandboxUnavailableError(
+            f"the network bridge control channel failed: {exc}", transient = True
+        ) from exc
+    listener: socket.socket | None = None
+    try:
+        if not message and not fds:
+            raise SandboxUnavailableError(
+                "the sandboxed process exited before handing over its network listener",
+                transient = True,
+            )
+        if message != b"L" or len(fds) != 1:
+            raise SandboxUnavailableError("the network bridge sent an unexpected message")
+        listener = socket.socket(fileno = fds.pop())
+        if listener.family != socket.AF_INET or listener.type != socket.SOCK_STREAM:
+            raise SandboxUnavailableError("the network bridge listener is not a TCP socket")
+        address, port = listener.getsockname()[:2]
+        if address != "127.0.0.1" or not port:
+            raise SandboxUnavailableError(
+                f"the network bridge listener is bound to {address}:{port}, not loopback"
+            )
+        if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
+            raise SandboxUnavailableError("the network bridge listener is not listening")
+        return listener
+    except Exception:
+        if listener is not None:
+            listener.close()
+        raise
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _network_allowlist_for_launch() -> NetworkAllowlist:
+    try:
+        return NetworkAllowlist.from_env()
+    except AllowlistError as exc:
+        raise SandboxUnavailableError(
+            f"the network allowlist is invalid ({exc}); fix {NETWORK_ALLOWLIST_ENV} or disable network access"
+        ) from exc
+
+
+def _network_allowlist_hosts() -> tuple[str, ...] | None:
+    """The configured hosts, or None when the environment override does not parse."""
+    try:
+        return NetworkAllowlist.from_env().hosts
+    except AllowlistError:
+        return None
+
 
 def _nproc_limit() -> int:
     try:
@@ -789,7 +1382,7 @@ def _nproc_limit() -> int:
 
 
 def _validate_linux_workdir_environment(workdir: str) -> None:
-    if _linux_environment() != "wsl2":
+    if _linux_environment() not in ("wsl1", "wsl2"):
         return
     mount = _linux_mount_for_path(workdir)
     if mount is None:
@@ -817,7 +1410,7 @@ def _nested_exposed_mounts(roots: tuple[str, ...]) -> tuple[_LinuxMount, ...]:
 
 def _sanitize_linux_environment(env: dict[str, str], environment: str) -> dict[str, str]:
     sanitized = dict(env)
-    if environment == "wsl2":
+    if environment in ("wsl1", "wsl2"):
         for key in (
             "WSL_INTEROP",
             "WSLENV",
@@ -841,11 +1434,19 @@ def _sanitize_linux_environment(env: dict[str, str], environment: str) -> dict[s
 
 
 class LinuxBubblewrapBackend:
+    supports_network_allowlist = True
     identity = "linux-bubblewrap"
     profile_id = "linux-bubblewrap-v2"
 
     def __init__(self) -> None:
         self._bwrap: str | None = None
+        # True when the installed bwrap accepts --disable-userns (0.8.0+). When it
+        # does not, prepare() denies nested user namespaces with seccomp instead
+        # and the capability carries _LIMITATION_NESTED_USERNS_SECCOMP.
+        self._disable_userns_supported: bool = True
+
+    def _limitations(self) -> tuple[str, ...]:
+        return () if self._disable_userns_supported else (_LIMITATION_NESTED_USERNS_SECCOMP,)
 
     def probe(self) -> SandboxCapability:
         if platform.machine().lower() not in _LINUX_SECCOMP_ABIS:
@@ -869,7 +1470,9 @@ class LinuxBubblewrapBackend:
                 f"Bubblewrap is not a root-controlled executable: {candidate}",
             )
         system_roots = tuple(
-            path for path in (*_LINUX_SYSTEM_ROOTS, *_LINUX_ETC_FILES) if os.path.exists(path)
+            path
+            for path in (*_LINUX_SYSTEM_ROOTS, *_LINUX_ETC_FILES, *_LINUX_CA_TRUST_PATHS)
+            if os.path.exists(path)
         )
         try:
             _validate_runtime_paths(
@@ -883,16 +1486,22 @@ class LinuxBubblewrapBackend:
                 self.identity,
                 False,
                 f"a read-only Linux system root is unsafe to expose: {exc}",
+                transient = exc.transient,
             )
         self._bwrap = candidate
+        self._disable_userns_supported = "--disable-userns" in _bwrap_supported_options(candidate)
         result = _live_probe(self)
+        limitations = tuple(dict.fromkeys((*result.limitations, *self._limitations())))
         if result.qualified:
             return replace(
                 result,
                 available = True,
                 profile_id = self.profile_id,
+                limitations = limitations,
             )
-        return replace(result, available = False)
+        return replace(
+            _explain_linux_probe_failure(result, candidate), available = False, limitations = limitations
+        )
 
     def prepare(self, spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
         if self._bwrap is None:
@@ -901,7 +1510,9 @@ class LinuxBubblewrapBackend:
         _validate_linux_workdir_environment(workdir)
         runtime_paths = _runtime_read_paths()
         system_roots = tuple(
-            path for path in (*_LINUX_SYSTEM_ROOTS, *_LINUX_ETC_FILES) if os.path.exists(path)
+            path
+            for path in (*_LINUX_SYSTEM_ROOTS, *_LINUX_ETC_FILES, *_LINUX_CA_TRUST_PATHS)
+            if os.path.exists(path)
         )
         _validate_runtime_paths(
             system_roots,
@@ -926,7 +1537,7 @@ class LinuxBubblewrapBackend:
                     f"a nested host mount has an unsupported type: {mount.mount_point}"
                 )
             nested_mounts.append((mount, stat.S_ISDIR(mode)))
-        seccomp_filter = _linux_seccomp_filter()
+        seccomp_filter = _linux_seccomp_filter(block_userns = not self._disable_userns_supported)
         try:
             identity_dir, passwd, group = _identity_files()
         except Exception:
@@ -934,6 +1545,11 @@ class LinuxBubblewrapBackend:
             raise
         environment = _linux_environment()
         env = _sanitize_linux_environment(spec.env, environment)
+        if spec.network_policy == "allowlist":
+            # Not secret and not the proxy URL (that one is set inside the
+            # namespace by the wrapper): the trust bundle for interpreters whose
+            # OpenSSL has no default store, so TLS through the proxy verifies.
+            env.update(tls_trust_environment(env))
         env["HOME"] = workdir
         env["TMPDIR"] = "/tmp"
 
@@ -943,7 +1559,7 @@ class LinuxBubblewrapBackend:
             "--new-session",
             "--unshare-all",
             "--unshare-user",
-            "--disable-userns",
+            *(("--disable-userns",) if self._disable_userns_supported else ()),
             "--cap-drop",
             "ALL",
             "--seccomp",
@@ -965,6 +1581,9 @@ class LinuxBubblewrapBackend:
             argv.extend(("--ro-bind", "/nix/store", "/nix/store"))
         for path in _LINUX_ETC_FILES:
             argv.extend(("--ro-bind-try", path, path))
+        if spec.network_policy == "allowlist":
+            for path in _LINUX_CA_TRUST_PATHS:
+                argv.extend(("--ro-bind-try", path, path))
         argv.extend(("--ro-bind", passwd, "/etc/passwd"))
         argv.extend(("--ro-bind", group, "/etc/group"))
         private_tmp_runtime_paths: list[str] = []
@@ -977,6 +1596,20 @@ class LinuxBubblewrapBackend:
                 private_tmp_runtime_paths.append(path)
                 continue
             argv.extend(("--ro-bind", path, path))
+        if spec.network_policy == "allowlist":
+            # OpenSSL's default store and certifi, only where an existing bind does
+            # not already cover them: on Debian /usr/lib/ssl sits under /usr/lib and
+            # certifi under the runtime tree, and mounting again on top of a bound
+            # tree (through /usr/lib/ssl/certs, a symlink into /etc/ssl) made
+            # bwrap exit before the wrapper ran (staging round 8). Bound after the
+            # runtime paths so a later bind cannot shadow them.
+            covered = (*_LINUX_SYSTEM_ROOTS, *_LINUX_CA_TRUST_PATHS, "/nix/store", *runtime_paths)
+            for path in tls_trust_paths():
+                if any(_lexically_contained(path, root) for root in covered):
+                    continue
+                if _lexically_contained(path, "/tmp"):
+                    continue
+                argv.extend(("--ro-bind-try", path, path))
         empty_mask = os.path.join(identity_dir, "empty")
         try:
             with open(empty_mask, "wb"):
@@ -990,7 +1623,7 @@ class LinuxBubblewrapBackend:
                 argv.extend(("--tmpfs", mount.mount_point))
             else:
                 argv.extend(("--ro-bind", empty_mask, mount.mount_point))
-        if environment == "wsl2":
+        if environment in ("wsl1", "wsl2"):
             for path in _WSL_HIDDEN_PATHS:
                 argv.extend(("--tmpfs", path))
         argv.extend(("--dir", workdir, "--remount-ro", "/"))
@@ -1000,34 +1633,155 @@ class LinuxBubblewrapBackend:
             argv.extend(("--ro-bind", path, path))
         argv.extend(("--bind", workdir, workdir, "--chdir", workdir))
         argv.extend(("--setenv", "HOME", workdir, "--setenv", "TMPDIR", "/tmp"))
-        wrapper = _NPROC_WRAPPER.format(limit = _nproc_limit())
-        argv.extend(
-            (
-                "--",
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                wrapper,
-                *spec.argv,
+        network_bridge = spec.network_policy == "allowlist"
+        pass_fds: list[int] = [seccomp_filter.fileno()]
+        cleanup_callbacks: list[Callable[[], None]] = []
+        spawn_callback = None
+        network_audit = None
+        proxy: AllowlistProxy | None = None
+        bridge_ends: tuple[socket.socket, socket.socket] | None = None
+        # Nothing owns the proxy or the socketpair until PreparedSandboxLaunch
+        # holds their cleanup callbacks, so anything that raises in between has
+        # to close them here, the way the Seatbelt backend does.
+        try:
+            if network_bridge:
+                allowlist = _network_allowlist_for_launch()
+                proxy = AllowlistProxy(allowlist)
+                host_end, sandbox_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                bridge_ends = (host_end, sandbox_end)
+                cleanup_callbacks.extend((proxy.close, host_end.close, sandbox_end.close))
+                pass_fds.append(sandbox_end.fileno())
+                argv.extend(("--setenv", _NETWORK_BRIDGE_ENV, str(sandbox_end.fileno())))
+                spawn_callback = _bridged_spawn(proxy, host_end, sandbox_end)
+                network_audit = proxy.audit
+            wrapper = _linux_wrapper_source(
+                limit = _nproc_limit(), network_bridge = network_bridge
             )
+            argv.extend(
+                (
+                    "--",
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    wrapper,
+                    *spec.argv,
+                )
+            )
+            return PreparedSandboxLaunch(
+                argv = tuple(argv),
+                workdir = workdir,
+                env = env,
+                preexec_fn = spec.launcher_preexec_fn,
+                backend = self.identity,
+                pass_fds = tuple(pass_fds),
+                owned_files = [seccomp_filter],
+                cleanup_paths = [identity_dir],
+                timeout_seconds = spec.timeout_seconds,
+                close_fds = spec.close_fds,
+                terminate_descendants = spec.terminate_descendants,
+                spawn_callback = spawn_callback,
+                cleanup_callbacks = cleanup_callbacks,
+                network_audit = network_audit,
+            )
+        except Exception:
+            if proxy is not None:
+                proxy.close()
+            for end in bridge_ends or ():
+                try:
+                    end.close()
+                except OSError:
+                    pass
+            # The seccomp descriptor and the identity directory are owned by the
+            # PreparedSandboxLaunch that was never returned, so they are this
+            # path's to release too, like the empty-mask failure above. Leaking
+            # a descriptor here is worst exactly when it matters: socketpair
+            # fails under descriptor exhaustion, and every retry made it worse.
+            seccomp_filter.close()
+            shutil.rmtree(identity_dir, ignore_errors = True)
+            raise
+
+
+def _bridged_spawn(
+    proxy: AllowlistProxy, host_end: socket.socket, sandbox_end: socket.socket
+) -> Callable[[PreparedSandboxLaunch, dict[str, Any]], object]:
+    """Spawn, then complete the listener handshake before the tool runs.
+
+    The sandboxed wrapper blocks until the host confirms, so the tool's own code
+    never starts unless the proxy is accepting on a listener that lives inside
+    the sandbox's network namespace. Any failure kills the process and surfaces
+    as a transient SandboxUnavailableError instead of a tool that silently has
+    no network.
+    """
+
+    def spawn(prepared: PreparedSandboxLaunch, popen_kwargs: dict[str, Any]) -> object:
+        try:
+            proc = subprocess.Popen(prepared.argv, **popen_kwargs)
+        finally:
+            # The child holds its own copy; the host's copy must go so a child
+            # that dies early is seen as EOF instead of a hang until timeout.
+            sandbox_end.close()
+        try:
+            listener = _receive_bridge_listener(host_end)
+            proxy.serve_listener(listener)
+            host_end.sendall(b"K " + proxy.credential.token.encode("ascii") + b"\n")
+        except BaseException as exc:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout = 5)
+            except Exception:  # noqa: BLE001 - best effort reap
+                pass
+            proxy.close()
+            if isinstance(exc, SandboxUnavailableError):
+                raise
+            raise SandboxUnavailableError(
+                f"the sandbox network bridge failed: {exc}", transient = True
+            ) from exc
+        finally:
+            host_end.close()
+        return proc
+
+    return spawn
+
+
+def _explain_linux_probe_failure(
+    result: SandboxCapability, bwrap_path: str = _DEFAULT_BWRAP_PATH
+) -> SandboxCapability:
+    """Attach the known cause and its remediation when AppArmor blocked Bubblewrap.
+
+    Ubuntu 24.04 and later ship ``kernel.apparmor_restrict_unprivileged_userns=1``
+    and no profile for ``/usr/bin/bwrap``; the raw symptom is a loopback or uid
+    map error. The sysctl read here is already part of the environment
+    fingerprint, so the explanation cannot go stale silently.
+    """
+    if result.qualified:
+        return result
+    if _linux_environment() == "wsl1":
+        # No namespaces at all under WSL 1, so no package or profile can help.
+        return replace(
+            result,
+            reason = f"WSL 1 has no Linux user namespaces: {result.reason}",
+            remediation = _WSL1_REMEDIATION,
         )
-        return PreparedSandboxLaunch(
-            argv = tuple(argv),
-            workdir = workdir,
-            env = env,
-            preexec_fn = spec.launcher_preexec_fn,
-            backend = self.identity,
-            pass_fds = (seccomp_filter.fileno(),),
-            owned_files = [seccomp_filter],
-            cleanup_paths = [identity_dir],
-            timeout_seconds = spec.timeout_seconds,
-            close_fds = spec.close_fds,
-            terminate_descendants = spec.terminate_descendants,
-        )
+    if _read_text(_APPARMOR_USERNS_SYSCTL).strip() != "1":
+        return result
+    if not any(marker in result.reason for marker in _APPARMOR_USERNS_MARKERS):
+        return result
+    return replace(
+        result,
+        reason = (
+            "AppArmor restricts unprivileged user namespaces on this host "
+            f"(kernel.apparmor_restrict_unprivileged_userns=1): {result.reason}"
+        ),
+        remediation = _apparmor_userns_remediation(os.path.realpath(bwrap_path)),
+    )
 
 
 class MacOSSeatbeltBackend:
+    supports_network_allowlist = True
     identity = "macos-seatbelt"
     profile_id = "macos-seatbelt-preview-v1"
     limitations = (
@@ -1089,13 +1843,31 @@ class MacOSSeatbeltBackend:
         private_tmp = tempfile.mkdtemp(
             prefix = "us-seatbelt-", dir = "/tmp" if sys.platform == "darwin" else None
         )
+        proxy: AllowlistProxy | None = None
         try:
+            proxy_port = None
+            if spec.network_policy == "allowlist":
+                # Seatbelt has no network namespace, so the proxy listens on the
+                # host loopback and the profile admits exactly that port; every
+                # other outbound destination stays under (deny default).
+                proxy = AllowlistProxy(_network_allowlist_for_launch())
+                proxy_port = proxy.listen_loopback()
             profile = _macos_seatbelt_profile(
                 workdir = workdir,
                 private_tmp = private_tmp,
                 runtime_paths = runtime_paths,
+                proxy_port = proxy_port,
             )
             env = _sanitize_macos_environment(spec.env, workdir, private_tmp)
+            developer_paths = _macos_developer_paths()
+            if developer_paths and "DEVELOPER_DIR" not in env:
+                # xcselect honours DEVELOPER_DIR before it reads the xcode_select
+                # link, so the /usr/bin shims (git, make, python3) resolve the real
+                # tool without depending on the link being readable.
+                env["DEVELOPER_DIR"] = developer_paths[0]
+            if proxy is not None:
+                env.update(proxy_environment(proxy.port, proxy.credential))
+                env.update(tls_trust_environment(env))
             return PreparedSandboxLaunch(
                 argv = (self._sandbox_exec, "-p", profile, "--", *spec.argv),
                 workdir = workdir,
@@ -1106,8 +1878,12 @@ class MacOSSeatbeltBackend:
                 timeout_seconds = spec.timeout_seconds,
                 close_fds = spec.close_fds,
                 terminate_descendants = spec.terminate_descendants,
+                cleanup_callbacks = [proxy.close] if proxy is not None else [],
+                network_audit = proxy.audit if proxy is not None else None,
             )
         except Exception:
+            if proxy is not None:
+                proxy.close()
             shutil.rmtree(private_tmp, ignore_errors = True)
             raise
 
@@ -1134,6 +1910,121 @@ _MACOS_READ_ROOTS = (
     "/private/etc/services",
     "/System/Library/CoreServices/.SystemVersionPlatform.plist",
     "/System/Library/CoreServices/SystemVersion.plist",
+    # /usr/bin/git and friends are xcode-select shims that resolve the developer
+    # directory through this link and exec the real tool from it; without these
+    # every git call inside the sandbox ends with "See man xcode-select".
+    "/private/var/db/xcode_select_link",
+    "/Library/Developer/CommandLineTools",
+    "/Applications/Xcode.app/Contents/Developer",
+)
+# Readable only when the network allowlist is on: the trust store OpenSSL reads
+# (/private/etc/ssl) and what Security.framework needs to evaluate a server
+# certificate (the system keychains, the trust settings database, and trustd
+# through mach-lookup); curl and Foundation clients cannot verify TLS without
+# them, and Python's OpenSSL needs the cert.pem the system ships.
+_MACOS_TLS_TRUST_PATHS = (
+    "/private/etc/ssl",
+    "/System/Library/Keychains",
+    "/Library/Keychains",
+    "/System/Library/Security",
+    "/private/var/db/mds",
+    "/Library/Preferences/com.apple.security.plist",
+    "/Library/Preferences/com.apple.security.revocation.plist",
+)
+# Certificate evaluation only. com.apple.SecurityServer is deliberately absent:
+# with it a sandboxed tool can query the login Keychain through Security.framework
+# even though /usr/bin/security is exec-denied (the escape PR 5468 removed in its
+# fourth review round). Python's OpenSSL verifies through the trust store bound
+# above and needs none of these; they are here for curl and Foundation clients.
+_MACOS_TLS_MACH_SERVICES = (
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+    "com.apple.ocspd",
+)
+# Homebrew and /usr/local: PATH inside the sandbox carries /usr/local/bin, so a
+# tool found through PATH would fail process-exec without these. Read-only, and
+# only the trees that exist on the host.
+_MACOS_OPTIONAL_READ_ROOTS = (
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/usr/local/sbin",
+    "/usr/local/opt",
+    "/usr/local/Cellar",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/sbin",
+    "/opt/homebrew/opt",
+    "/opt/homebrew/Cellar",
+)
+_developer_paths_cache: tuple[str, ...] | None = None
+_developer_paths_lock = threading.Lock()
+
+
+def _macos_developer_paths() -> tuple[str, ...]:
+    """The active developer directory, resolved once through xcode-select.
+
+    /usr/bin/git, /usr/bin/python3 and the other shims call xcselect to find
+    the developer directory and exec the real tool from it, so a profile that
+    cannot see that directory ends every such call with "See man xcode-select".
+    The directory is versioned on many hosts (/Applications/Xcode_16.4.app) and
+    the static list cannot name it; the real path is read from xcode-select and
+    kept for the process lifetime.
+    """
+    global _developer_paths_cache
+    with _developer_paths_lock:
+        if _developer_paths_cache is not None:
+            return _developer_paths_cache
+        found: list[str] = []
+        if sys.platform == "darwin" and os.path.exists("/usr/bin/xcode-select"):
+            try:
+                result = subprocess.run(
+                    ["/usr/bin/xcode-select", "-p"],
+                    capture_output = True,
+                    text = True,
+                    timeout = 10,
+                    check = False,
+                )
+                candidate = result.stdout.strip()
+                if result.returncode == 0 and candidate and os.path.isdir(candidate):
+                    found.append(os.path.realpath(candidate))
+                    if candidate not in found:
+                        found.append(candidate)
+                    # xcselect validates the developer directory against the
+                    # enclosing app bundle (Info.plist, version.plist), so a
+                    # Contents/Developer inside an .app needs the bundle itself.
+                    for spelling in list(found):
+                        marker = ".app/Contents/Developer"
+                        if spelling.endswith(marker):
+                            bundle = spelling[: -len(marker) + len(".app")]
+                            if os.path.isdir(bundle) and bundle not in found:
+                                found.append(bundle)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _developer_paths_cache = tuple(found)
+        return _developer_paths_cache
+
+
+# Files git and other tools probe on every run and may legitimately be absent.
+# The path filter above keeps only paths that exist, and under (deny default)
+# an absent file yields EPERM instead of ENOENT, which git reports as
+# "unable to access '/etc/gitconfig'" and aborts on. These literals are allowed
+# whether or not they exist.
+_MACOS_OPTIONAL_READ_LITERALS = (
+    "/etc/gitconfig",
+    "/private/etc/gitconfig",
+    "/etc/gitattributes",
+    "/private/etc/gitattributes",
+    # A Homebrew git is built with its own prefix as the system config path, so
+    # it reads these instead of /etc and aborts the same way. Both prefixes are
+    # listed because the binary on PATH decides which one, not the host's
+    # architecture: an Intel-built git under Rosetta uses /usr/local.
+    "/usr/local/etc/gitconfig",
+    "/usr/local/etc/gitattributes",
+    "/opt/homebrew/etc/gitconfig",
+    "/opt/homebrew/etc/gitattributes",
+    # xcrun's license check: the Xcode shims refuse ("You have not agreed to the
+    # Xcode license agreements") when they cannot read the system-wide record.
+    "/Library/Preferences/com.apple.dt.Xcode.plist",
 )
 _MACOS_DENIED_EXECUTABLES = (
     "/usr/bin/open",
@@ -1229,9 +2120,14 @@ def _sbpl_path_filters(paths: tuple[str, ...]) -> list[str]:
 def _sbpl_path_spellings(path: str) -> tuple[str, ...]:
     canonical, _ = _sbpl_path(path)
     selected = [os.path.abspath(path), json.loads(canonical)]
+    # /etc, /tmp and /var are symlinks into /private; tools spell paths through
+    # the symlink (git reads /etc/gitconfig), and resolving that spelling needs
+    # the symlink itself and its ancestors in the metadata rules, otherwise the
+    # access fails with EPERM before the canonical rule is ever consulted.
     for spelling in tuple(selected):
-        if spelling == "/private/var" or spelling.startswith("/private/var/"):
-            selected.append(spelling[len("/private") :])
+        for prefix in ("/private/var", "/private/etc", "/private/tmp"):
+            if spelling == prefix or spelling.startswith(prefix + "/"):
+                selected.append(spelling[len("/private") :])
     return tuple(dict.fromkeys(selected))
 
 
@@ -1256,14 +2152,42 @@ def _sbpl_ancestor_filters(paths: tuple[str, ...]) -> list[str]:
 
 
 def _macos_seatbelt_profile(
-    *, workdir: str, private_tmp: str, runtime_paths: tuple[str, ...]
+    *,
+    workdir: str,
+    private_tmp: str,
+    runtime_paths: tuple[str, ...],
+    proxy_port: int | None = None,
 ) -> str:
-    readable_paths = (*_MACOS_READ_ROOTS, *_MACOS_DEVICES, *runtime_paths, workdir, private_tmp)
+    readable_paths = (
+        *_MACOS_READ_ROOTS,
+        *_MACOS_OPTIONAL_READ_ROOTS,
+        *_macos_developer_paths(),
+        *((*_MACOS_TLS_TRUST_PATHS, *tls_trust_paths()) if proxy_port else ()),
+        *_MACOS_DEVICES,
+        *runtime_paths,
+        workdir,
+        private_tmp,
+    )
     read_filters = [
         '(literal "/")',
         *_sbpl_path_filters(readable_paths),
     ]
     metadata_filters = _sbpl_ancestor_filters(readable_paths)
+    # The optional literals may not exist, so their ancestors are added by name.
+    # posixpath, not os.path: these are sandbox profile paths, always POSIX, and
+    # on Windows ntpath.dirname("/") returns "/" while os.path.sep is a
+    # backslash, so the walk never reached its stop condition and this loop hung
+    # the whole test run.
+    for literal in _MACOS_OPTIONAL_READ_LITERALS:
+        current = posixpath.dirname(literal)
+        while current and current != "/":
+            encoded = f"(literal {json.dumps(current)})"
+            if encoded not in metadata_filters:
+                metadata_filters.append(encoded)
+            parent = posixpath.dirname(current)
+            if parent == current:
+                break
+            current = parent
     write_filters = _sbpl_path_filters((workdir, private_tmp))
     temp_encoded, _ = _sbpl_path(private_tmp)
     device_filters = _sbpl_path_filters(_MACOS_DEVICES)
@@ -1286,6 +2210,9 @@ def _macos_seatbelt_profile(
         "(deny process-exec " + " ".join(denied_exec) + ")",
         "(allow file-read-metadata " + " ".join(metadata_filters) + ")",
         "(allow file-read* file-test-existence " + " ".join(read_filters) + ")",
+        "(allow file-read* file-test-existence "
+        + " ".join(f"(literal {json.dumps(path)})" for path in _MACOS_OPTIONAL_READ_LITERALS)
+        + ")",
         "(allow file-map-executable " + " ".join(read_filters) + ")",
         "(allow file-write* " + " ".join(write_filters) + ")",
         "(allow file-read* file-test-existence file-write-data "
@@ -1304,10 +2231,22 @@ def _macos_seatbelt_profile(
         "(allow system-socket (socket-domain AF_UNIX))",
         f"(allow network-bind (local unix-socket (subpath {temp_encoded})))",
         f"(allow network-outbound (remote unix-socket (subpath {temp_encoded})))",
+        *(
+            # Codex and Zed use the same rule for their loopback proxies; the
+            # profile stays (deny default) for every other remote endpoint.
+            [f'(allow network-outbound (remote ip "localhost:{int(proxy_port)}"))']
+            if proxy_port
+            else []
+        ),
         "(allow sysctl-read " + " ".join(sysctl_filters) + ")",
         '(allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))',
         "(allow mach-lookup",
         '  (global-name "com.apple.system.opendirectoryd.libinfo")',
+        *(
+            [f"  (global-name {json.dumps(name)})" for name in _MACOS_TLS_MACH_SERVICES]
+            if proxy_port
+            else []
+        ),
         '  (global-name "com.apple.PowerManagement.control"))',
     ]
     return "\n".join(lines) + "\n"
@@ -1548,11 +2487,14 @@ def _probe_payload(
     host_pid: int,
     abstract_socket: str | None,
     ipv4_address: tuple[str, int],
-    ipv6_address: tuple[str, int, int, int],
+    ipv6_address: tuple[str, int, int, int] | None,
     udp_address: tuple[str, int],
     host_namespaces: dict[str, str],
     inherited_fds: tuple[int, ...],
 ) -> str:
+    ip_endpoints: list[tuple[int, tuple]] = [(int(socket.AF_INET), ipv4_address)]
+    if ipv6_address is not None:
+        ip_endpoints.append((int(socket.AF_INET6), ipv6_address))
     abstract_check = ""
     if abstract_socket is not None:
         abstract_check = f"""
@@ -1619,7 +2561,9 @@ if hasattr(socket, 'AF_VSOCK'):
 libc = ctypes.CDLL(None, use_errno=True)
 result = libc.syscall(425, 1, 0)
 assert result == -1 and ctypes.get_errno() == errno.EPERM, 'io_uring_setup was not denied'
-for family, address in ((socket.AF_INET, {ipv4_address!r}), (socket.AF_INET6, {ipv6_address!r})):
+result = libc.unshare({_CLONE_NEWUSER})
+assert result == -1, 'a nested user namespace could be created inside the sandbox'
+for family, address in {ip_endpoints!r}:
     s = socket.socket(family)
     s.settimeout(0.2)
     try:
@@ -1695,6 +2639,7 @@ def _live_probe(backend: SandboxBackend) -> SandboxCapability:
     host_udp_socket: socket.socket | None = None
     inherited_fds: list[int] = []
     prepared: PreparedSandboxLaunch | None = None
+    limitations: list[str] = []
     try:
         with tempfile.TemporaryDirectory(prefix = "unsloth-sandbox-probe-") as base:
             workdir = os.path.join(base, "work")
@@ -1713,10 +2658,20 @@ def _live_probe(backend: SandboxBackend) -> SandboxCapability:
             host_ipv4_socket.bind(("127.0.0.1", 0))
             host_ipv4_socket.listen(1)
             ipv4_address = host_ipv4_socket.getsockname()
-            host_ipv6_socket = socket.socket(socket.AF_INET6)
-            host_ipv6_socket.bind(("::1", 0))
-            host_ipv6_socket.listen(1)
-            ipv6_address = host_ipv6_socket.getsockname()
+            ipv6_address: tuple[str, int, int, int] | None = None
+            try:
+                host_ipv6_socket = socket.socket(socket.AF_INET6)
+                host_ipv6_socket.bind(("::1", 0))
+                host_ipv6_socket.listen(1)
+                ipv6_address = host_ipv6_socket.getsockname()
+            except OSError:
+                # IPv6 disabled at the kernel or no ::1: nothing to isolate from,
+                # so the IPv6 leg is skipped and disclosed rather than failing the
+                # whole qualification.
+                if host_ipv6_socket is not None:
+                    host_ipv6_socket.close()
+                    host_ipv6_socket = None
+                limitations.append(_LIMITATION_IPV6_UNAVAILABLE)
             host_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             host_udp_socket.bind(("127.0.0.1", 0))
             udp_address = host_udp_socket.getsockname()
@@ -1752,6 +2707,7 @@ def _live_probe(backend: SandboxBackend) -> SandboxCapability:
             host_namespaces = {
                 name: os.readlink(f"/proc/self/ns/{name}")
                 for name in ("mnt", "pid", "net", "ipc", "user")
+                if os.path.exists(f"/proc/self/ns/{name}")
             }
             spec = SandboxLaunchSpec(
                 argv = (
@@ -1844,12 +2800,20 @@ def _live_probe(backend: SandboxBackend) -> SandboxCapability:
                 os.close(inherited_fd)
             except OSError:
                 pass
-    return SandboxCapability(backend.identity, True, "restrictive live probe passed")
+    return SandboxCapability(
+        backend.identity,
+        True,
+        "restrictive live probe passed",
+        limitations = tuple(limitations),
+    )
 
 
 _LINUX_BACKEND = LinuxBubblewrapBackend()
 _MACOS_BACKEND = MacOSSeatbeltBackend()
 _WINDOWS_BACKEND: SandboxBackend | None = None
+_WINDOWS_LIMITED_BACKEND: Any = None
+_LIMITED_BACKEND = "process-guard"
+_LIMITED_PROFILE_ID = "limited-software-safeguards-v1"
 _capability_cache: dict[str, SandboxCapability] = {}
 _probe_lock = threading.Lock()
 
@@ -1868,32 +2832,97 @@ def _platform_backend() -> SandboxBackend | None:
     return None
 
 
+def _limited_isolation_backend() -> Any:
+    """The launcher that hardens Limited mode beyond the process guard, if this host has one.
+
+    Only Windows has one: a write-restricted token (windows_restricted_token).
+    Linux and macOS Limited launches keep the process guard alone, and the
+    Windows launcher is used only after its own live probe passed.
+    """
+    global _WINDOWS_LIMITED_BACKEND
+    if sys.platform != "win32":
+        return None
+    if _WINDOWS_LIMITED_BACKEND is None:
+        try:
+            from .windows_restricted_token import WindowsRestrictedTokenBackend
+        except Exception:  # noqa: BLE001 - Limited mode keeps working without it
+            logger.warning("Windows restricted-token launcher unavailable", exc_info = True)
+            return None
+        _WINDOWS_LIMITED_BACKEND = WindowsRestrictedTokenBackend()
+    return _WINDOWS_LIMITED_BACKEND
+
+
+def _with_limited_capability(capability: SandboxCapability, *, force: bool) -> SandboxCapability:
+    """Attach what Limited mode runs under on this host to an OS capability snapshot."""
+    limited = _limited_isolation_backend()
+    if limited is None:
+        return capability
+    try:
+        probe = limited.probe(force = force)
+    except Exception as exc:  # noqa: BLE001 - never blocks the OS capability
+        logger.warning("Limited launcher probe failed", exc_info = True)
+        return replace(capability, limited_reason = f"{type(exc).__name__}: {exc}")
+    if not probe.available:
+        return replace(capability, limited_reason = probe.reason)
+    return replace(
+        capability,
+        limited_backend = limited.identity,
+        limited_profile_id = probe.profile_id,
+        limited_limitations = tuple(probe.limitations),
+        limited_reason = probe.reason,
+    )
+
+
 def _capability_with_identity(
-    capability: SandboxCapability, *, environment: str, fingerprint: str
+    capability: SandboxCapability,
+    *,
+    environment: str,
+    fingerprint: str,
+    network_allowlist_supported: bool = False,
 ) -> SandboxCapability:
     available = capability.qualified if capability.available is None else capability.available
     protection_state = capability.protection_state if available else "unavailable"
     if available and protection_state == "unavailable":
         protection_state = "protected" if environment == "native_linux" else "preview"
     profile_id = capability.profile_id if available else "none"
+    # The generation binds Limited grants to the security facts that produced
+    # them. Free-text reasons are deliberately not part of it: a probe that fails
+    # with a different temp path or stderr tail must not revoke every grant.
     generation_payload = "\0".join(
         (
+            "generation-v2",
             fingerprint,
             capability.backend,
             str(available),
             str(capability.qualified),
-            capability.reason,
             protection_state,
             profile_id,
             *capability.limitations,
         )
     ).encode()
     generation = hashlib.sha256(generation_payload).hexdigest()
-    remediation = (
-        "No remediation required."
-        if available
-        else "Use Limited mode only for a trusted task, or install and enable a qualified OS sandbox backend."
-    )
+    default_remediation = SandboxCapability.__dataclass_fields__["remediation"].default
+    if available:
+        remediation = "No remediation required."
+    elif capability.remediation and capability.remediation != default_remediation:
+        remediation = capability.remediation
+    else:
+        remediation = _GENERIC_REMEDIATION
+    network_policies: tuple[str, ...] = ("deny",)
+    network_allowlist: tuple[str, ...] = ()
+    limitations = capability.limitations
+    if available and network_allowlist_supported:
+        hosts = _network_allowlist_hosts()
+        if hosts:
+            network_policies = ("deny", "allowlist")
+            network_allowlist = hosts
+        else:
+            # A broken or empty UNSLOTH_STUDIO_TOOL_NETWORK_ALLOWLIST must not be
+            # advertised as a working allowlist: the launch would refuse every tool
+            # call while the toggle looked healthy. Display-only limitation, added
+            # after probe_generation was computed so Limited grants do not rotate.
+            if _LIMITATION_NETWORK_ALLOWLIST_INVALID not in limitations:
+                limitations = (*limitations, _LIMITATION_NETWORK_ALLOWLIST_INVALID)
     return replace(
         capability,
         available = available,
@@ -1904,6 +2933,9 @@ def _capability_with_identity(
         environment_fingerprint = fingerprint,
         remediation = remediation,
         retryable = capability.transient,
+        limitations = limitations,
+        network_policies = network_policies,
+        network_allowlist = network_allowlist,
     )
 
 
@@ -1912,14 +2944,17 @@ def capability_snapshot(*, force: bool = False) -> SandboxCapability:
     environment = _environment_class()
     fingerprint = _environment_fingerprint(backend)
     if backend is None:
-        return _capability_with_identity(
-            SandboxCapability(
-                f"unsupported-{sys.platform}",
-                False,
-                f"OS sandboxing is unsupported on {sys.platform}",
+        return _with_limited_capability(
+            _capability_with_identity(
+                SandboxCapability(
+                    f"unsupported-{sys.platform}",
+                    False,
+                    f"OS sandboxing is unsupported on {sys.platform}",
+                ),
+                environment = environment,
+                fingerprint = fingerprint,
             ),
-            environment = environment,
-            fingerprint = fingerprint,
+            force = force,
         )
     cached = _capability_cache.get(fingerprint)
     if cached is not None and not force:
@@ -1930,12 +2965,19 @@ def capability_snapshot(*, force: bool = False) -> SandboxCapability:
         if cached is not None and not force:
             return cached
         if force:
+            # The scan memo is keyed by mount topology and expires on its own; a
+            # forced capability refresh (every pre-send check) must not turn
+            # every launch back into a full scan of /usr.
             _capability_cache.clear()
         result = _capability_with_identity(
             backend.probe(),
             environment = _environment_class(),
             fingerprint = current_fingerprint,
+            network_allowlist_supported = bool(
+                getattr(backend, "supports_network_allowlist", False)
+            ),
         )
+        result = _with_limited_capability(result, force = force)
         if not result.transient:
             _capability_cache.clear()
             _capability_cache[current_fingerprint] = result
@@ -1963,6 +3005,62 @@ _LIMITED_SAFEGUARDS = (
 _FULL_SAFEGUARDS = ("timeout", "cancellation", "reaping", "cleanup")
 
 
+# pidfd_open(2) and pidfd_send_signal(2) share these numbers on every Linux
+# architecture (they postdate the unified syscall table). Used only when the
+# interpreter was built without os.pidfd_open, which is the case for the
+# python-build-standalone 3.10 to 3.12 builds that uv installs.
+_NR_PIDFD_SEND_SIGNAL = 424
+_NR_PIDFD_OPEN = 434
+_pidfd_support: "bool | None" = None
+
+
+def _pidfd_open(pid: int) -> int:
+    """A file descriptor pinned to exactly this process (raises OSError)."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid, 0)
+    libc = ctypes.CDLL(None, use_errno = True)
+    fd = libc.syscall(_NR_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+    if fd < 0:
+        errno_value = ctypes.get_errno()
+        raise OSError(errno_value, os.strerror(errno_value))
+    return int(fd)
+
+
+def _pidfd_send_signal(pidfd: int, signum: int) -> None:
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(pidfd, signum)
+        return
+    libc = ctypes.CDLL(None, use_errno = True)
+    result = libc.syscall(
+        _NR_PIDFD_SEND_SIGNAL, ctypes.c_int(pidfd), ctypes.c_int(signum), None, ctypes.c_uint(0)
+    )
+    if result < 0:
+        errno_value = ctypes.get_errno()
+        raise OSError(errno_value, os.strerror(errno_value))
+
+
+def descendant_sweep_supported() -> bool:
+    """Whether Limited launches can reap detached descendants after the leader exits.
+
+    The sweep (tools._sweep_marked_descendants) matches processes by the per-call
+    marker in ``/proc/<pid>/environ`` and signals them through a pidfd taken
+    before the match, so a pid recycled between the match and the signal is
+    never hit. Without ``/proc`` or pidfds (macOS, Linux before 5.3) there is no
+    safe sweep and the Limited record discloses
+    ``detached_descendant_cleanup_unverified`` instead.
+    """
+    global _pidfd_support
+    if sys.platform != "linux" or not os.path.isdir("/proc"):
+        return False
+    if _pidfd_support is None:
+        try:
+            os.close(_pidfd_open(os.getpid()))
+            _pidfd_support = True
+        except (OSError, AttributeError, TypeError):
+            _pidfd_support = False
+    return _pidfd_support
+
+
 def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
     """Finalize one launch in its requested mode without fallback or replay."""
     if not spec.argv:
@@ -1973,6 +3071,8 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
         raise SandboxUnavailableError(
             "tool launches must close inherited descriptors and own descendant cleanup"
         )
+    if spec.network_policy not in NETWORK_POLICIES:
+        raise SandboxUnavailableError(f"unknown network policy: {spec.network_policy!r}")
     canonical = replace(spec, workdir = os.path.realpath(spec.workdir))
     backend = _platform_backend()
 
@@ -2001,6 +3101,7 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
             probe_generation = identity.probe_generation,
             os_isolation = False,
             retained_safeguards = _FULL_SAFEGUARDS,
+            network_policy = "unrestricted",
         )
         return PreparedSandboxLaunch(
             argv = canonical.argv,
@@ -2017,6 +3118,12 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
     capability = capability_snapshot()
 
     if canonical.requested_mode == "limited":
+        if canonical.network_policy != "deny":
+            # Limited has no OS boundary, so a proxy would be advisory only; the
+            # request is refused rather than recorded as enforced.
+            raise SandboxUnavailableError(
+                "the network allowlist requires OS isolation; Limited mode cannot enforce it"
+            )
         if capability.available:
             raise SandboxUnavailableError(
                 "OS isolation is available; Limited mode is not authorized for this capability generation"
@@ -2039,15 +3146,53 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
             )
         except LimitedGrantError as exc:
             raise SandboxUnavailableError(f"Limited mode authorization failed: {exc}") from exc
+        limitations: tuple[str, ...] = ()
+        limited = _limited_isolation_backend()
+        if limited is not None and limited.probe().available:
+            # Windows: the write-restricted token launcher. It fails closed per
+            # launch (workdir too large to scan, ACL grant refused, token API
+            # error); that one call then runs under the process guard alone and
+            # its record says so, instead of Limited mode disappearing.
+            try:
+                prepared = limited.prepare(canonical)
+            except (SandboxUnavailableError, OSError) as exc:
+                logger.warning("Limited launcher declined this launch: %s", exc)
+                limitations = ("restricted_token_unavailable",)
+            else:
+                prepared.execution_record = ToolExecutionRecord(
+                    requested_mode = "limited",
+                    effective_mode = "limited",
+                    environment = capability.environment,
+                    backend = limited.identity,
+                    profile_id = limited.profile_id,
+                    probe_generation = capability.probe_generation,
+                    os_isolation = False,
+                    retained_safeguards = (
+                        *_LIMITED_SAFEGUARDS,
+                        "write_restricted_token",
+                        "job_object",
+                    ),
+                    limitations = tuple(limited.limitations),
+                    # The token fences writes only; the host network is reachable.
+                    network_policy = "unrestricted",
+                )
+                return prepared
+        if not descendant_sweep_supported():
+            # Linux sweeps /proc for the per-call run marker after the leader
+            # exits (tools._sweep_marked_descendants); macOS has no /proc, so a
+            # setsid grandchild there can outlive the call and the record says so.
+            limitations = (*limitations, "detached_descendant_cleanup_unverified")
         record = ToolExecutionRecord(
             requested_mode = "limited",
             effective_mode = "limited",
             environment = capability.environment,
-            backend = "process-guard",
-            profile_id = "limited-software-safeguards-v1",
+            backend = _LIMITED_BACKEND,
+            profile_id = _LIMITED_PROFILE_ID,
             probe_generation = capability.probe_generation,
             os_isolation = False,
             retained_safeguards = _LIMITED_SAFEGUARDS,
+            limitations = limitations,
+            network_policy = "unrestricted",
         )
         return PreparedSandboxLaunch(
             argv = canonical.argv,
@@ -2065,8 +3210,23 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
         raise SandboxUnavailableError(
             f"OS_ISOLATION_UNAVAILABLE: {capability.reason}. {capability.remediation}"
         )
+    if canonical.network_policy == "allowlist" and "allowlist" not in capability.network_policies:
+        raise SandboxUnavailableError(
+            f"the network allowlist is not available with {capability.backend}; "
+            "run with network access off or use Full access"
+        )
+    allowlist_hosts = (
+        _network_allowlist_for_launch().hosts if canonical.network_policy == "allowlist" else ()
+    )
     try:
-        prepared = backend.prepare(canonical)
+        # A backend with more than one profile (Windows LPAC or its AppContainer
+        # fallback) prepares the profile the capability was recorded with, so a
+        # concurrent re-probe cannot swap profiles between the check and the launch.
+        prepare_for_profile = getattr(backend, "prepare_for_profile", None)
+        if callable(prepare_for_profile):
+            prepared = prepare_for_profile(canonical, capability.profile_id)
+        else:
+            prepared = backend.prepare(canonical)
     except SandboxUnavailableError:
         raise
     except Exception as exc:
@@ -2083,5 +3243,7 @@ def prepare_tool_launch(spec: ToolLaunchPlan) -> PreparedSandboxLaunch:
         os_isolation = True,
         retained_safeguards = (*_LIMITED_SAFEGUARDS, "os_isolation"),
         limitations = capability.limitations,
+        network_policy = canonical.network_policy,
+        network_allowlist = allowlist_hosts,
     )
     return prepared
