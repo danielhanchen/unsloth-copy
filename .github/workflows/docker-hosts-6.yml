@@ -1,0 +1,211 @@
+# Round 6: re-check of the published images after the tag scheme merge (main cc0cdab40).
+# Linux amd64/arm64, Windows via WSL 2, macOS Apple Silicon (colima + QEMU) and macOS
+# Intel (colima) all pull unsloth/unsloth:core and run the imports for real; Linux amd64
+# also boots unsloth/unsloth:latest (Studio + JupyterLab) and waits for the ready block.
+# No hosted runner has a GPU, so every leg is CPU mode (UNSLOTH_ALLOW_CPU=1).
+name: Docker on hosted runners, round 6 (post-merge re-check)
+
+on:
+  push:
+    branches: ['docker-hosts-6']
+  workflow_dispatch:
+
+env:
+  IMAGE: unsloth/unsloth:core
+  STUDIO_IMAGE: unsloth/unsloth:latest
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            machine: x86_64
+          - os: ubuntu-24.04-arm
+            machine: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Reclaim disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true; df -h /
+      - name: Pull
+        run: docker pull "$IMAGE" 2>&1 | tail -1 && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
+      - name: Imports + unsloth CLI (CPU mode), asserted
+        run: |
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python - <<'PY'
+          import platform, torch, unsloth, transformers, trl, peft, bitsandbytes, subprocess
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available())
+          print("unsloth", unsloth.__version__, "transformers", transformers.__version__, "trl", trl.__version__, "peft", peft.__version__, "bnb", bitsandbytes.__version__)
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q "machine ${{ matrix.machine }} torch 2.11" || { echo "::error::import output missing or wrong arch"; exit 1; }
+      - name: JupyterLab boots and authenticates
+        run: |
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 -p 127.0.0.1:8888:8888 "$IMAGE" \
+                jupyter lab --ip 0.0.0.0 --port 8888 --allow-root --no-browser)
+          for i in $(seq 1 90); do curl -s -o /dev/null http://127.0.0.1:8888/api/status && break; sleep 2; done
+          TOK=$(docker logs "$CID" 2>&1 | grep -o 'token=[0-9a-f]*' | head -1 | cut -d= -f2)
+          NOTOK=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/api/status)
+          OK=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8888/api/status?token=$TOK")
+          echo "no token: $NOTOK  with token: $OK"
+          docker rm -f "$CID" >/dev/null
+          test "$NOTOK" = 403 && test "$OK" = 200
+      - name: llama.cpp prebuilt loads (CPU)
+        run: |
+          docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" bash -c '
+            set -e
+            B=/opt/unsloth/llama.cpp/build/bin
+            $B/llama-server --version 2>&1 | tail -1
+            head -c 300 /opt/unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json; echo'
+
+  linux-studio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Reclaim disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true; df -h /
+      - name: Pull the Studio image
+        run: docker pull "$STUDIO_IMAGE" 2>&1 | tail -1 && docker image inspect "$STUDIO_IMAGE" --format 'arch={{.Architecture}} size={{.Size}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
+      - name: Boot Studio + JupyterLab with a preset password, wait for the ready block
+        run: |
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 \
+                -e UNSLOTH_STUDIO_PASSWORD=ci-recheck-password -e JUPYTER_PASSWORD=ci-recheck-jupyter \
+                -p 127.0.0.1:8000:8000 -p 127.0.0.1:8888:8888 "$STUDIO_IMAGE")
+          for i in $(seq 1 240); do
+            docker logs "$CID" 2>&1 | grep -q "Unsloth container ready" && break
+            if ! docker ps -q --no-trunc | grep -q "$CID"; then echo "::error::container exited"; docker logs "$CID" 2>&1 | tail -60; exit 1; fi
+            sleep 5
+          done
+          docker logs "$CID" 2>&1 | grep -E "Unsloth Studio login|Unsloth container|Studio  |JupyterLab" | head -8
+          docker logs "$CID" 2>&1 | grep -q "Unsloth container ready" || { echo "::error::ready block never appeared"; docker logs "$CID" 2>&1 | tail -80; exit 1; }
+          HEALTH=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/health)
+          LOGIN=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/api/auth/login -H 'Content-Type: application/json' -d '{"username":"unsloth","password":"ci-recheck-password"}')
+          BADLOGIN=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/api/auth/login -H 'Content-Type: application/json' -d '{"username":"unsloth","password":"wrong"}')
+          JUP=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/login)
+          echo "studio health: $HEALTH  login: $LOGIN  wrong password: $BADLOGIN  jupyter login page: $JUP"
+          docker rm -f "$CID" >/dev/null
+          test "$HEALTH" = 200 && test "$LOGIN" = 200 && test "$BADLOGIN" != 200 && test "$JUP" = 200
+
+  windows-wsl2:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::rootfs checksum mismatch: got $actual"; exit 1 }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+
+      - name: Write the Linux-side scripts
+        shell: pwsh
+        run: |
+          $setup = @'
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl docker.io iptables >/dev/null
+          dockerd --version
+          nohup dockerd --iptables=false --bridge=none >/var/log/dockerd.log 2>&1 &
+          for i in $(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}} storage={{.Driver}}' || { tail -40 /var/log/dockerd.log; exit 1; }
+          df -h / | tail -1; nproc; free -g | head -2
+          '@
+          $run = @'
+          set -eu
+          docker pull unsloth/unsloth:core 2>&1 | tail -3
+          docker image inspect unsloth/unsloth:core --format 'arch={{.Architecture}} size={{.Size}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:core python - <<'PY'
+          import platform, torch, unsloth, subprocess
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available(), "unsloth", unsloth.__version__)
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q 'machine x86_64 torch 2.11' || { echo 'import step printed nothing usable'; exit 1; }
+          '@
+          $jupyter = @'
+          set -eu
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 -p 127.0.0.1:8888:8888 unsloth/unsloth:core jupyter lab --ip 0.0.0.0 --port 8888 --allow-root --no-browser)
+          for i in $(seq 1 90); do curl -s -o /dev/null http://127.0.0.1:8888/api/status && break; sleep 2; done
+          TOK=$(docker logs "$CID" 2>&1 | grep -o 'token=[0-9a-f]*' | head -1 | cut -d= -f2)
+          NOTOK=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/api/status)
+          OK=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8888/api/status?token=$TOK")
+          echo "no token: $NOTOK  with token: $OK"
+          docker rm -f "$CID" >/dev/null
+          test "$NOTOK" = 403 && test "$OK" = 200
+          '@
+          foreach ($pair in @(@('setup', $setup), @('run', $run), @('jupyter', $jupyter))) {
+            [IO.File]::WriteAllText("$PWD/wsl-dist/$($pair[0]).sh", ($pair[1] -replace "`r`n", "`n"))
+          }
+          $drive = $PWD.Drive.Name.ToLower()
+          $rest = $PWD.Path.Substring(2) -replace '\\', '/'
+          $p = "/mnt/$drive$rest/wsl-dist"
+          Write-Host "WSL_DIR=$p"
+          wsl -d unsloth-ci -- ls -la "$p"
+          Add-Content -Path $env:GITHUB_ENV -Value "WSL_DIR=$p"
+
+      - name: Install Docker inside WSL 2 and start the daemon
+        shell: pwsh
+        run: wsl -d unsloth-ci -u root -- bash "$env:WSL_DIR/setup.sh"
+
+      - name: Pull and run the entrypoint (CPU mode)
+        shell: pwsh
+        run: wsl -d unsloth-ci -u root -- bash "$env:WSL_DIR/run.sh"
+
+      - name: JupyterLab boots and authenticates inside WSL 2
+        shell: pwsh
+        run: wsl -d unsloth-ci -u root -- bash "$env:WSL_DIR/jupyter.sh"
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            machine: aarch64
+            vm: qemu
+          - os: macos-15-intel
+            machine: x86_64
+            vm: default
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - name: Host
+        run: uname -m; sw_vers; sysctl -n kern.hv_support || true; df -h / | tail -1
+      - name: Install colima and start a Linux VM
+        run: |
+          brew install --quiet docker colima qemu 2>&1 | tail -2
+          if [ "${{ matrix.vm }}" = qemu ]; then
+            colima start --vm-type qemu --cpu 3 --memory 8 --disk 60 2>&1 | tail -8
+          elif colima start --cpu 3 --memory 8 --disk 60 2>&1 | tail -8; then
+            echo "backend: default"
+          else
+            colima delete -f 2>/dev/null || true
+            colima start --vm-type qemu --cpu 3 --memory 8 --disk 60 2>&1 | tail -8
+            echo "backend: qemu"
+          fi
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: Pull
+        run: docker pull "$IMAGE" 2>&1 | tail -2 && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
+      - name: Entrypoint + imports (CPU mode), asserted
+        run: |
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python - <<'PY'
+          import platform, torch, unsloth, subprocess
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available(), "unsloth", unsloth.__version__)
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q "machine ${{ matrix.machine }} torch 2.11" || { echo "::error::import output missing or wrong arch"; exit 1; }
+      - name: Stop
+        if: always()
+        run: colima stop 2>/dev/null || true
