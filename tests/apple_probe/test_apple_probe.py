@@ -32,6 +32,19 @@ def test_apple_probe():
         except BaseException as e:
             d["mps_alloc_works"] = False
             d["mps_alloc_error"] = f"{type(e).__name__}: {e}"
+        # How much MPS memory is actually usable? Reported failures on hosted runners
+        # are at benchmark scale, not at 256 bytes, so find the real ceiling.
+        ceiling = {}
+        for mb in (1, 16, 128, 512, 1024, 2048):
+            try:
+                t = torch.empty(int(mb * 1024 * 1024 / 4), dtype=torch.float32, device="mps")
+                t.fill_(1.0); torch.mps.synchronize()
+                ceiling[f"{mb}MB"] = "ok"
+                del t; torch.mps.empty_cache()
+            except BaseException as e:
+                ceiling[f"{mb}MB"] = f"{type(e).__name__}"
+                break
+        d["mps_alloc_ceiling"] = ceiling
         return d
     _record("torch", torch_info)
 

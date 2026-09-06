@@ -30,6 +30,10 @@ jobs:
         run: |
           P="${{ steps.setup.outputs.python-path }}"
           "$P" -m pip install mlx mlx-lm unsloth unsloth_zoo
+          # Unsloth deps pin torch down (2.14 -> 2.11); FlexAttention-on-MPS landed in
+          # 2.13, so restore a modern torch or the flex probe tests the wrong version.
+          "$P" -m pip install --upgrade "torch>=2.14"
+          "$P" -c "import torch;print('torch after restore:',torch.__version__)"
       - name: probe
         run: |
           P="${{ steps.setup.outputs.python-path }}"
