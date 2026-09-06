@@ -33,6 +33,15 @@ def test_attention_bench():
     import mlx.core as mx
 
     REPORT["torch_version"] = torch.__version__
+    # If anything pulled in unsloth, `triton` is a permissive stub and every
+    # torch.compile in this process will fail. Record it rather than rediscover it.
+    import sys
+    REPORT["unsloth_imported"] = "unsloth" in sys.modules or "unsloth_zoo" in sys.modules
+    try:
+        import triton
+        REPORT["triton"] = f"{getattr(triton, '__file__', None)}"
+    except Exception as e:
+        REPORT["triton"] = f"absent: {type(e).__name__}"
     torch._dynamo.config.recompile_limit = 128
     torch._dynamo.config.accumulated_recompile_limit = 512
     torch.manual_seed(0)

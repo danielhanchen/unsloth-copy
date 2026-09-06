@@ -38,10 +38,13 @@ jobs:
         run: |
           P="${{ steps.setup.outputs.python-path }}"
           "$P" -m pytest tests/apple_probe/test_apple_probe.py -s -v
-      # Separate process on purpose: importing unsloth on Apple Silicon installs a stub
-      # `triton` module, and Inductor's compile path calls triton.runtime.cache.triton_key,
-      # so any torch.compile in the same interpreter dies with NotImplementedError.
+      # Lives OUTSIDE tests/ and runs in its own process, both on purpose:
+      # tests/conftest.py:218 does `import unsloth`, which on Apple Silicon installs a
+      # meta-path finder that stubs out `triton` (unsloth_zoo/stubs/triton_stub.py).
+      # Inductor's compile path calls triton.runtime.cache.triton_key, so any
+      # torch.compile in such a process dies with NotImplementedError -- which is what
+      # killed every FlexAttention cell in the two previous runs.
       - name: attention benchmark (no unsloth import)
         run: |
           P="${{ steps.setup.outputs.python-path }}"
-          "$P" -m pytest tests/apple_probe/test_attention_bench.py -s -v
+          "$P" -m pytest apple_attn_bench/test_attention_bench.py -s -v
