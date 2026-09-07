@@ -188,6 +188,23 @@ def test_shared_catalog_is_filtered_after_each_account_reads_it(monkeypatch, kin
     assert len(rows) == 2
 
 
+def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
+    """The dataset inventory is the same shared cache scan as the model one, so a
+    managed account without a grant must not see a private repository's row."""
+    from hub.services.datasets import cache_inventory as dataset_inventory
+
+    rows = [{"repo_id": "org/secret"}, {"repo_id": "org/public"}]
+    run_as(ALICE, access.record_model_grant, "org/secret", "dataset")
+    monkeypatch.setattr(access, "repo_is_public", lambda repo, *a: repo == "org/public")
+    monkeypatch.setattr(dataset_inventory, "_scan_hf_dataset_caches", lambda: rows)
+
+    fn = dataset_inventory.list_cached_datasets_response
+    assert len(asyncio.run(arun_as(ALICE, fn()))["cached"]) == 2
+    assert asyncio.run(arun_as(BOB, fn()))["cached"] == [rows[1]]
+    assert len(asyncio.run(arun_as(OWNER, fn()))["cached"]) == 2
+    assert len(rows) == 2
+
+
 def test_local_inventory_does_not_mutate_shared_scan_objects():
     class Response:
         models = [SimpleNamespace(path = "org/secret", id = "same-id")]

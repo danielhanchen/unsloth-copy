@@ -649,9 +649,21 @@ def _scan_hf_dataset_caches() -> list[dict]:
 
 
 async def list_cached_datasets_response() -> dict:
-    """List dataset repos already downloaded into the HF cache."""
+    """List dataset repos already downloaded into the HF cache.
+
+    The cache is shared by every account, so the rows carry the same visibility
+    filter the model and GGUF inventories apply. The owner keeps the whole scan
+    and does no grant lookup.
+    """
     try:
-        return {"cached": await asyncio.to_thread(_scan_hf_dataset_caches)}
+        rows = await asyncio.to_thread(_scan_hf_dataset_caches)
+        if managed_account():
+            from hub.services.models import account_access
+
+            rows = await asyncio.to_thread(
+                account_access.filter_model_rows, rows, repo_type = "dataset"
+            )
+        return {"cached": rows}
     except Exception as exc:
         logger.error("Error listing cached datasets: %s", exc, exc_info = True)
         raise HTTPException(
