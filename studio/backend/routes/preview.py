@@ -63,9 +63,8 @@ def _verify_or_404(run: str, checkpoint: str | None, request: Request):
     return account
 
 
-# The public routes carry no credential, so the capability decides whose outputs
-# the ref resolves in. Bound for the whole request, streaming body included, the
-# same way the authenticated dependency binds a login.
+# The public routes carry no credential, so the capability decides whose outputs the
+# ref resolves in, bound for the whole request including the streaming body.
 async def _latest_account(run: str, request: Request):
     account = _verify_or_404(run, None, request)
     token = bind_account(account)

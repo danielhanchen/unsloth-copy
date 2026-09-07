@@ -7999,8 +7999,7 @@ async def _maybe_auto_switch_model(
     :func:`_preflight_audio_for_switch`. ``image_preflight`` does the same for
     non-GGUF image count and byte validation.
     """
-    # A raw-body route passes the reload-only sentinel for an omitted ``model``;
-    # to the account checks that is an omitted model, not a name to look up.
+    # The reload-only sentinel means an omitted model to the account checks, not a name.
     named_model = requested_model if requested_model != _RELOAD_ONLY_MODEL else None
 
     async def _switch() -> None:
@@ -8274,8 +8273,7 @@ async def _maybe_auto_switch_model(
                     _set_preview_resident(None)
                 _record_serving_alias()
                 return
-            # Below both resident fast paths: serving the shared model adds no
-            # account-policy lookup, registry scan, or retry-hint work.
+            # Below both resident fast paths, so serving the shared model stays free.
             from core.inference.gpu_arbiter import require_no_foreign_generations
 
             switch_path = getattr(getattr(fastapi_request, "url", None), "path", None)
@@ -8451,9 +8449,8 @@ async def _maybe_auto_switch_model(
         try:
             await _resolve_and_switch()
         except HTTPException as exc:
-            # A foreign generation may register during load preparation, after the
-            # early guard. Preserve this endpoint's envelope for the arbiter's final
-            # refusal too, including a load retried without stale GPU placement.
+            # A foreign generation can register after the early guard, so keep this
+            # endpoint's envelope for the arbiter's final refusal too.
             path = getattr(getattr(fastapi_request, "url", None), "path", None)
             if (
                 path
@@ -8473,13 +8470,9 @@ async def _maybe_auto_switch_model(
         await _reject_unservable_model(requested_model, fastapi_request)
 
     await _switch()
-    # A managed account may name a model it is allowed to use while another
-    # account's private model is resident. When no switch happened (auto-switch
-    # off, an unknown name, a keyless caller) the body above fell through to the
-    # resident model: the drop-in behaviour a single owner expects, but here it
-    # would run the prompt through a model this account cannot even see on the
-    # status routes. So a managed caller that named a model is served only if the
-    # resident model is its own or answers to the name it asked for.
+    # When no switch happened the code above falls through to the resident model, which
+    # for a managed caller could be another account's hidden one. So a managed caller that
+    # named a model is served only if the resident model is its own or matches that name.
     if not isinstance(named_model, str) or not named_model:
         return
     if not account_access.managed_account():
@@ -19909,7 +19902,7 @@ async def _proxy_to_external_provider(
             include_api_key = bool(studio_tool_payloads),
         )
         cancel_event = threading.Event()
-        # Scoped like every lookup, so the caller can still cancel its own stream once a second account exists.
+        # Scoped like every lookup, so a caller can still cancel its own stream.
         cancel_keys = tuple(
             _account_cancel_key(key) for key in (payload.cancel_id, payload.session_id) if key
         )
@@ -34368,8 +34361,7 @@ async def load_diffusion_model_gated(
             preflighted = engine_for(pending_name)
             await asyncio.to_thread(_preflight, preflighted)
 
-        # Engine activation can unload the previous image engine before the
-        # acquire below. Apply the arbiter's guard ahead of that teardown too.
+        # Engine activation can unload the previous image engine, so guard before it too.
         if needs_gpu:
             require_no_foreign_generations()
         # Pick the engine for this host (diffusers on GPU, native sd.cpp otherwise), installing sd-cli if needed, BEFORE evicting chat.

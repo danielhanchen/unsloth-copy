@@ -1,35 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Settings policy (all paths are relative to /api/settings).
+"""Settings policy (paths relative to /api/settings).
 
-| Setting / route family | Classification | Reason |
-| --- | --- | --- |
-| generation-presets/* | Per account | Private image/video presets in studio.db |
-| hugging-face-token, hugging-face-token/migrate | Per account | Private credentials; credential storage owns encryption |
-| chat-preferences, chat-preferences/migrate | Per account | Chat display preferences |
-| current-date-prompt | Per account | Personal prompt preference |
-| last-local-model | Per account | Last selection, keyed by immutable account identity |
-| personalization | Per account | Existing profile/appearance row, without migration |
-| GET upload-limit, helper-precache, download-transport | Shared policy, read only | Effective installation limits and download policy |
-| PUT upload-limit, helper-precache, download-transport | Owner only | Process limits and shared downloads |
-| xet-notice/reserve | Owner only | Installation download-health notice reservation |
-| hugging-face-cache | Owner only | Shared cache location and status |
-| llama-cpp-path | Owner only | Executable selection |
-| model-memory, vram-budget | Owner only | Shared model memory policy |
-| openai-auto-switch, openai-auto-switch/overrides | Owner only | Shared loading, VRAM, idle unload and executable arguments |
-| coding-agents | Owner only | Host executable discovery |
-| embedding-model, embedding-model/resolve, embedding-model/unload | Owner only | Shared embedding backend and model selection |
-| preview-sharing, preview-links/rotate | Owner only | Public sharing policy and installation signing secret |
-| remote-access/*, lan-access/* | Owner only | Installation listeners and tunnel policy |
-| keyless-api-access | Owner only | Installation authentication policy |
-| debug/logs, debug/logs/sources | Owner only | Logs contain activity from every account |
+Per account: generation-presets, hugging-face-token, chat-preferences, current-date-prompt,
+last-local-model, personalization. Shared read-only: GET upload-limit, helper-precache,
+download-transport. Everything else is owner only, because it is installation-wide state:
+process limits, shared downloads and caches, executables, memory/VRAM policy, sharing and
+signing secrets, listeners and tunnels, keyless API access, and logs (which span all accounts).
 
-Groups carry their dependencies on subrouters. The shared read group binds the
-owner only for the read and restores the authenticated account afterwards.
-Single-account installations keep the existing handlers and stored keys.
-Update checks, whisper/sd executable selection and cache cleanup have no routes
-in this module; their owning route modules must apply the same owner policy.
+Groups carry their dependencies on subrouters; the shared read group binds the owner for the
+read and restores the authenticated account afterwards. Single-account installs keep the
+existing handlers and stored keys. Update checks, whisper/sd executable selection and cache
+cleanup live in other route modules, which must apply the same owner policy.
 """
 
 import functools

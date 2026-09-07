@@ -222,10 +222,8 @@ def _require_run(run_id: str) -> dict[str, Any]:
 def cancel_account_run(request: Request, run_id: str, *, supervisor_name: str) -> None:
     """Signal only the caller's registration when supervisor IDs are shared.
 
-    Durable chat producers reserve their event before starting. Research workers
-    also observe cancellation/deletion through their account's persisted lease.
-    Never stash a bare cancel ID in a multi-account installation: a later request
-    from another account can legitimately reuse it.
+    A bare cancel ID is never stashed in a multi-account installation: a later
+    request from another account can legitimately reuse it.
     """
     if policy.installation_is_multi_user():
         active_generations.cancel_run(run_id, account_id = current_account_id())

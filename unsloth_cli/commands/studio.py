@@ -1239,9 +1239,8 @@ def _cli_update_password(
     """
     password_salt, password_hash = _hash_password(new_password)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(auth_user)")}
-    # A managed account's credentials live behind the downgrade fence (the
-    # account_* columns a build without account support never reads); the
-    # owner's row keeps the legacy columns. See auth/storage.py.
+    # Managed credentials live in the account_* columns behind the downgrade fence;
+    # the owner's row keeps the legacy columns. See auth/storage.py.
     managed = False
     if "account_jwt_secret" in columns:
         row = conn.execute("SELECT role FROM auth_user WHERE username = ?", (username,)).fetchone()
@@ -5097,9 +5096,8 @@ def reset_password(
 ):
     """Reset an Unsloth account password.
 
-    Rotates the credential in place: a running Unsloth accepts the new password on
-    its next request, so there is nothing to restart. Shared /p preview links are
-    not revoked -- rotate those in Settings if the old password leaked.
+    Rotates in place, so a running Unsloth needs no restart. Shared /p preview links
+    are not revoked -- rotate those in Settings if the old password leaked.
     """
     new_password = _generate_reset_password()
     try:

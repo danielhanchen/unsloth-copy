@@ -320,10 +320,8 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
         setMustChangePassword(isLoginMode && token.must_change_password);
         storeAuthTokens(token.access_token, token.refresh_token);
       };
-      // Password changes keep the authenticated subject, including managed setup sessions.
-      // The immutable account id decides the browser transition: a username can be
-      // deleted and created again as a different account, which must not inherit
-      // the previous holder's browser data.
+      // The immutable account id decides the browser transition: a username can be deleted
+      // and re-created as a different account, which must not inherit the old browser data.
       const signedInUsername = sessionAccount(token.access_token)?.username ?? username;
       const route = isLoginMode && token.must_change_password ? "/change-password" : "/chat";
       const replaced = await transitionBrowserAccount(

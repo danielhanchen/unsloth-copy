@@ -58,8 +58,7 @@ class ActiveGeneration:
         kind: str = "chat",
         account_id: Optional[str] = None,
     ):
-        # Captured at registration: the account this generation belongs to, so a
-        # cancel or a swap can be scoped to one account instead of everyone.
+        # The account this generation belongs to, so cancels and swaps can be scoped to it.
         self.account_id = account_id or current_account_id()
         self.thread_id = thread_id or None
         self.run_id = run_id or None
@@ -114,10 +113,10 @@ class ActiveGeneration:
 
 
 def snapshot(account_id: Optional[str] = None) -> list[dict[str, Any]]:
-    """In-flight generations, newest last. Drops the Event: this is a response.
+    """In-flight generations, newest last, minus the Event: this is a response.
 
-    ``account_id`` narrows to one account; None is every account, which only
-    installation-wide callers (shutdown, the arbiter) should ask for.
+    ``account_id`` narrows to one account; None (every account) is for
+    installation-wide callers only: shutdown and the arbiter.
     """
     with _LOCK:
         entries = [
@@ -161,22 +160,19 @@ def count(account_id: Optional[str] = None) -> int:
 
 
 def foreign_count(account_id: str) -> int:
-    """Generations in flight that belong to OTHER accounts. What a load or
-    unload by ``account_id`` is not allowed to interrupt."""
+    """Generations in flight for OTHER accounts: what a load or unload by
+    ``account_id`` must not interrupt."""
     with _LOCK:
         return sum(1 for e in _ACTIVE.values() if e["account_id"] != account_id)
 
 
 def cancel_all(account_id: Optional[str] = None) -> int:
-    """Signal in-flight generations to stop. Returns how many were signalled.
+    """Signal in-flight generations to stop; returns how many were signalled.
 
-    ``account_id`` limits the cancel to one account's generations, which is what
-    every request-driven caller must pass: a user's forced reload stops their own
-    chats, never somebody else's. None is everyone, for shutdown only.
-
-    Only sets the cancel events; each stream tears itself down. Entries are
-    removed by their own __exit__, so one mid-cleanup is neither lost nor double
-    counted.
+    ``account_id`` limits the cancel to one account, which every request-driven
+    caller must pass so a forced reload never stops another user's chats; None is
+    everyone, for shutdown only. Only sets the events: each entry is removed by its
+    own __exit__, so one mid-cleanup is neither lost nor double counted.
     """
     with _LOCK:
         events = [
@@ -193,10 +189,8 @@ def cancel_all(account_id: Optional[str] = None) -> int:
 
 
 def cancel_thread(thread_id: str, account_id: Optional[str] = None) -> int:
-    """Signal only the generations belonging to ``thread_id``.
-
-    Thread ids are client-chosen, so ``account_id`` (default: the acting
-    account) keeps one account from stopping the same id in another."""
+    """Signal the generations for ``thread_id``. Thread ids are client-chosen, so
+    ``account_id`` (default: acting) keeps one account from stopping another's."""
     if not thread_id:
         return 0
     scope = account_id or current_account_id()
@@ -215,8 +209,8 @@ def cancel_thread(thread_id: str, account_id: Optional[str] = None) -> int:
 
 
 def cancel_run(run_id: str, account_id: Optional[str] = None) -> int:
-    """Signal only the generation registered for a durable Studio run, scoped
-    to the acting account unless told otherwise."""
+    """Signal the generation for a durable Studio run, scoped to the acting
+    account unless told otherwise."""
     if not run_id:
         return 0
     scope = account_id or current_account_id()

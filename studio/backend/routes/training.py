@@ -2692,20 +2692,14 @@ def _preflight_gated_base(base_model: str, hf_token: Optional[str]) -> None:
 
 
 def _resolve_diffusion_data_dir(raw: str) -> Path:
-    """Resolve a diffusion-training ``data_dir``. The upload/labeling routes create and
-    manage image datasets directly under ``datasets_root()`` and the UI passes the bare
-    folder name back as ``data_dir``, but the generic :func:`resolve_dataset_path`
-    searches the LLM uploads and recipe dataset roots FIRST -- so an unrelated upload
-    file or recipe folder sharing that name would shadow the just-uploaded image
-    dataset (preflight 400 "not a directory", or training the wrong data). Prefer the
-    image dataset root for a bare single-component name that exists there; everything
-    else (explicit "uploads/..." / "recipes/..." prefixes, absolute paths, missing
-    names) resolves exactly as before.
+    """Resolve a diffusion-training ``data_dir``, preferring ``datasets_root()``.
 
-    The account check runs on the RESOLVED directory, not on ``raw``: the UI sends the
-    bare folder name, and validating that spelling would resolve it against the server
-    process's working directory rather than the account's datasets root, refusing a
-    managed account its own upload."""
+    Image datasets live directly under ``datasets_root()`` and the UI sends the bare
+    folder name, but :func:`resolve_dataset_path` searches the uploads and recipe roots
+    first, so a same-named upload or recipe would shadow them. Bare single-component
+    names that exist there win; anything else resolves exactly as before. The account
+    check runs on the RESOLVED directory, since checking ``raw`` would resolve the bare
+    name against the process working directory and refuse an account its own upload."""
     from utils.paths import datasets_root
 
     value = str(raw or "").strip()

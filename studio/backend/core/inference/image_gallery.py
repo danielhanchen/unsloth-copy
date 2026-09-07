@@ -3,12 +3,9 @@
 
 """Disk-backed persistence for generated images.
 
-Each image is a PNG under ``workspace_root()/images`` with its full recipe embedded as PNG text
-chunks: a structured ``unsloth`` JSON blob (the source of truth) plus an Automatic1111-style
-``parameters`` string for interop. So a downloaded PNG carries its own settings.
-
-Dumb storage: the route owns the metadata schema and passes a plain dict; this only reads/writes/
-sorts files.
+Each image is a PNG under ``workspace_root()/images`` with its recipe embedded as PNG text chunks:
+an ``unsloth`` JSON blob (the source of truth) plus an Automatic1111-style ``parameters`` string,
+so a downloaded PNG carries its own settings. The route owns the schema; this only stores files.
 """
 
 from __future__ import annotations

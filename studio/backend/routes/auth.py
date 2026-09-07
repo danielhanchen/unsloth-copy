@@ -48,10 +48,8 @@ router = APIRouter()
 def _account_id_of(username: str) -> "str | None":
     """Immutable id of ``username``'s account, for clients that key state on it.
 
-    A username is a login and display attribute that can be renamed or reused,
-    so a browser that kept per-account state under the name alone would hand a
-    recreated account its predecessor's data. Returns None only if the row went
-    away between authentication and this read.
+    Usernames can be renamed or reused, so state keyed on the name alone would
+    hand a recreated account its predecessor's data. None if the row is gone.
     """
     account = storage.get_account(username)
     return account.account_id if account is not None else None
@@ -544,8 +542,7 @@ async def desktop_login(payload: DesktopLoginRequest) -> Token | Response:
     from auth.policy import installation_is_multi_user
 
     if installation_is_multi_user():
-        # The secret still proves the shell owns the backend. It cannot choose
-        # which account is using the desktop once login is required.
+        # The secret proves the shell owns the backend, not which account is using it.
         return Response(
             content = '{"login_required":true,"login_mode":"multi"}',
             media_type = "application/json",
@@ -752,10 +749,8 @@ def _row_to_api_key_response(row: dict) -> ApiKeyResponse:
 def _key_account_scope() -> "str | None":
     """The immutable account a managed request's keys belong to.
 
-    The request bound its account when its credential was validated. A namesake
-    created after that (delete the account, create the name again) has another
-    id, so the keys this request lists, mints or revokes stay the old account's.
-    None for the owner, whose keys keep the username query they always had.
+    Bound when the credential was validated, so a later namesake (same name, new
+    id) cannot reach these keys. None for the owner, who queries by username.
     """
     from utils.account_context import current_account, is_owner_context
 

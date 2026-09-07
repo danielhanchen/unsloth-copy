@@ -482,20 +482,12 @@ _STDOUT_LOCK = threading.Lock()
 
 
 class _CurrentStdoutLogger:
-    """A structlog logger that writes each record to whatever ``sys.stdout`` is at
-    the moment the record is emitted.
+    """A structlog logger that resolves ``sys.stdout`` per record.
 
-    ``cache_logger_on_first_use`` freezes the logger a module first logs with, and a
-    ``PrintLogger`` binds its stream when it is built. Together they pin every later
-    record from that module to the stream that happened to be ``sys.stdout`` on its
-    first line: a stream a tee, a redirect or a test's capture has since replaced. A
-    module whose first line is written while another module is being imported (a
-    route inventory, a probe at import) then loses the rest of its output for the
-    life of the process. Resolving the stream per record keeps the process-wide
-    contract simple: stdout is wherever stdout points now.
-
-    One lock, one write per record, so a record and the traceback echoed after it
-    stay adjacent, exactly as ``PrintLogger`` keeps them.
+    ``cache_logger_on_first_use`` plus ``PrintLogger``'s build-time stream binding
+    would pin a module's output forever to whatever stdout was on its first line,
+    losing later records once a tee, redirect or test capture replaces it. One lock
+    and one write per record keeps a record adjacent to its echoed traceback.
     """
 
     def msg(self, message: str) -> None:

@@ -111,9 +111,8 @@ def validate_mcp_address(url: str) -> None:
 def _public_http_client_factory(**kwargs):
     """Pin public destinations, including redirects and OAuth discovery requests.
 
-    Use the HTTP client family selected by the installed MCP SDK (httpx or
-    httpx2). Host and TLS SNI retain the original hostname. Proxy environment
-    settings are excluded so they cannot redirect traffic into the LAN.
+    Uses whichever httpx family the installed MCP SDK selected; host and TLS SNI keep
+    the original hostname, and proxy env vars are ignored so they cannot reach the LAN.
     """
     from mcp.shared._httpx_utils import create_mcp_http_client
 

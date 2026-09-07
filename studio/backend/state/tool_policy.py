@@ -48,8 +48,6 @@ def require_tool_access(
 ) -> None:
     """Admit tool permissions before starting a response or executing a tool.
 
-    Request routes should call this after authentication and before streaming.
-    Loops and direct execution use the same check for non-HTTP callers.
     Ordinary sandboxed requests do not consult installation policy.
     """
     if permission_mode != "full" and not bypass_permissions and not disable_sandbox:

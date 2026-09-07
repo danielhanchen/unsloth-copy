@@ -641,9 +641,7 @@ def compute_profile_stats(
 ) -> dict[str, Any]:
     """Aggregate profile statistics, subject-scoping only external API usage.
 
-    Chat and training history come from the acting account's database.
-    An empty subject intentionally sees no API
-    receipts, keeping non-route callers fail-closed.
+    An empty subject sees no API receipts, keeping non-route callers fail-closed.
     """
     days = max(1, min(int(days), MAX_DAILY_DAYS))
     tz_offset_minutes = max(

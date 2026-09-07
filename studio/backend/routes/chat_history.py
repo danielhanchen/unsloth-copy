@@ -1451,8 +1451,7 @@ def record_import_ledger(
 def _snapshot_chat_images() -> Optional[set[str]]:
     """The legacy image registry cannot authorize an account-scoped reap.
 
-    Until the image registry carries ownership, retain thumbnails when multiple
-    accounts exist. Even a client-supplied image ID is not proof of ownership.
+    Until it carries ownership, retain thumbnails when multiple accounts exist.
     """
     if policy.installation_is_multi_user():
         return set()

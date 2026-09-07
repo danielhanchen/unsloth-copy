@@ -101,13 +101,10 @@ async function doTauriAutoAuth(options: TauriAutoAuthOptions): Promise<boolean> 
 }
 
 /**
- * Silently authenticate in Tauri desktop mode.
+ * Silently authenticate in Tauri desktop mode, delegating bootstrap to Rust.
  *
- * Delegates bootstrap/password handling to Rust and only stores returned tokens.
- *
- * Returns true if authentication succeeded, or a forced startup probe verified
- * the shell and opened the required login form. The latter stores no session.
- * Concurrent calls are coalesced into a single in-flight attempt.
+ * True when authentication succeeded, or when a forced startup probe verified the
+ * shell and opened the login form (which stores no session). Calls are coalesced.
  */
 export function tauriAutoAuth(
   options: TauriAutoAuthOptions = {},

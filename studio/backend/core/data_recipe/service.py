@@ -187,14 +187,8 @@ def recipe_has_stdio_mcp(recipe: dict[str, Any]) -> bool:
 
 
 def _require_confinable_mcp_transport(provider_type: str) -> None:
-    """Chat MCP keeps a managed account off loopback and the LAN: it validates every
-    resolved address and then PINS the connection to the address it validated, so a
-    later DNS answer or a redirect cannot move it (core/inference/mcp_client.py,
-    ``validate_mcp_address`` and ``_public_http_client_factory``). The Data Designer
-    engine opens its own MCP connections, so neither half reaches a recipe provider and
-    an endpoint chat refuses is accepted here. Refuse network MCP for managed accounts
-    until the engine can take the confined transport; a URL check alone is not the same
-    guarantee. The owner keeps recipe MCP exactly as before."""
+    """Refuse network MCP for managed accounts: the Data Designer engine opens its own
+    connections, so it cannot use chat's address-pinned confined transport."""
     if provider_type not in {"sse", "streamable_http"} or not managed_account():
         return
     raise HTTPException(

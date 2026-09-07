@@ -42,14 +42,12 @@ def _account_errors():
 def retire_account_roots(account: AccountContext) -> None:
     """Signal this account's work, then rename each existing private root aside.
 
-    Resolve every path before renaming: configured roots may be nested. Move
-    children first so each gets its own retirement suffix. No root is created.
+    Roots may be nested, so resolve all of them first and move children first.
     """
     if account.is_owner or account.account_id == "owner":
         raise ValueError("The installation owner cannot be retired")
     active_generations.cancel_all(account.account_id)
-    # Long-running services, MCP sessions and tool caches hold this account's
-    # paths open; stop them before the rename so nothing recreates a root.
+    # Stop services holding this account's paths open so none recreates a root.
     from core.inference.mcp_client import close_mcp_sessions, invalidate_tool_cache
     from core.training.account_jobs import retire_account_jobs
 

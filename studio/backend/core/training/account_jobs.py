@@ -41,8 +41,7 @@ def account_path(
 ):
     """Validate a supplied local path, resolving symlinks even for new outputs.
 
-    Remote Hub ids are allowed only for fields explicitly marked as references.
-    The caller retains its historical spelling and relative-path resolution.
+    Remote Hub ids are allowed only for fields marked ``reference``.
     """
     if not value or not managed_account():
         return value
@@ -179,16 +178,10 @@ def refresh_job_owner(service) -> None:
 def owned_job(*, continuation: bool = False):
     """Reserve ownership across validation/spawn and retain it while work is live.
 
-    Finished results retain their account tag separately, so releasing the active
-    reservation never makes an old model, log, or metric public.
-
-    The bookkeeping is skipped only on an install that has never had a managed
-    account, not merely on one that is single-user right now. Deactivating the last
-    managed account turns the login mode single while that account's tag is still on
-    the service, so skipping here would leave an owner job wearing the previous
-    account's attribution -- handed back to that account the moment it is reactivated.
-    ``installation_has_managed_accounts()`` reads the same cached account counts as
-    ``installation_is_multi_user()``, so a one-account install pays nothing extra.
+    Finished results keep their account tag separately, so releasing the reservation never
+    makes an old model, log or metric public. Skipped on installs that never had a managed
+    account, not merely single-user ones: after deactivating the last account, its tag is
+    still on the service, so an owner job would inherit that attribution.
     """
 
     def decorate(fn):
@@ -289,7 +282,7 @@ def account_process_spec(module: str, target: str, env: dict, kwargs: dict):
 def run_account_child(*, account: AccountContext, job_module: str, job_target: str, **kwargs):
     def execute():
         if not account.is_owner:
-            # Child-only mutation: never change credentials in the multithreaded server.
+            # Child-only: never mutate credentials in the multithreaded server.
             for key in tuple(os.environ):
                 if key.startswith(("AWS_", "WANDB_")) or key in {
                     "HF_TOKEN",
@@ -318,10 +311,9 @@ def run_account_child(*, account: AccountContext, job_module: str, job_target: s
 
 
 def retire_account_jobs(account: AccountContext) -> None:
-    """Revoke new starts and cancel only this account's existing work.
+    """Revoke new starts and cancel only this account's work; call before renaming its directories.
 
-    Call before renaming its directories. The identity remains retired in this
-    process; a recreated username receives a fresh id and is unaffected.
+    The id stays retired in this process; a recreated username gets a fresh id and is unaffected.
     """
     with _services_lock:
         _retired.add(account.account_id)

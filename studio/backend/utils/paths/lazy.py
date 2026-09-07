@@ -13,9 +13,8 @@ from typing import Callable
 class LazyPath(os.PathLike[str]):
     """Resolve a root in the acting account whenever a caller uses the path.
 
-    Existing imports retain a live accessor, including across account switches.
-    Calling it explicitly returns a concrete Path for a job to retain. Do not
-    retain this accessor as a job's account identity; bind that account instead.
+    Calling it explicitly returns a concrete Path. Do not retain the accessor as
+    a job's account identity; bind that account instead.
     """
 
     def __init__(self, resolve: Callable[[], Path]):

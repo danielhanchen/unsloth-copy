@@ -508,10 +508,8 @@ async def _get_current_credential(
                 detail = _invalid_api_key_detail(token),
             )
         record, secret = verified
-        # Bound to the identity the key was validated against, from the same
-        # statement. A second lookup by username would bind whatever account
-        # owns that name now, which after a delete and re-create is not the
-        # account this key belonged to.
+        # Bind the identity the key was validated against: a second lookup by
+        # username would bind whoever owns that name after a delete and re-create.
         bind_account(AccountContext(record["account_id"], record["username"], record["role"]))
         return record["username"], credential_generation(secret)
 
@@ -531,8 +529,8 @@ async def _get_current_credential(
 
     jwt_secret = record["jwt_secret"]
     must_change_password = bool(record["must_change_password"])
-    # Same query, no second read: the request is bound to its account here and
-    # every storage lookup below the route resolves through that binding.
+    # Bind from this same query, no second read; every storage lookup below the
+    # route resolves through that binding.
     bind_account(AccountContext(record["account_id"], record["username"], record["role"]))
     try:
         payload = jwt.decode(token, jwt_secret, algorithms = [ALGORITHM])

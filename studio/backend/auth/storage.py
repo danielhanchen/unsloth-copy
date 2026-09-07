@@ -229,16 +229,10 @@ def credential_generation(jwt_secret: str) -> str:
     return hashlib.sha256(jwt_secret.encode("utf-8")).hexdigest()
 
 
-# The downgrade fence. A managed account's real credentials live in the
-# ``account_*`` columns, which a build without account support never reads; its
-# legacy ``password_salt`` / ``password_hash`` / ``jwt_secret`` hold values that
-# can never verify, and its API key and refresh token hashes carry a prefix the
-# older build never computes. So on a build that has one shared root for
-# everyone, a managed account cannot log in, present a token, refresh a session
-# or use a key: it gets 401, not the owner's data. The owner's row and rows are
-# byte for byte what they always were, and this build reads the real value with
-# COALESCE, so nothing changes for a single-account install and an upgrade
-# brings every managed account straight back.
+# The downgrade fence: a managed account's real credentials live in the
+# ``account_*`` columns, and its legacy columns and hash prefixes can never
+# verify, so a build without account support 401s a managed login instead of
+# serving the owner's data. The owner's rows are byte for byte unchanged.
 _FENCE_PREFIX = "account:"
 _FENCED_HASH_SQL = "IN (?, ?)"
 _LEGACY_PASSWORD_HASH_SENTINEL = "managed-account"
@@ -261,8 +255,7 @@ def _hash_candidates(digest: str) -> tuple[str, str]:
 
 
 def _legacy_dummies() -> tuple[str, str, str]:
-    """Legacy-column values for a managed row: a salt, a hash no password
-    produces, and a signing secret nothing is ever signed with."""
+    """Legacy-column values for a managed row: nothing verifies or signs with them."""
     return secrets.token_hex(16), _LEGACY_PASSWORD_HASH_SENTINEL, secrets.token_urlsafe(64)
 
 
@@ -388,10 +381,8 @@ def get_connection() -> sqlite3.Connection:
 _api_key_pbkdf2_salt_cache: Optional[bytes] = None
 
 
-# Immutable account identity. Storage keys on ``account_id``, never on the
-# username: a username is renamed or reused, an id is not. The seeded owner gets
-# the fixed id ``owner`` so every pre-accounts install resolves to the same
-# identity without a migration writing anything it did not have to.
+# Storage keys on the immutable ``account_id``, never the username, which can be
+# renamed or reused. The seeded owner keeps the fixed id ``owner``.
 _ACCOUNT_COLUMNS = (
     ("account_id", "TEXT"),
     ("role", "TEXT NOT NULL DEFAULT 'user'"),
@@ -399,8 +390,7 @@ _ACCOUNT_COLUMNS = (
     ("created_at", "TEXT"),
     ("setup_code_hash", "TEXT"),
     ("setup_code_expires_at", "TEXT"),
-    # Managed credentials, unread by builds without account support (see the
-    # downgrade fence above _current_secret).
+    # Managed credentials, unread by builds without account support (see the fence above).
     ("account_password_salt", "TEXT"),
     ("account_password_hash", "TEXT"),
     ("account_jwt_secret", "TEXT"),
@@ -408,13 +398,11 @@ _ACCOUNT_COLUMNS = (
 
 
 def _ensure_account_columns(conn: sqlite3.Connection, existing: set) -> None:
-    """Add the identity columns and backfill them. Idempotent, additive only, so
-    an older build reading this database sees columns it ignores."""
+    """Add and backfill the identity columns; additive, so older builds ignore them."""
     if all(name in existing for name, _decl in _ACCOUNT_COLUMNS):
         return
-    # Two connections opened at the same moment both saw the columns missing.
-    # Take the write lock first, so the second waits here and then re-reads the
-    # table; an ALTER that still loses is the other side's, not an error.
+    # Two connections can both see the columns missing, so take the write lock and
+    # re-read; an ALTER that still loses is the other side's, not an error.
     conn.execute("BEGIN IMMEDIATE")
     try:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(auth_user)")}
@@ -446,22 +434,14 @@ _account_keys_synced: set[str] = set()
 
 
 def _ensure_account_api_keys(conn: sqlite3.Connection, existing: set) -> None:
-    """Pin every managed account's API keys to its immutable id, and keep a
-    copy of them where an older build never looks.
+    """Pin managed API keys to the immutable ``account_id``, and mirror them into
+    ``account_api_keys``.
 
-    The key table names its account by username, and a username can be deleted
-    and created again. A request that authenticated with a key of the old
-    account must keep addressing the old account's keys, never the namesake's,
-    so listing and revoking scope on ``account_id``. The owner's rows keep NULL
-    and the username query they always had.
-
-    A build without account support empties the whole key table when the
-    owner resets the password. Managed keys are therefore also written to
-    ``account_api_keys``, a table that build never touches, and any managed key
-    missing from the key table on the next start is put back from there for an
-    account that still exists. Both steps are idempotent, and they run once per
-    process per database, so a one-account install's requests carry no extra
-    statements.
+    The key table names its account by username, which can be deleted and recreated,
+    so listing and revoking scope on the id instead; the owner's rows keep NULL. The
+    mirror table is one an older build never empties on a password reset, so managed
+    keys missing at the next start are restored from it. Idempotent, once per process
+    per database.
     """
     db_key = str(DB_PATH)
     if db_key in _account_keys_synced and "account_id" in existing:
@@ -619,8 +599,7 @@ def count_managed_accounts() -> int:
 def account_counts() -> tuple[int, int]:
     """``(active accounts, managed accounts of any state)`` in one query.
 
-    The first decides the login form; the second decides whether the host may
-    be opened up at all: a deactivated account still has its files on disk.
+    The second counts deactivated accounts too: their files are still on disk.
     """
     conn = get_connection()
     try:
@@ -678,8 +657,8 @@ def _managed_account(conn: sqlite3.Connection, account_id: str):
 
 
 def _revoke_account_credentials(conn: sqlite3.Connection, row) -> None:
-    # These frozen legacy tables reference usernames. Resolve that name only from
-    # the immutable account id, under the same write lock as the mutation.
+    # These frozen legacy tables key on username, so resolve it from the immutable
+    # account id under the same write lock as the mutation.
     conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (row["username"],))
     conn.execute("DELETE FROM api_keys WHERE username = ?", (row["username"],))
     conn.execute("DELETE FROM account_api_keys WHERE account_id = ?", (row["account_id"],))
@@ -773,8 +752,7 @@ def authenticate_account_login(
                 row["setup_code_hash"], _hash_token(password)
             ):
                 return None
-            # Compare-and-swap includes expiry, activity and credential generation.
-            # Concurrent logins, resets or regeneration can never spend a code twice.
+            # Compare-and-swap on expiry, activity and generation: no code is spent twice.
             with conn:
                 cursor = conn.execute(
                     f"""UPDATE auth_user SET setup_code_hash = NULL, setup_code_expires_at = NULL
@@ -1327,8 +1305,7 @@ def update_password(
 
     salt, pwd_hash = hash_password(new_password)
     jwt_secret = secrets.token_urlsafe(64)
-    # The owner's row keeps the legacy columns; a managed row is written behind
-    # the downgrade fence (see _current_secret).
+    # The owner keeps the legacy columns; a managed row goes behind the fence.
     columns = (
         "password_salt = ?, password_hash = ?, jwt_secret = ?"
         if _is_owner_name(username)
@@ -1596,8 +1573,7 @@ def create_api_key(
     runs) that should not appear in user-facing key listings.
 
     ``expect_gen`` ties the insert to the credential generation the request
-    authenticated under, so a session revoked by a concurrent password reset
-    cannot mint a key that outlives it. Raises ``CredentialRotated`` if it moved.
+    authenticated under, raising ``CredentialRotated`` if a concurrent reset moved it.
     """
     raw_key = API_KEY_PREFIX + secrets.token_hex(16)
     key_hash = _fenced_hash(_pbkdf2_api_key(raw_key), username)
@@ -1649,9 +1625,10 @@ def list_api_keys(
     include_internal: bool = False,
     account_id: Optional[str] = None,
 ) -> list:
-    """Return API keys for *username*. Internal workflow keys are hidden
-    by default so they do not clutter user-facing UIs. ``account_id`` narrows a
-    managed account's listing to keys of that exact account."""
+    """Return API keys for *username*, hiding internal workflow keys by default.
+
+    ``account_id`` narrows a managed account's listing to keys of that exact account.
+    """
     conn = get_connection()
     try:
         scope, params = _key_scope(username, account_id)
@@ -1824,21 +1801,15 @@ def validate_api_key_with_credential(
 def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tuple[dict, str]]:
     """Validate *raw_key* and return ``(account record, jwt_secret)``, or ``None``.
 
-    The record carries ``account_id``, ``username``, ``role`` and ``is_active``,
-    read in the same statement that matched the key. A request is bound to that
-    identity and never to a second lookup by username: a username can be deleted
-    and created again while a request is in flight, an account id cannot. A key
-    whose account is deactivated does not validate.
+    The record is read in the statement that matched the key, so the request binds to
+    that identity rather than a second lookup by a username that may be recreated
+    meanwhile. A deactivated account does not validate.
 
-    Also updates ``last_used_at`` on success. The key check and the credential
-    read share one write transaction, so the returned version is the one the key
-    was actually valid under: a reset committing right after cannot have its new
-    generation handed to a request the key it revoked authenticated.
+    The key check and the credential read share one write transaction, so a reset
+    committing right after cannot hand its new generation to this request.
 
-    ``touch=False`` drops that stamp, and with it the write transaction, for a caller
-    that only asks whether the key authenticates and never binds a write to the
-    generation. One request must not count as two uses, and on sqlite the write lock
-    is global, so an advisory check has no business taking it.
+    ``touch=False`` drops the ``last_used_at`` stamp and its write transaction for an
+    advisory check, which must not count as a use or take sqlite's global write lock.
     """
     cache_id = _api_key_cache_id(raw_key)
     cached_hash = _api_key_hash_cache.get(cache_id)

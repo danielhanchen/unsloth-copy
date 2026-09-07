@@ -33,12 +33,9 @@ export type AccountTransitionBrowser = Pick<
 >;
 
 /**
- * Who the browser now belongs to. A username is a login and display attribute
- * that can be renamed, and a deleted one can be created again as a different
- * account, so the immutable `accountId` the server partitions storage by is the
- * identity that decides whether this browser's data carries over. It is absent
- * only against a server too old to send it, where the reusable name is all
- * there is.
+ * Who the browser now belongs to. Usernames can be renamed and recreated, so the immutable
+ * `accountId` decides whether this browser's data carries over; it is absent only against a
+ * server too old to send it.
  */
 export type BrowserAccount = { username: string; accountId?: string | null };
 
@@ -357,10 +354,8 @@ export function normalizeAccountUsername(username: string): string {
 }
 
 /**
- * The value stored under {@link BROWSER_ACCOUNT_KEY}: `account:<id>:<username>`
- * once the server supplies an id, and the bare normalized username before that.
- * The name is kept alongside the id so a browser marked by one build is still
- * comparable to the other.
+ * The value stored under {@link BROWSER_ACCOUNT_KEY}: `account:<id>:<username>` once the server
+ * supplies an id, else the bare normalized username, so markers from either build stay comparable.
  */
 export function browserAccountMarker(account: BrowserAccount | string): string {
   const identity: BrowserAccount =
@@ -390,10 +385,8 @@ function parseAccountMarker(marker: string): MarkedAccount {
 }
 
 /**
- * Whether the browser's data may carry over. Immutable ids decide it whenever
- * both sides have one; the reusable username is the answer only for a browser
- * marked before ids existed or a server that does not send them, which cannot
- * tell a recreated account apart at all.
+ * Whether the browser's data may carry over. Ids decide it when both sides have one; falling back
+ * to the reusable username cannot tell a recreated account apart.
  */
 function isSameAccount(previous: MarkedAccount, next: MarkedAccount): boolean {
   if (previous.accountId && next.accountId)
@@ -426,9 +419,9 @@ function deleteAccountDatabase(
 }
 
 /**
- * Run before publishing new tokens. An absent marker denotes the historical owner browser.
- * Publish the marker last so other tabs reload only after the new session is ready.
- * Returns true when a document navigation replaces every hydrated store.
+ * Run before publishing new tokens; an absent marker means the historical owner browser. The marker
+ * is published last so other tabs reload only once the new session is ready. Returns true when a
+ * document navigation replaces every hydrated store.
  */
 export async function transitionBrowserAccount(
   account: BrowserAccount | string,

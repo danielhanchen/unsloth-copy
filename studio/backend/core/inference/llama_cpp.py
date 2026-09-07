@@ -22671,9 +22671,8 @@ class LlamaCppBackend:
 
                 if os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
                     self._api_key = _secrets.token_urlsafe(32)
-                    # Through a file rather than argv: a command line is readable by
-                    # every process of this Unix user, including a managed account's
-                    # confined tool, and the auth directory is not.
+                    # Through a file, not argv: a command line is readable by every
+                    # process of this Unix user, and the auth directory is not.
                     cmd.extend(["--api-key-file", str(_write_direct_stream_key(self._api_key))])
                     logger.info("llama-server started with --api-key-file for direct streaming")
                 else:

@@ -25,10 +25,8 @@ VIDEO = "video"
 _lock = threading.Lock()
 _owner: Optional[str] = None
 _owner_epoch = 0
-# The account whose load put the current owner on the GPU. Arbitration between
-# modalities stays as it was; this is what lets a route refuse to evict a model
-# that ANOTHER account is actively generating with, and lets status responses
-# hide a private model's identity from everybody but its loader.
+# The account whose load put the current owner on the GPU, so routes can refuse to evict
+# another account's in-use model and hide a private model's identity from everyone else.
 _owner_account: Optional[str] = None
 
 
@@ -92,11 +90,8 @@ class GpuOwnerBusyError(RuntimeError):
 
 
 class GpuBusyForAnotherAccountError(GpuOwnerBusyError):
-    """Another account is generating on the resident model right now.
-
-    Routes answer this with 409 ``gpu_busy`` and a retry hint rather than
-    cancelling somebody else's stream, which is what cancel_all() used to do.
-    """
+    """Another account is generating on the resident model, so routes answer 409
+    ``gpu_busy`` rather than cancelling its stream."""
 
     def __init__(self, owner: str, active: int):
         self.active = active
@@ -133,11 +128,10 @@ def other_accounts_active(account_id: str) -> int:
 
 
 def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:
-    """Guard a destructive reload or training teardown in a multi-account install.
+    """Guard a destructive reload or teardown in a multi-account install.
 
-    Call under the existing lifecycle gate before touching any backend. This is
-    also needed for replacements within CHAT or DIFFUSION, where the modality
-    owner itself does not change. Single-account installs keep their old policy.
+    Call under the lifecycle gate before touching any backend, including replacements
+    within CHAT or DIFFUSION where the modality owner does not change.
     """
     from auth.policy import installation_is_multi_user
     from utils.account_context import current_account_id
@@ -181,15 +175,12 @@ def acquire_for(
 ) -> Any:
     """Make ``owner`` the sole GPU owner, evicting the other if it holds it.
 
-    ``register``, if given, runs under the arbiter lock right after ownership transfers and its
-    return value is returned. Marking the in-flight load HERE (not after ``acquire_for`` returns)
-    closes the window where a competing acquire could evict this owner before its load is in-flight,
-    letting both loaders allocate VRAM at once. It must be quick and not re-enter the arbiter; if it
-    raises, ownership stays with ``owner``.
-
-    A ``register`` callback marks a real load within the same backend too;
-    ``replacing`` also protects callers that load without a callback. A plain
-    ownership reassertion leaves both unset so accounts share the llama slots.
+    ``register`` runs under the arbiter lock right after ownership transfers and its return
+    value is returned; marking the in-flight load here rather than after this call closes the
+    window where a competing acquire evicts this owner and both loaders allocate VRAM at once.
+    It must be quick and not re-enter the arbiter; if it raises, ownership stays with ``owner``.
+    ``register`` or ``replacing`` marks a real load; a plain ownership reassertion sets neither,
+    so accounts share the llama slots.
     """
     global _owner, _owner_epoch, _owner_account
     if owner not in _EVICTORS:
@@ -205,19 +196,16 @@ def acquire_for(
         if _owner is not None and _owner != owner:
             if not allow_evict:
                 raise GpuOwnerBusyError(_owner)
-            # Another account mid-generation on the outgoing owner is never
-            # evicted; the caller retries once their stream finishes.
+            # Never evict an account mid-generation; the caller retries after its stream ends.
             busy = other_accounts_active(acting)
             if busy:
                 raise GpuBusyForAnotherAccountError(_owner, busy)
             logger.info("gpu_arbiter: evicting %s for %s", _owner, owner)
             _EVICTORS[_owner]()
-        # ``_owner_account`` records who LOADED what is resident, so a plain
-        # reassertion of an owner that is already held must not rewrite it. The
-        # already-loaded fast paths in routes/inference.py re-assert CHAT with
-        # neither a register callback nor ``replacing``; overwriting here handed the
-        # resident model to whoever asked for it last and left the account that
-        # loaded it hidden from its own model.
+        # ``_owner_account`` records who LOADED the resident model, so a plain reassertion
+        # must not rewrite it: the already-loaded fast paths in routes/inference.py re-assert
+        # CHAT without register/``replacing``, and overwriting handed the model to whoever
+        # asked last, hiding it from the account that loaded it.
         if _owner != owner or register is not None or replacing:
             _owner_account = acting
         _owner = owner

@@ -7168,10 +7168,8 @@ def _sandbox_preexec():
 def _account_confinement():
     """The OS-level confinement for the acting account's next child.
 
-    None for the installation owner (one context read, nothing else changes).
-    A managed account's child is confined to its own roots; when this host
-    has no mechanism the call raises ToolConfinementUnavailable and the tool
-    reports that instead of running. See core/inference/tool_confinement.py.
+    None for the owner; a managed account is confined to its own roots, and a host
+    with no mechanism raises ToolConfinementUnavailable. See tool_confinement.py.
     """
     return account_confinement(_SANDBOX_SITE_DIR)
 
@@ -7804,8 +7802,7 @@ def _project_workdir_for(session_id: "str | None") -> "str | None":
 
 
 def _get_project_workdir(session_id: str) -> str | None:
-    # Host project paths are a single-user feature. Managed project sessions
-    # use their account sandbox, just like ordinary chats.
+    # Host project paths are single-user only; managed accounts use their sandbox.
     if not is_owner_context():
         from auth.policy import installation_is_multi_user
         if installation_is_multi_user():

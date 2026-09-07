@@ -651,9 +651,8 @@ def _scan_hf_dataset_caches() -> list[dict]:
 async def list_cached_datasets_response() -> dict:
     """List dataset repos already downloaded into the HF cache.
 
-    The cache is shared by every account, so the rows carry the same visibility
-    filter the model and GGUF inventories apply. The owner keeps the whole scan
-    and does no grant lookup.
+    The cache is shared, so managed accounts get the same visibility filter the
+    model and GGUF inventories apply.
     """
     try:
         rows = await asyncio.to_thread(_scan_hf_dataset_caches)

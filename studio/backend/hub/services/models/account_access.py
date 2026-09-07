@@ -203,9 +203,8 @@ def _remember_public_verdict(name: str, public: bool) -> None:
 
 
 def _hub_public_answer(repo_id: str, repo_type: str) -> bool | None:
-    """True when the Hub says public, False when it says private, gated or missing,
-    None when it could not be asked: unreachable, or switched off in this process by
-    another operation's forced offline window."""
+    """True when the Hub says public, False for private, gated or missing, None when
+    it could not be asked (unreachable, or a forced offline window)."""
     try:
         info = HfApi().repo_info(repo_id, repo_type = repo_type, token = False, timeout = 5.0)
     except Exception as exc:  # noqa: BLE001 - classified below, never trusted as public
@@ -219,10 +218,9 @@ def _hub_public_answer(repo_id: str, repo_type: str) -> bool | None:
 def repo_is_public(repo_id: str, repo_type: str = "model") -> bool:
     """Only an anonymous Hub answer proves that a shared-cache repo is public.
 
-    A proof is kept on disk, so a repo the Hub once confirmed public stays visible to
-    managed accounts when the Hub cannot be asked: the installation is offline, or a
-    concurrent load has this process in a forced offline window. A definitive
-    private, gated or missing answer withdraws it. Nothing is ever assumed public.
+    The proof is kept on disk so the repo stays visible when the Hub cannot be asked,
+    and a definitive private, gated or missing answer withdraws it. Nothing is ever
+    assumed public.
     """
     key = (repo_type, repo_id.lower())
     name = f"{repo_type}:{repo_id.lower()}"
@@ -269,12 +267,8 @@ def model_grants() -> set[str]:
 
 
 def record_model_grant(repo_id: str, repo_type: str = "model") -> None:
-    """Record a successfully authorized download in the initiating account's studio.db.
-
-    Called from the account-bound download watcher for both models and datasets. A
-    transaction preserves simultaneous completions without depending on storage's
-    installation-era schema cache. Owner downloads need no grants.
-    """
+    """Record an authorized model or dataset download in the initiating account's
+    studio.db, under a transaction so simultaneous completions both survive."""
     if not managed_account() or not repo_id:
         return
     path = studio_db_path()
@@ -334,8 +328,8 @@ def model_visible(
 ) -> bool:
     """Apply grants equally to repo ids and cache snapshot/file spellings.
 
-    Arbitrary local paths are private to the current workspace. A symlink cannot
-    turn another account's private files into a visible local model.
+    Arbitrary local paths stay private to the workspace, and a symlink cannot expose
+    another account's files as a local model.
     """
     if not managed_account():
         return True
@@ -425,10 +419,9 @@ _schema_lock = threading.Lock()
 
 
 def ensure_account_schema(module) -> None:
-    """Initialize a private DB for callers of storage modules with legacy global schema flags.
+    """Initialize a private DB for storage modules whose schema flag is still global.
 
-    Storage owns the DDL. This account-aware caller bridge can be retired when all
-    storage modules track schema readiness by database path.
+    Retire this bridge once every storage module tracks readiness by database path.
     """
     if not managed_account():
         return

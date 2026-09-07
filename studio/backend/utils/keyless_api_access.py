@@ -109,8 +109,8 @@ def _read_settings_from_db() -> tuple[str, bool]:
     from storage.studio_db import get_app_settings
 
     keys = [KEYLESS_API_ACCESS_SETTING_KEY, KEYLESS_API_TOOLS_SETTING_KEY]
-    # The cache is installation-wide. A refresh from a managed request must not
-    # publish that account's private settings as the authentication policy.
+    # The cache is installation-wide, so a managed account's private settings must
+    # never be published as the authentication policy.
     values = get_app_settings(keys) if is_owner_context() else run_as(OWNER, get_app_settings, keys)
     scope = _coerce_scope(values.get(KEYLESS_API_ACCESS_SETTING_KEY))
     tools = _coerce_bool(values.get(KEYLESS_API_TOOLS_SETTING_KEY))
@@ -611,9 +611,8 @@ def _keyless_request_allowed_for_scope(request: Any, scope: str) -> bool:
         return False
     from auth.policy import installation_has_managed_accounts
 
-    # Both the middleware (cached settings) and auth dependency use this gate.
-    # Persisted grants become inert as soon as a managed account exists, and
-    # stay so while a deactivated one's files are still on disk.
+    # Persisted grants become inert as soon as a managed account exists, and stay
+    # so while a deactivated one's files are still on disk.
     if installation_has_managed_accounts():
         return False
     asgi_scope = getattr(request, "scope", {})

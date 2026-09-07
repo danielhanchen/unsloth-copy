@@ -97,9 +97,8 @@ def rag_available() -> bool:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the RAG tables if absent (once per database). ``chunks_vec`` is
-    skipped: its column type needs the embedding dim, so ensure_vec() makes it
-    lazily at first ingest."""
+    """Create the RAG tables if absent (once per database). ``chunks_vec`` needs the
+    embedding dim, so ensure_vec() creates it lazily at first ingest."""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
         """

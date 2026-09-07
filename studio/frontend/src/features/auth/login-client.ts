@@ -23,8 +23,8 @@ export type TokenResponse = {
   account_id?: string | null;
 };
 
-// A hint lets multi-account documents hide Full access before React mounts. Legacy
-// owner-only browsers keep their existing startup request count (no status probe here).
+// Hides Full access on multi-account documents before React mounts, with no extra
+// startup request for owner-only browsers.
 export const LOGIN_MODE_HINT_KEY = "unsloth.auth-login-mode.v1";
 function initialLoginMode(): LoginMode {
   try {
@@ -63,10 +63,8 @@ function onLoginModeStorage(event: StorageEvent): void {
   )
     setLoginMode("multi");
 }
-// Whether Full access may be offered. The server refuses it whenever another
-// account exists, active or not, so a deactivated account keeps it hidden while
-// the login form is already back in single mode. Until a status arrives the
-// login-mode hint is the only knowledge: multi means no.
+// The server refuses Full access whenever another account exists, active or not, so
+// a deactivated one keeps it hidden. Before a status arrives, the hint is all we have.
 let fullAccessAllowed: boolean = initialLoginMode() !== "multi";
 export const getFullAccessAllowed = (): boolean => fullAccessAllowed;
 export function setLoginMode(mode: LoginMode, fullAccess?: boolean): void {

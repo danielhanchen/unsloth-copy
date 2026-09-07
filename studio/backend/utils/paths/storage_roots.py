@@ -67,11 +67,9 @@ def studio_root() -> Path:
 def workspace_root() -> Path:
     """Private persistent root of the acting account.
 
-    The installation owner keeps the historical install-root layout exactly,
-    so an install that never created a second account never sees a path move.
-    Every other account lives under ``accounts/<account_id>/``, keyed by the
-    immutable id rather than the username so a renamed or reused name cannot
-    inherit anything.
+    The owner keeps the historical install-root layout, so single-account installs see no path
+    move. Others live under ``accounts/<account_id>/``, keyed by immutable id rather than
+    username so a renamed or reused name inherits nothing.
     """
     root = studio_root()
     if is_owner_context():
@@ -228,7 +226,7 @@ def project_workspaces_root() -> Path:
     base = Path(override).expanduser() if override else documents_root() / "Unsloth Studio"
     if is_owner_context():
         return base if override else base / "Projects"
-    # A separate Documents tree, so it keys on the account like the rest.
+    # A separate Documents tree, keyed on the account like the rest.
     return base / "Accounts" / current_account().account_id / "Projects"
 
 
@@ -499,10 +497,8 @@ def _assert_contained(resolved: Path, root: Path) -> None:
 def within_account(path: Path) -> bool:
     """Whether ``path`` really lives in the acting account's own roots.
 
-    Always true for the owner, whose roots are the install. For a managed
-    account the real path (symlinks followed) must sit under its workspace or
-    its temporary root: a link planted inside the account's tree must not read
-    or list anything outside it.
+    Always true for the owner. For a managed account the symlink-resolved path must sit under
+    its workspace or tmp root, so a planted link cannot read outside the account.
     """
     if is_owner_context():
         return True
@@ -520,12 +516,8 @@ def within_account(path: Path) -> bool:
 
 
 def own_entry(path: Path) -> bool:
-    """``path.exists()`` as the acting account sees it.
-
-    The owner gets the plain check. For a managed account the entry must also
-    really sit inside its roots, so a scanner walking the account's tree does
-    not read metadata through a link planted there.
-    """
+    """``path.exists()`` as the acting account sees it: a managed account's entry must
+    also really sit inside its roots."""
     return path.exists() and within_account(path)
 
 
@@ -621,7 +613,7 @@ def resolve_export_write_dir(path_value: str | None = None) -> Path:
     if _has_parent_segment(raw, path):
         raise ValueError(f"path may not contain '..' segments: {raw!r}")
     if _is_absolute_user_path(path):
-        # Another drive is the owner's call; a managed account exports inside its own roots.
+        # Another drive is the owner's call; managed accounts export inside their own roots.
         return require_within_account(path)
     return resolve_under_root(
         path_value,

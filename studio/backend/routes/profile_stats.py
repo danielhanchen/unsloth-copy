@@ -57,12 +57,9 @@ async def get_profile_stats(
 ) -> dict[str, Any]:
     """Usage stats from the caller's database, including private chats and training.
 
-    API receipts additionally retain their existing subject filter.
-
-    Days and hours are bucketed in the caller's timezone so a remote browser
-    does not read the server's calendar. ``tz`` is an IANA name, which carries
-    each date's own daylight-saving offset; ``tz_offset_minutes`` is the
-    ``Date.getTimezoneOffset()`` fallback for hosts with no tzdata.
+    API receipts keep their existing subject filter. Buckets use the caller's timezone,
+    not the server's: ``tz`` is an IANA name (so each date gets its own DST offset), and
+    ``tz_offset_minutes`` is the ``Date.getTimezoneOffset()`` fallback without tzdata.
     """
     try:
         # A cold pass parses every message's metadata JSON: ~90 ms at 10k

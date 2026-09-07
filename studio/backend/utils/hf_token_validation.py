@@ -150,9 +150,8 @@ def _check_remote(token: str) -> TokenValidationResult:
 def validate_hf_token(token: str, *, rate_key: str) -> TokenValidationResult:
     """Validate ``token`` without retaining it, sharing results within the acting account.
 
-    Cached checks do not consume the caller's three-per-hour network budget. A
-    single-flight event also prevents simultaneously mounted UI surfaces from
-    sending duplicate ``whoami`` requests for the same token.
+    Cached checks skip the three-per-hour network budget, and a single-flight event
+    stops concurrent UI surfaces duplicating ``whoami`` for the same token.
     """
     normalized = token.strip()
     if not normalized:

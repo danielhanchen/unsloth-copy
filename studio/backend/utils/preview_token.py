@@ -3,19 +3,14 @@
 
 """HMAC capability tokens for public ``/p`` preview share links.
 
-The preview ref (``run`` or ``run/checkpoint``) is a deterministic, guessable
-outputs-root path, so it can't gate access on its own. We sign the canonical ref
-with a dedicated server-side secret and require the resulting token on every
-public preview request: guessing a ref no longer grants access, and rotating the
-secret (``auth.storage.rotate_preview_link_secret``) revokes every link at once.
+A preview ref is a guessable outputs-root path, so access is gated on a token
+signing the canonical ref with a server-side secret; rotating that secret
+(``auth.storage.rotate_preview_link_secret``) revokes every link at once.
 
-A link is also bound to the account that minted it. The owner's tokens keep the
-original shape, so every link an existing install handed out still works and
-still resolves in the owner's outputs. A managed account's token carries its
-account id ahead of the signature and the signature covers that id, so the
-public request that redeems it is served inside that account's outputs and
-nowhere else: two accounts with a run of the same name get different tokens,
-and neither opens the other's run.
+Tokens are also bound to the minting account. Owner tokens keep the original
+shape so existing links still work; a managed account's token carries its
+account id ahead of the signature and the signature covers it, so identically
+named runs in two accounts get different tokens and neither opens the other's.
 """
 
 from __future__ import annotations
@@ -53,8 +48,8 @@ def _mac(ref: str, account_id: Optional[str]) -> str:
 
 
 def sign_preview_ref(ref: str, account: Optional[AccountContext] = None) -> str:
-    """Return the URL-safe capability token for a canonical preview ref, minted
-    for ``account`` (the acting account by default)."""
+    """URL-safe capability token for a canonical preview ref, minted for
+    ``account`` (the acting account by default)."""
     account = account or current_account()
     if account.is_owner:
         return _mac(ref, None)
@@ -64,8 +59,8 @@ def sign_preview_ref(ref: str, account: Optional[AccountContext] = None) -> str:
 def preview_token_account(ref: str, token: Optional[str]) -> Optional[AccountContext]:
     """The account whose outputs ``token`` opens for ``ref``, or None.
 
-    Constant-time on the signature. A managed account's token names the account;
-    a deactivated or deleted account's links stop working with it.
+    Constant-time on the signature. A managed account's token names the account,
+    so its links stop working once that account is deactivated or deleted.
     """
     if not token:
         return None

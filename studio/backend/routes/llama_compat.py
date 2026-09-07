@@ -178,9 +178,8 @@ def _server_props() -> dict:
 async def llama_props(current_subject: str = Depends(get_current_subject)):
     """llama-server-compatible ``GET /props``.
 
-    The body names the resident model and carries its chat template, which is
-    the identity and content of whoever loaded it; another account gets the
-    same answer ``/api/inference/status`` gives it.
+    The body reveals the resident model, so another account gets the same answer
+    ``/api/inference/status`` gives it.
     """
     if await asyncio.to_thread(_resident_hidden_from_caller):
         from hub.services.models.account_access import hidden_resident_response

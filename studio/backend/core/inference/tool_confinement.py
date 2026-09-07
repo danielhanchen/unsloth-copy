@@ -3,30 +3,20 @@
 
 """Filesystem confinement for a managed account's tool subprocesses.
 
-The sandbox in ``tools.py`` gives a child a working directory, a scrubbed
-environment, resource limits and a command blocklist. None of that stops a
-process from opening ``../../<other account>/`` or the install root, which
-holds the owner's data and the authentication database. With one account that
-is the user's own machine and their own files; with several accounts it is a
-boundary that has to hold at the operating-system level.
+The sandbox in ``tools.py`` does not stop a child from opening another account's
+root or the install root, which holds the owner's data and the auth database, so
+for a managed account only every sandboxed child is also confined:
 
-So, for a managed account only, every sandboxed child is confined before it
-runs:
-
-* Linux: a Landlock ruleset (kernel 5.13 and later, no privileges required)
-  applied in the forked child. System directories and the interpreter stay
-  readable and executable; the account's own workspace and temporary root are
-  writable; everything else, including the owner's root, the shared model
-  cache and the operating-system home directory, does not exist for the child.
-  Landlock is inherited by every descendant and cannot be lifted.
+* Linux: a Landlock ruleset (kernel 5.13+, no privileges) applied in the forked
+  child, inherited by every descendant and impossible to lift. System paths stay
+  readable and executable, the account's own roots are writable, everything else
+  does not exist for the child.
 * macOS: ``sandbox-exec`` with an equivalent profile wrapping the command.
-* Anywhere else (Windows, a kernel without Landlock): the call is refused
-  rather than run unconfined. The owner can set
-  ``UNSLOTH_STUDIO_ALLOW_UNCONFINED_TOOLS=1`` to accept that risk knowingly.
+* Anywhere else: refused rather than run unconfined, unless the owner sets
+  ``UNSLOTH_STUDIO_ALLOW_UNCONFINED_TOOLS=1``.
 
-The owner never enters this module's confined path: ``account_confinement``
-returns ``None`` after one context read, so a single-account install spawns
-its tools exactly as before.
+``account_confinement`` returns ``None`` for the owner, so a single-account
+install spawns its tools exactly as before.
 """
 
 from __future__ import annotations
@@ -63,8 +53,7 @@ _FS_IOCTL_DEV = 1 << 15  # ABI 5
 _SCOPE_SIGNAL = 1 << 1  # ABI 6: signals reach only processes inside the same domain
 _FS_ABI1_MASK = (1 << 13) - 1
 
-# Read and execute only. /proc and /sys are readable as they are for the
-# owner's sandbox today (the parent already hides its environ).
+# Read and execute only; /proc and /sys stay readable as in the owner's sandbox.
 _SYSTEM_READ_ROOTS = (
     "/usr",
     "/lib",
@@ -90,12 +79,8 @@ class ToolConfinementUnavailable(RuntimeError):
 
 @dataclass(frozen = True)
 class Confinement:
-    """How a managed account's child is confined on this host.
-
-    ``preexec`` runs in the forked child after the ordinary sandbox pre-exec
-    (Linux). ``wrap`` rewrites the argv (macOS). ``mechanism`` names what was
-    applied, for logs and tests.
-    """
+    """How a managed account's child is confined: ``preexec`` runs in the forked
+    child (Linux), ``wrap`` rewrites the argv (macOS), ``mechanism`` names which."""
 
     mechanism: str
     preexec: Optional[Callable[[], None]] = None
@@ -146,8 +131,7 @@ def _interpreter_roots() -> list[str]:
 
 
 def _ensure_dirs(paths) -> list[str]:
-    """Create the account's own roots if this is its first tool call: a rule
-    can only name a path that exists."""
+    """Create the account's own roots: a rule can only name a path that exists."""
     roots = []
     for root in paths:
         try:
@@ -159,18 +143,15 @@ def _ensure_dirs(paths) -> list[str]:
 
 
 def _readable_account_roots() -> list[str]:
-    """The account's workspace, readable so a tool can open the account's own
-    uploads and outputs. Not writable: the account's database, its recorded
-    grants and every directory the server itself manages live here, and a
-    tool that could rewrite them could grant itself what the owner did not."""
+    """The account's workspace, readable but never writable: its database and its
+    recorded grants live here, and a tool could otherwise grant itself access."""
     from utils.paths.storage_roots import workspace_root
     return _ensure_dirs((workspace_root(),))
 
 
 def _writable_roots() -> list[str]:
-    """Where a tool may write: its sandbox (the account-resolved one, so a
-    configured sandbox home is honoured), its temporary root, and its project
-    workspaces."""
+    """Where a tool may write: its account-resolved sandbox, temporary root and
+    project workspaces."""
     from core.inference.tools import sandbox_root
     from utils.paths.storage_roots import project_workspaces_root, tmp_root
 
@@ -178,9 +159,8 @@ def _writable_roots() -> list[str]:
 
 
 def _protected_roots() -> list[str]:
-    """Paths no read grant may contain: the installation itself. A Studio home
-    under /opt, /var/lib or the interpreter prefix would otherwise be readable
-    through the grant for that ancestor."""
+    """The installation itself, which a Studio home under /opt or the interpreter
+    prefix would otherwise expose through the read grant for that ancestor."""
     from utils.paths.storage_roots import studio_root
     return _existing((studio_root(),))
 
@@ -194,8 +174,7 @@ def _grant_excluding(
 ) -> None:
     """Grant ``access`` beneath ``path`` except for the protected roots.
 
-    Landlock has no deny rule, so an ancestor of a protected root is granted
-    child by child, descending only along the chain that leads to it.
+    Landlock has no deny rule, so an ancestor is granted child by child.
     """
     inside = [p for p in protected if _contains(path, p)]
     if not inside:
@@ -211,8 +190,7 @@ def _grant_excluding(
     for name in children:
         child = os.path.join(path, name)
         if os.path.islink(child):
-            # A link is opened by its target; a target inside a protected
-            # root must not be reachable through it.
+            # A link is opened by its target, which must not be protected.
             if any(_contains(p, os.path.realpath(child)) for p in protected):
                 continue
         _grant_excluding(child, access, protected, rules)
@@ -222,8 +200,7 @@ def _grant_excluding(
 
 
 class _RulesetAttr(ctypes.Structure):
-    # Only the first field is passed; the kernel accepts the ABI 1 size from
-    # every later ABI and treats the missing fields as zero.
+    # The kernel accepts this ABI 1 size from every later ABI, zeroing the rest.
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]
 
 
@@ -298,9 +275,8 @@ def _landlock_rules(abi: int, sandbox_site_dir: str) -> list[tuple[str, int]]:
         rules.append((path, read))
     for path in _existing((_DEVICE_ROOT,)):
         rules.append((path, device))
-    # Everything but creating links: a link planted in the account's own tree
-    # and pointing outside it is the one thing the server, which follows links
-    # for the owner, must never find there.
+    # Everything but creating links: the server follows links for the owner, so a
+    # tool must not be able to plant one pointing outside the account's tree.
     writable = handled & ~_FS_MAKE_SYM
     for path in _writable_roots():
         rules.append((path, writable))
@@ -344,8 +320,8 @@ def _landlock_preexec(
         os.close(ruleset_fd)
 
 
-# Truncation is only handled from ABI 3 (Linux 6.2): below that a confined
-# child could still empty a foreign file it cannot otherwise write.
+# Truncation is only handled from ABI 3 (Linux 6.2); below that a confined child
+# could still empty a foreign file it cannot otherwise write.
 _MIN_LANDLOCK_ABI = 3
 
 
@@ -357,11 +333,9 @@ def _linux_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     rules = _landlock_rules(abi, sandbox_site_dir)
     return Confinement(
         mechanism = f"landlock-abi{abi}",
-        # Signals stay inside the child's own domain (ABI 6), so a tool cannot
-        # stop another account's tool process. Its entry under /proc stays
-        # readable, as for any two processes of one Unix user; the kernel's
-        # ptrace rules already keep environ, maps and fds of a non-descendant
-        # closed, so what remains visible is the command line.
+        # Signals stay inside the child's own domain (ABI 6), so a tool cannot stop
+        # another account's. /proc stays readable, but ptrace rules leave only the
+        # command line visible.
         preexec = partial(_landlock_preexec, handled, rules, _SCOPE_SIGNAL if abi >= 6 else 0),
     )
 
@@ -445,9 +419,9 @@ def _macos_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
 def account_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     """The confinement for the acting account's next tool child.
 
-    ``None`` for the installation owner, whose sandbox is unchanged. For a
-    managed account, the platform mechanism, or ``ToolConfinementUnavailable``
-    when the host has none and the owner has not opted out of confinement.
+    ``None`` for the owner, whose sandbox is unchanged; otherwise the platform
+    mechanism, or ``ToolConfinementUnavailable`` when the host has none and the
+    owner has not opted out.
     """
     if is_owner_context():
         return None

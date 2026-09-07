@@ -176,11 +176,8 @@ class ApiMonitorEntry:
     updated_at: float
     # Who this row is attributed to; on a shared row it does not restrict visibility.
     subject: Optional[str] = None
-    # The username in ``subject`` is reusable: deleting an account frees the name, and
-    # these rows outlive the account because they are in memory. The immutable account
-    # id is stamped here so a replacement that is handed the same username cannot read,
-    # count, or clear its predecessor's traffic. Owner rows all carry the owner's id, so
-    # a one-account install compares exactly as before.
+    # Usernames are reusable and these in-memory rows outlive the account, so the
+    # immutable account id fences a replacement off its predecessor's traffic.
     account_id: str = field(default_factory = current_account_id)
     # True for sk-unsloth callers only: the panel auto-opens on these, not Unsloth's chat.
     via_api_key: bool = False
@@ -314,8 +311,7 @@ class ApiMonitor:
     ):
         self._entries: deque[ApiMonitorEntry] = deque()
         # Shared rows one subject cleared: deleting would erase another caller's history.
-        # Keyed by (account id, subject): a reusable username alone would carry one
-        # account's dismissals over to its replacement.
+        # Keyed by account id too: a reused username would inherit the dismissals.
         self._hidden_shared: dict[tuple[str, str], set[str]] = {}
         self._max_entries = max(0, max_entries)
         self._lock = threading.Lock()
@@ -1003,9 +999,8 @@ class ApiMonitor:
             # Every subject minus the cleared ones. Before ownership, so a clear hides own rows.
             if entry.id in self._hidden_shared.get((current_account_id(), subject), ()):
                 return False
-            # A load row names the model, and for a trained model that is a path
-            # inside the loading account's workspace. Another managed account
-            # gets no row; the owner and the loading account keep it.
+            # A load row names the model, which for a trained model is a path
+            # inside the loading account's workspace.
             return _lifecycle_row_visible_to_caller(entry, subject)
         return entry.subject == subject and entry.account_id == current_account_id()
 
@@ -1048,10 +1043,8 @@ api_monitor = ApiMonitor(enabled = not _api_monitor_disabled())
 
 
 def _lifecycle_row_visible_to_caller(entry: "ApiMonitorEntry", subject: str) -> bool:
-    """A model load or unload row is shared state, but it names the model, and for a
-    trained model that is a path inside the loading account's workspace. The owner
-    and the account that loaded it see the row; another managed account does not.
-    With one account nothing is hidden."""
+    """Lifecycle rows name a model path that may sit inside the loading account's
+    workspace, so only the owner and that account see them."""
     if entry.kind != "lifecycle" or entry.subject is None:
         return True
     if entry.subject == subject and entry.account_id == current_account_id():

@@ -3,20 +3,13 @@
 
 """Which account a request, job or thread is acting for.
 
-One ContextVar, bound by the auth dependency once a credential resolves and
-carried by asyncio tasks from there. It is deliberately NOT inherited by new
-threads or spawned processes: long-running work carries the account as data
-and rebinds at its execution boundary through ``run_as`` / ``account_thread``.
+One ContextVar, bound by the auth dependency and carried by asyncio tasks, but
+deliberately NOT inherited by new threads or processes: those rebind through
+``run_as`` / ``account_thread``. It defaults to the installation owner, so a
+single-account install behaves exactly as it did before accounts existed.
 
-The default is the installation owner. An install that never created a second
-account therefore resolves every request, every background loop and every test
-exactly as before accounts existed, which is the compatibility guarantee the
-rest of the feature rests on.
-
-Accounts are identified by an immutable ``account_id``, never by username: a
-username is a login and display attribute that can be renamed or reused, and a
-storage key derived from it would let the next holder of a name inherit the
-previous holder's files.
+Accounts are keyed by immutable ``account_id``, never username: usernames can be
+renamed or reused, and the next holder of a name would inherit the old files.
 """
 
 from __future__ import annotations
@@ -77,8 +70,7 @@ def reset_account(token: Token[AccountContext]) -> None:
 
 def run_as(account: AccountContext, target: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     """Call ``target`` bound to ``account``. Synchronous targets only: a coroutine
-    returned here would run AFTER the binding is reset, under whatever account the
-    awaiting task holds. Use ``arun_as`` for those."""
+    returned here would run after the binding is reset. Use ``arun_as`` instead."""
     token = bind_account(account)
     try:
         result = target(*args, **kwargs)
