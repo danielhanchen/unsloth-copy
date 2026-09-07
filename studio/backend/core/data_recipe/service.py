@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
+
 from utils.paths import recipe_datasets_root
 
 from .jsonable import to_jsonable
@@ -184,11 +186,32 @@ def recipe_has_stdio_mcp(recipe: dict[str, Any]) -> bool:
     )
 
 
+def _require_confinable_mcp_transport(provider_type: str) -> None:
+    """Chat MCP keeps a managed account off loopback and the LAN: it validates every
+    resolved address and then PINS the connection to the address it validated, so a
+    later DNS answer or a redirect cannot move it (core/inference/mcp_client.py,
+    ``validate_mcp_address`` and ``_public_http_client_factory``). The Data Designer
+    engine opens its own MCP connections, so neither half reaches a recipe provider and
+    an endpoint chat refuses is accepted here. Refuse network MCP for managed accounts
+    until the engine can take the confined transport; a URL check alone is not the same
+    guarantee. The owner keeps recipe MCP exactly as before."""
+    if provider_type not in {"sse", "streamable_http"} or not managed_account():
+        return
+    raise HTTPException(
+        status_code = 403,
+        detail = (
+            "Recipe MCP servers are unavailable for managed accounts until the recipe "
+            "engine uses the account-confined MCP transport."
+        ),
+    )
+
+
 def build_mcp_providers(recipe: dict[str, Any]) -> list:
     from data_designer.config.mcp import LocalStdioMCPProvider, MCPProvider  # pyright: ignore[reportMissingImports]
 
     # Same gate as the chat MCP path: stdio providers spawn a local subprocess, so build
     # them only when this host allows it (desktop loopback default / explicit opt-in).
+    # stdio_mcp_enabled() is already False for a managed account.
     from core.inference.mcp_client import stdio_mcp_enabled
 
     stdio_allowed = stdio_mcp_enabled()
@@ -218,6 +241,7 @@ def build_mcp_providers(recipe: dict[str, Any]) -> list:
             continue
 
         if provider_type in {"sse", "streamable_http"}:
+            _require_confinable_mcp_transport(provider_type)
             api_key = provider.get("api_key")
             api_key_env = provider.get("api_key_env")
             if not api_key and api_key_env and not managed_account():
