@@ -170,7 +170,7 @@ jobs:
     # one has to wait out the whole torch warm before the self-heal is even
     # scheduled, and then the length of the install it is holding a verdict
     # against.
-    timeout-minutes: 40
+    timeout-minutes: 65
     steps:
       # harden-runner v2.20.0 supports blocking mode on GitHub-hosted macOS
       # runners. Keep this job in audit while its egress destinations are
@@ -581,6 +581,53 @@ jobs:
             exit 1
           fi
           echo "OK: Unsloth prebuilt llama.cpp on Mac M1 + GGUF /completion works"
+
+      # STAGING ONLY (unslothai/unsloth#10239). The suites above fake mlx.core and
+      # never import mlx_vlm, so nothing anywhere proves the VLM prompt-prefix cache
+      # against the real dispatcher. These two steps do, on this host, and are the
+      # reason this branch exists. Neither is in the upstream workflow.
+      - name: VLM snapshot cache - real cache objects
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python tests/studio/run_real_mlx_cache_objects.py \
+            --json "$PWD/mlx_cache_objects.json"
+
+      # Qwen2-VL rather than the smaller SmolVLM: SmolVLM-256M-Instruct-4bit does not
+      # load at all on this transformers, AutoProcessor failing to resolve a sub-processor
+      # for its idefics3 config, which says nothing about this PR. Qwen2-VL also exercises
+      # more of it, since mRoPE is the family whose prompt-wide position_ids the session
+      # withholds. 2B at 4 bits is about 1.2 GB against the runner's 7.
+      - name: VLM snapshot cache - warm vs cold token parity (Qwen2-VL-2B)
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: |
+          python tests/studio/run_real_mlx_vlm_cache_smoke.py \
+            --model mlx-community/Qwen2-VL-2B-Instruct-4bit \
+            --turns 5 --max-new-tokens 24 \
+            --json "$PWD/vlm_parity_qwen2vl.json"
+
+      # Kept as advisory so the load failure above is recorded rather than hidden. A token
+      # MISMATCH here would still be visible in the log and the artifact.
+      - name: VLM snapshot cache - warm vs cold token parity (SmolVLM-256M, advisory)
+        continue-on-error: true
+        env:
+          UNSLOTH_COMPILE_DISABLE: '1'
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: |
+          python tests/studio/run_real_mlx_vlm_cache_smoke.py \
+            --model mlx-community/SmolVLM-256M-Instruct-4bit \
+            --turns 4 --max-new-tokens 16 \
+            --json "$PWD/vlm_parity_smolvlm.json"
+
+      - name: VLM snapshot cache - results
+        if: always()
+        run: |
+          for f in mlx_cache_objects.json vlm_parity_smolvlm.json vlm_parity_qwen2vl.json; do
+            echo "=== $f ==="
+            cat "$f" 2>/dev/null || echo "(missing)"
+          done
 
       - name: Save the pip cache
         if: always()
