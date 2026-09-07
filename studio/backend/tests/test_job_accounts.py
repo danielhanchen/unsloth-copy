@@ -265,6 +265,64 @@ def test_recipe_job_status_dataset_events_and_cancel_are_private(monkeypatch):
     assert run_as(BOB, manager.start, recipe = {}, run = {}) != job_id
 
 
+class _OwnedJobService:
+    """The shared shape ``owned_job`` reserves against."""
+
+    def __init__(self):
+        self._account_job_lock = threading.RLock()
+        self._account_inflight = 0
+        self._result_account = None
+        self.job_account = None
+        self._account_clear = None
+        self.live = False
+
+    def _account_active(self):
+        return self.live
+
+    @jobs.owned_job()
+    def start(self):
+        self.live = True
+        return "started"
+
+
+def test_owner_start_while_the_last_managed_account_is_deactivated_keeps_its_own_attribution(
+    monkeypatch,
+):
+    """Deactivating the last managed account turns the login mode single while that
+    account's tag is still on the service. An owner start then has to retag it, or
+    reactivation hands the owner's running job back to the previous account."""
+    mode = {"multi": True}
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: mode["multi"])
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: True)
+
+    service = _OwnedJobService()
+    run_as(ALICE, service.start)
+    service.live = False
+    jobs.refresh_job_owner(service)
+    assert service._result_account == ALICE
+
+    mode["multi"] = False  # Alice is deactivated.
+    run_as(OWNER, service.start)
+    assert service._result_account == OWNER and service.job_account == OWNER
+
+    mode["multi"] = True  # Alice is reactivated.
+    assert not run_as(OWNER, jobs.job_is_foreign, service)
+    assert run_as(ALICE, jobs.job_is_foreign, service)
+    with pytest.raises(HTTPException) as exc:
+        run_as(ALICE, jobs.require_job_owner, service)
+    assert exc.value.status_code == 404
+
+
+def test_an_install_that_never_had_a_managed_account_does_no_job_bookkeeping(monkeypatch):
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
+    monkeypatch.setattr(policy, "installation_has_managed_accounts", lambda: False)
+
+    service = _OwnedJobService()
+    service._account_job_lock = None  # any reservation would raise here
+    assert run_as(OWNER, service.start) == "started"
+    assert service._result_account is None and service.job_account is None
+
+
 def test_diffusion_status_and_stop_are_private():
     from core.training.diffusion_training_service import DiffusionTrainingService
 

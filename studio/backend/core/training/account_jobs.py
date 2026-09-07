@@ -181,12 +181,20 @@ def owned_job(*, continuation: bool = False):
 
     Finished results retain their account tag separately, so releasing the active
     reservation never makes an old model, log, or metric public.
+
+    The bookkeeping is skipped only on an install that has never had a managed
+    account, not merely on one that is single-user right now. Deactivating the last
+    managed account turns the login mode single while that account's tag is still on
+    the service, so skipping here would leave an owner job wearing the previous
+    account's attribution -- handed back to that account the moment it is reactivated.
+    ``installation_has_managed_accounts()`` reads the same cached account counts as
+    ``installation_is_multi_user()``, so a one-account install pays nothing extra.
     """
 
     def decorate(fn):
         @wraps(fn)
         def wrapped(self, *args, **kwargs):
-            if not policy.installation_is_multi_user():
+            if not policy.installation_has_managed_accounts():
                 return fn(self, *args, **kwargs)
             account = current_account()
             with self._account_job_lock:
