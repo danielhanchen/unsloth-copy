@@ -30,6 +30,7 @@ const token = {
   access_token: "access",
   refresh_token: "refresh",
   must_change_password: false,
+  account_id: "a1",
 };
 
 function elements(node: unknown): StubElement[] {
@@ -88,11 +89,19 @@ function mountForm(
     "@/lib/account-transition": {
       normalizeAccountUsername: transition.normalizeAccountUsername,
       transitionBrowserAccount: async (
-        username: string,
+        account: transition.BrowserAccount | string,
         route: string,
         commit: () => void,
       ) => {
-        transitions.push(`${username}:${route}`);
+        // Records the identity the form transitions on: the immutable account id
+        // when the server sent one, since usernames are reusable.
+        const identity =
+          typeof account === "string"
+            ? { username: account, accountId: null }
+            : account;
+        transitions.push(
+          `${identity.username}@${identity.accountId ?? "none"}:${route}`,
+        );
         if (failTransitionOnce && transitions.length === 1)
           throw new Error("Close other Unsloth tabs and retry");
         commit();
@@ -329,7 +338,7 @@ test("successful login commits through transition and avoids SPA navigation when
   const submit = elements(tree).find((element) => element.type === "form")
     ?.props.onSubmit as (event: unknown) => Promise<void>;
   await submit({ preventDefault() {} });
-  assert.deepEqual(form.transitions, ["alice:/change-password"]);
+  assert.deepEqual(form.transitions, ["alice@a1:/change-password"]);
   assert.equal(session.change, true);
   assert.equal(session.access, "access");
   assert.deepEqual(form.routes, []);

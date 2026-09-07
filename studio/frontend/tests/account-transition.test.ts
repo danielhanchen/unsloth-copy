@@ -7,6 +7,7 @@ import {
   ACCOUNT_CHROME_KEYS,
   ACCOUNT_DATABASES,
   BROWSER_ACCOUNT_KEY,
+  browserAccountMarker,
   installAccountTransitionListener,
   normalizeAccountUsername,
   resetFullAccessForMultiUser,
@@ -169,6 +170,132 @@ test("same managed account keeps content and avoids IndexedDB work", async () =>
   assert.deepEqual(b.replaced, []);
 });
 
+test("a username created again as a different account inherits nothing", async () => {
+  const b = browserWith({});
+  // First login: the account holding the name "alice" has the immutable id "a1".
+  await transitionBrowserAccount(
+    { username: "alice", accountId: "a1" },
+    "/chat",
+    () => {},
+    b.browser,
+  );
+  b.data.set("chat-draft:1", "first alice");
+  b.data.set("unsloth_hf_token", "first alice");
+  const deletedOnFirstLogin = b.deleted.length;
+  // That account is deleted and the free name is taken by a new account, "a2".
+  const changed = await transitionBrowserAccount(
+    { username: "alice", accountId: "a2" },
+    "/chat",
+    () => {},
+    b.browser,
+  );
+  assert.equal(changed, true);
+  assert.equal(b.data.has("chat-draft:1"), false);
+  assert.equal(b.data.has("unsloth_hf_token"), false);
+  assert.deepEqual(b.deleted.slice(deletedOnFirstLogin), [
+    ...ACCOUNT_DATABASES,
+  ]);
+  assert.equal(b.data.get(BROWSER_ACCOUNT_KEY), "account:a2:alice");
+});
+
+test("one account keeps its data across a rename", async () => {
+  const b = browserWith({
+    [BROWSER_ACCOUNT_KEY]: browserAccountMarker({
+      username: "alice",
+      accountId: "a1",
+    }),
+    "chat-draft:1": "alice",
+  });
+  assert.equal(
+    await transitionBrowserAccount(
+      { username: "Alice2", accountId: "a1" },
+      "/chat",
+      () => {},
+      b.browser,
+    ),
+    false,
+  );
+  assert.deepEqual(b.removed, []);
+  assert.deepEqual(b.deleted, []);
+  assert.equal(b.data.get(BROWSER_ACCOUNT_KEY), "account:a1:alice2");
+});
+
+// Neither side can tell a recreated account apart, so the reusable name has to answer.
+test("a marker written before account ids upgrades in place", async () => {
+  const b = browserWith({
+    [BROWSER_ACCOUNT_KEY]: "alice",
+    "chat-draft:1": "alice",
+  });
+  assert.equal(
+    await transitionBrowserAccount(
+      { username: "alice", accountId: "a1" },
+      "/chat",
+      () => {},
+      b.browser,
+    ),
+    false,
+  );
+  assert.deepEqual(b.removed, []);
+  assert.equal(b.data.get(BROWSER_ACCOUNT_KEY), "account:a1:alice");
+});
+
+test("a server that sends no account id keeps the session on the username", async () => {
+  for (const account of [
+    "alice",
+    { username: "alice", accountId: null },
+  ] as const) {
+    const b = browserWith({
+      [BROWSER_ACCOUNT_KEY]: "account:a1:alice",
+      "chat-draft:1": "alice",
+    });
+    assert.equal(
+      await transitionBrowserAccount(account, "/chat", () => {}, b.browser),
+      false,
+    );
+    assert.deepEqual(b.removed, []);
+    assert.equal(b.data.get(BROWSER_ACCOUNT_KEY), "alice");
+  }
+});
+
+for (const marker of [undefined, "unsloth"]) {
+  test(`an owner-only install never purges when ids arrive, marker ${marker ?? "absent"}`, async () => {
+    const b = browserWith({
+      "chat-draft:1": "keep",
+      ...(marker ? { [BROWSER_ACCOUNT_KEY]: marker } : {}),
+    });
+    assert.equal(
+      await transitionBrowserAccount(
+        { username: "unsloth", accountId: "owner" },
+        "/chat",
+        () => {},
+        b.browser,
+      ),
+      false,
+    );
+    assert.deepEqual(b.removed, []);
+    assert.deepEqual(b.deleted, []);
+    assert.deepEqual(b.replaced, []);
+    assert.equal(b.data.get(BROWSER_ACCOUNT_KEY), "account:owner:unsloth");
+  });
+}
+
+test("a marker no build wrote can only compare as a different account", async () => {
+  const b = browserWith({
+    [BROWSER_ACCOUNT_KEY]: "account:",
+    "unsloth-private": "x",
+  });
+  assert.equal(
+    await transitionBrowserAccount(
+      { username: "alice", accountId: "a1" },
+      "/chat",
+      () => {},
+      b.browser,
+    ),
+    true,
+  );
+  assert.equal(b.data.has("unsloth-private"), false);
+});
+
 test("returning to the owner clears the previous managed account", async () => {
   const b = browserWith({
     [BROWSER_ACCOUNT_KEY]: "alice",
@@ -226,6 +353,38 @@ test("cross-tab switches reload once, ignoring initial owner markers, removals a
   });
   send({ key: BROWSER_ACCOUNT_KEY, oldValue: "alice", newValue: "bob" });
   assert.equal(b.reloads(), 1);
+});
+
+test("cross-tab reloads follow the account id, not the name", () => {
+  const upgrade = browserWith();
+  installAccountTransitionListener(upgrade.browser);
+  upgrade.listeners[0]({
+    key: BROWSER_ACCOUNT_KEY,
+    oldValue: "alice",
+    newValue: "account:a1:alice",
+    storageArea: upgrade.browser.localStorage,
+  });
+  assert.equal(upgrade.reloads(), 0);
+  const recreated = browserWith();
+  installAccountTransitionListener(recreated.browser);
+  recreated.listeners[0]({
+    key: BROWSER_ACCOUNT_KEY,
+    oldValue: "account:a1:alice",
+    newValue: "account:a2:alice",
+    storageArea: recreated.browser.localStorage,
+  });
+  assert.equal(recreated.reloads(), 1);
+});
+
+test("a marker carries the account id and the normalized name", () => {
+  assert.equal(browserAccountMarker(" ALICE "), "alice");
+  assert.equal(
+    browserAccountMarker({ username: " ALICE ", accountId: "a1" }),
+    "account:a1:alice",
+  );
+  assert.throws(() =>
+    browserAccountMarker({ username: "  ", accountId: "a1" }),
+  );
 });
 
 test("multi-user policy resets full while preserving other permission modes", () => {

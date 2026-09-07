@@ -287,6 +287,32 @@ def test_multi_login_requires_username(matrix):
     assert login(client, "UNSLOTH", "owner-password").status_code == 200
 
 
+def test_login_and_refresh_carry_the_immutable_account_id(auth_env):
+    """A browser that keeps per-account state needs an identity a new account cannot inherit."""
+    client, _, _ = auth_env
+    first = create(client, "alice").json()
+    first_id = first["account"]["account_id"]
+    session = login(client, "alice", first["setup_code"])
+    assert session.status_code == 200
+    assert session.json()["account_id"] == first_id
+    assert first_id != storage.get_account("unsloth").account_id
+    refreshed = client.post(
+        "/api/auth/refresh", json = {"refresh_token": session.json()["refresh_token"]}
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json()["account_id"] == first_id
+
+    # The username is released and claimed by a different account, which is a
+    # different account_id and so a different owner of anything keyed on it.
+    assert client.delete(f"/api/accounts/{first_id}", headers = headers()).status_code == 204
+    second = create(client, "alice").json()
+    replacement = login(client, "alice", second["setup_code"])
+    assert replacement.status_code == 200
+    assert replacement.json()["account_id"] == second["account"]["account_id"]
+    assert replacement.json()["account_id"] != first_id
+    assert login(client, "unsloth", "owner-password").json()["account_id"] == "owner"
+
+
 @pytest.mark.parametrize("must_change", [False, True])
 def test_single_owner_login_response_bytes_and_lookup_cost_are_unchanged(
     auth_env, monkeypatch, must_change
@@ -311,10 +337,12 @@ def test_single_owner_login_response_bytes_and_lookup_cost_are_unchanged(
     )
     response = login(client, "unsloth", "owner-password")
     assert response.status_code == 200
+    # The owner's immutable id is the last field: browsers key per-account state on it.
     assert (
         response.content
         == b'{"access_token":"access","refresh_token":"refresh","token_type":"bearer","must_change_password":'
-        + (b"true}" if must_change else b"false}")
+        + (b"true" if must_change else b"false")
+        + b',"account_id":"owner"}'
     )
     assert calls == ["unsloth"]
     assert login(client, "UNSLOTH", "owner-password").status_code == 401

@@ -45,6 +45,18 @@ from auth.authentication import (
 router = APIRouter()
 
 
+def _account_id_of(username: str) -> "str | None":
+    """Immutable id of ``username``'s account, for clients that key state on it.
+
+    A username is a login and display attribute that can be renamed or reused,
+    so a browser that kept per-account state under the name alone would hand a
+    recreated account its predecessor's data. Returns None only if the row went
+    away between authentication and this read.
+    """
+    account = storage.get_account(username)
+    return account.account_id if account is not None else None
+
+
 def _require_a_credential_of_its_own(what: str):
     """Refuse a caller that nothing but keyless API access let in.
 
@@ -495,6 +507,7 @@ async def login(payload: AuthLoginRequest, request: Request) -> Token:
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = must_change_password,
+        account_id = _account_id_of(username),
     )
 
 
@@ -543,6 +556,7 @@ async def desktop_login(payload: DesktopLoginRequest) -> Token | Response:
         refresh_token = create_refresh_token(subject = username, desktop = True, secret = jwt_secret),
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(username),
     )
 
 
@@ -556,9 +570,9 @@ async def refresh(payload: RefreshTokenRequest) -> Token:
             detail = "Invalid or expired refresh token",
         )
     username, is_desktop, jwt_secret = consumed
+    account = storage.get_account(username)
     if is_desktop:
         # Only the installation owner runs inside the desktop shell.
-        account = storage.get_account(username)
         is_desktop = account is not None and account.is_owner
     new_access_token = create_access_token(subject = username, desktop = is_desktop, secret = jwt_secret)
     new_refresh_token = create_refresh_token(
@@ -570,6 +584,7 @@ async def refresh(payload: RefreshTokenRequest) -> Token:
         refresh_token = new_refresh_token,
         token_type = "bearer",
         must_change_password = False if is_desktop else storage.requires_password_change(username),
+        account_id = account.account_id if account is not None else None,
     )
 
 
@@ -638,6 +653,7 @@ async def set_desktop_initial_password(
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(current_subject),
     )
 
 
@@ -713,6 +729,7 @@ async def change_password(
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(current_subject),
     )
 
 

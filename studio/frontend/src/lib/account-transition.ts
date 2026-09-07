@@ -32,6 +32,18 @@ export type AccountTransitionBrowser = Pick<
   "localStorage" | "indexedDB" | "location"
 >;
 
+/**
+ * Who the browser now belongs to. A username is a login and display attribute
+ * that can be renamed, and a deleted one can be created again as a different
+ * account, so the immutable `accountId` the server partitions storage by is the
+ * identity that decides whether this browser's data carries over. It is absent
+ * only against a server too old to send it, where the reusable name is all
+ * there is.
+ */
+export type BrowserAccount = { username: string; accountId?: string | null };
+
+const ACCOUNT_ID_MARKER_PREFIX = "account:";
+
 // Full Unicode case-fold exceptions to per-character lowercase, generated from
 // Python unicodedata 15.1.0 to match backend username normalization.
 const CASE_FOLD_OVERRIDES: Readonly<Record<string, string>> = {
@@ -344,6 +356,51 @@ export function normalizeAccountUsername(username: string): string {
   ).join("");
 }
 
+/**
+ * The value stored under {@link BROWSER_ACCOUNT_KEY}: `account:<id>:<username>`
+ * once the server supplies an id, and the bare normalized username before that.
+ * The name is kept alongside the id so a browser marked by one build is still
+ * comparable to the other.
+ */
+export function browserAccountMarker(account: BrowserAccount | string): string {
+  const identity: BrowserAccount =
+    typeof account === "string" ? { username: account } : account;
+  const username = normalizeAccountUsername(identity.username);
+  if (!username) throw new Error("Missing account username.");
+  return identity.accountId
+    ? `${ACCOUNT_ID_MARKER_PREFIX}${identity.accountId}:${username}`
+    : username;
+}
+
+type MarkedAccount = { accountId: string | null; username: string };
+function parseAccountMarker(marker: string): MarkedAccount {
+  const legacy = {
+    accountId: null,
+    username: normalizeAccountUsername(marker),
+  };
+  if (!marker.startsWith(ACCOUNT_ID_MARKER_PREFIX)) return legacy;
+  const qualified = marker.slice(ACCOUNT_ID_MARKER_PREFIX.length);
+  const separator = qualified.indexOf(":");
+  // A marker no build wrote stays whole, so it can only compare as different.
+  if (separator <= 0 || separator === qualified.length - 1) return legacy;
+  return {
+    accountId: qualified.slice(0, separator),
+    username: normalizeAccountUsername(qualified.slice(separator + 1)),
+  };
+}
+
+/**
+ * Whether the browser's data may carry over. Immutable ids decide it whenever
+ * both sides have one; the reusable username is the answer only for a browser
+ * marked before ids existed or a server that does not send them, which cannot
+ * tell a recreated account apart at all.
+ */
+function isSameAccount(previous: MarkedAccount, next: MarkedAccount): boolean {
+  if (previous.accountId && next.accountId)
+    return previous.accountId === next.accountId;
+  return previous.username === next.username;
+}
+
 export function resetFullAccessForMultiUser(storage: Storage): void {
   if (storage.getItem("unsloth_chat_permission_mode") === "full") {
     storage.setItem("unsloth_chat_permission_mode", "auto");
@@ -374,18 +431,17 @@ function deleteAccountDatabase(
  * Returns true when a document navigation replaces every hydrated store.
  */
 export async function transitionBrowserAccount(
-  username: string,
+  account: BrowserAccount | string,
   postAuthRoute: string,
   commitSession: () => void,
   browser: AccountTransitionBrowser = window,
 ): Promise<boolean> {
-  const next = normalizeAccountUsername(username);
-  if (!next) throw new Error("Missing account username.");
+  const marker = browserAccountMarker(account);
   const storage = browser.localStorage;
-  const previous = normalizeAccountUsername(
-    storage.getItem(BROWSER_ACCOUNT_KEY) ?? "unsloth",
+  const changed = !isSameAccount(
+    parseAccountMarker(storage.getItem(BROWSER_ACCOUNT_KEY) ?? "unsloth"),
+    parseAccountMarker(marker),
   );
-  const changed = previous !== next;
   if (changed) {
     const keys = Array.from({ length: storage.length }, (_, index) =>
       storage.key(index),
@@ -408,8 +464,8 @@ export async function transitionBrowserAccount(
     );
   }
   commitSession();
-  if (storage.getItem(BROWSER_ACCOUNT_KEY) !== next)
-    storage.setItem(BROWSER_ACCOUNT_KEY, next);
+  if (storage.getItem(BROWSER_ACCOUNT_KEY) !== marker)
+    storage.setItem(BROWSER_ACCOUNT_KEY, marker);
   if (changed) browser.location.replace(postAuthRoute);
   return changed;
 }
@@ -430,8 +486,8 @@ export function installAccountTransitionListener(
     )
       return;
     if (event.storageArea && event.storageArea !== browser.localStorage) return;
-    const previous = normalizeAccountUsername(event.oldValue ?? "unsloth");
-    if (previous === normalizeAccountUsername(event.newValue)) return;
+    const previous = parseAccountMarker(event.oldValue ?? "unsloth");
+    if (isSameAccount(previous, parseAccountMarker(event.newValue))) return;
     reloading = true;
     browser.location.reload();
   });

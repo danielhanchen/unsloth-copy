@@ -277,10 +277,14 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
 
         if (!accessToken) {
           const bootstrapToken = await loginWithPassword(username, currentPassword);
-          const replaced = await transitionBrowserAccount(username, "/change-password", () => {
-            storeAuthTokens(bootstrapToken.access_token, bootstrapToken.refresh_token);
-            setMustChangePassword(bootstrapToken.must_change_password);
-          });
+          const replaced = await transitionBrowserAccount(
+            { username, accountId: bootstrapToken.account_id },
+            "/change-password",
+            () => {
+              storeAuthTokens(bootstrapToken.access_token, bootstrapToken.refresh_token);
+              setMustChangePassword(bootstrapToken.must_change_password);
+            },
+          );
           if (replaced) return;
           accessToken = bootstrapToken.access_token;
         }
@@ -317,9 +321,16 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
         storeAuthTokens(token.access_token, token.refresh_token);
       };
       // Password changes keep the authenticated subject, including managed setup sessions.
+      // The immutable account id decides the browser transition: a username can be
+      // deleted and created again as a different account, which must not inherit
+      // the previous holder's browser data.
       const signedInUsername = sessionAccount(token.access_token)?.username ?? username;
       const route = isLoginMode && token.must_change_password ? "/change-password" : "/chat";
-      const replaced = await transitionBrowserAccount(signedInUsername, route, finishSession);
+      const replaced = await transitionBrowserAccount(
+        { username: signedInUsername, accountId: token.account_id },
+        route,
+        finishSession,
+      );
       pendingLogin.current = null;
       if (replaced) return;
       navigate({ to: getPostAuthRoute() });

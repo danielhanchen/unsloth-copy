@@ -103,7 +103,10 @@ def test_desktop_single_response_bytes_and_return_to_single(monkeypatch):
 
     monkeypatch.setattr(auth_routes, "create_access_token", access)
     monkeypatch.setattr(auth_routes, "create_refresh_token", lambda **kwargs: "refresh")
-    expected = b'{"access_token":"access","refresh_token":"refresh","token_type":"bearer","must_change_password":false}'
+    expected = (
+        b'{"access_token":"access","refresh_token":"refresh","token_type":"bearer",'
+        b'"must_change_password":false,"account_id":"owner"}'
+    )
     with client() as http:
         single = http.post("/api/auth/desktop-login", json = {"secret": raw})
         assert single.content == expected

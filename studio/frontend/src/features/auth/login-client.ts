@@ -19,6 +19,8 @@ export type TokenResponse = {
   access_token: string;
   refresh_token: string;
   must_change_password: boolean;
+  // Immutable identity of the signed-in account, absent only on an older backend.
+  account_id?: string | null;
 };
 
 // A hint lets multi-account documents hide Full access before React mounts. Legacy
