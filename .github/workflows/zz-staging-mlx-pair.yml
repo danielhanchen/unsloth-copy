@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# DISPOSABLE staging-only job. Does not ship upstream.
+#
+# Question it answers: does a fresh install on Apple Silicon leave a venv whose
+# transformers and tokenizers agree, i.e. one where the MLX training stack
+# actually imports?
+#
+# transformers enforces its tokenizers window at import time. install.sh's core
+# phase resolves with UV_OVERRIDE=overrides-darwin-arm64.txt, whose
+# `transformers>=5.5.0` has no upper bound and therefore REPLACES pyproject's
+# `<=5.5.0` cap, so it can land transformers 5.16.1 + tokenizers 0.23.2. Step 3b
+# of install_python_stack.py then installs extras-no-deps.txt with --no-deps,
+# which pins transformers back to 5.5.0 and leaves tokenizers where it was. Every
+# `import transformers` -- and so every `import mlx_lm` -- then raises, and Studio
+# settles chat-only with Train and Export off.
+#
+# UNSLOTH_DISABLE_MLX_AUTOREPAIR=1 is not a convenience here: the runtime
+# self-heal re-resolves mlx-lm under `--constraint transformers==<installed>` and
+# repairs the pair about 20s after first launch, which is exactly why this defect
+# reaches users as "Train was off until the update" and never as a CI failure.
+# Without the kill switch the job would measure the repair, not the installer.
+
+name: "Staging: MLX transformers/tokenizers pair"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: staging-mlx-pair-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UNSLOTH_DISABLE_MLX_AUTOREPAIR: '1'
+
+jobs:
+  replay:
+    name: "Replay the two install steps (macOS arm64)"
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Assert this really is Apple Silicon
+        run: |
+          set -euo pipefail
+          uname -sm
+          python -c "import platform, sys; m = platform.machine(); print('machine', m); sys.exit(0 if m == 'arm64' else 1)"
+
+      - name: Step 1 -- install.sh's core phase, verbatim
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/probe" --python 3.13
+          PY="$RUNNER_TEMP/probe/bin/python"
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          export UV_OVERRIDE="$PWD/studio/backend/requirements/single-env/overrides-darwin-arm64.txt"
+          uv pip install --python "$PY" \
+            --upgrade-package unsloth "unsloth>=2026.9.2" "unsloth-zoo>=2026.9.1"
+          "$PY" - <<'PROBE'
+          from importlib.metadata import PackageNotFoundError, version
+          for name in ("transformers", "tokenizers", "mlx", "mlx-lm", "mlx-vlm"):
+              try:
+                  print(f"after core phase: {name}=={version(name)}")
+              except PackageNotFoundError:
+                  print(f"after core phase: {name} MISSING")
+          PROBE
+
+      - name: Step 2 -- install_python_stack.py step 3b, verbatim
+        run: |
+          set -euo pipefail
+          uv pip install --python "$PY" --no-deps --no-cache-dir \
+            -r studio/backend/requirements/extras-no-deps.txt
+          "$PY" - <<'PROBE'
+          from importlib.metadata import PackageNotFoundError, version
+          for name in ("transformers", "tokenizers", "mlx", "mlx-lm", "mlx-vlm"):
+              try:
+                  print(f"after step 3b:     {name}=={version(name)}")
+              except PackageNotFoundError:
+                  print(f"after step 3b:     {name} MISSING")
+          PROBE
+
+      - name: The venv the installer would have left must be usable
+        run: |
+          set -euo pipefail
+          # --no-deps: the probe's own logger must not perturb the pair under test.
+          uv pip install --python "$PY" --no-deps structlog
+          bash .github/scripts/staging-assert-mlx-pair.sh "$PY"
+
+  real-install:
+    name: "install.sh --local end to end (macOS arm64)"
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert this really is Apple Silicon
+        run: |
+          set -euo pipefail
+          uname -sm
+          python3 -c "import platform, sys; m = platform.machine(); print('machine', m); sys.exit(0 if m == 'arm64' else 1)"
+
+      - name: Run the shipped installer
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          bash install.sh --local < /dev/null 2>&1 | tee logs/install.log
+
+      - name: The installed venv must be usable
+        run: |
+          set -euo pipefail
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::installer left no managed Python at $PY"; exit 1; }
+          bash .github/scripts/staging-assert-mlx-pair.sh "$PY"
+
+      - name: What the installer said about the MLX stack
+        if: always()
+        run: |
+          # Step 16 of install_python_stack.py prints this and never fails the
+          # install; the point is whether it named the blocker the job just hit.
+          grep -n -i "mlx" logs/install.log | tail -40 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: install-log
+          path: logs/install.log
+          if-no-files-found: warn
