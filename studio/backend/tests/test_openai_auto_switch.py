@@ -8059,7 +8059,7 @@ def test_a_fill_never_relabels_a_stored_gpu_pin_with_this_browser_s_index_space(
     import storage.studio_db as db
 
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
-    monkeypatch.setattr(db, "_schema_ready", False)
+    monkeypatch.setattr(db, "_schema_ready", set())
 
     key = "test_map_entry_coupled"
     coupled = (("gpu_ids", "gpu_index_kind"),)
