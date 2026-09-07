@@ -17,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from utils.account_context import current_account_id
 from storage.api_usage_db import (
     MAX_ENDPOINT_CHARS,
     MAX_STATUS_CHARS,
@@ -175,6 +176,12 @@ class ApiMonitorEntry:
     updated_at: float
     # Who this row is attributed to; on a shared row it does not restrict visibility.
     subject: Optional[str] = None
+    # The username in ``subject`` is reusable: deleting an account frees the name, and
+    # these rows outlive the account because they are in memory. The immutable account
+    # id is stamped here so a replacement that is handed the same username cannot read,
+    # count, or clear its predecessor's traffic. Owner rows all carry the owner's id, so
+    # a one-account install compares exactly as before.
+    account_id: str = field(default_factory = current_account_id)
     # True for sk-unsloth callers only: the panel auto-opens on these, not Unsloth's chat.
     via_api_key: bool = False
     # Monotonic anchors so duration math survives wall-clock steps (NTP).
@@ -307,7 +314,9 @@ class ApiMonitor:
     ):
         self._entries: deque[ApiMonitorEntry] = deque()
         # Shared rows one subject cleared: deleting would erase another caller's history.
-        self._hidden_shared: dict[str, set[str]] = {}
+        # Keyed by (account id, subject): a reusable username alone would carry one
+        # account's dismissals over to its replacement.
+        self._hidden_shared: dict[tuple[str, str], set[str]] = {}
         self._max_entries = max(0, max_entries)
         self._lock = threading.Lock()
         self._callback_condition = threading.Condition(self._lock)
@@ -958,7 +967,7 @@ class ApiMonitor:
                 for entry in self._entries
                 if entry.status == "running"
                 and entry.kind != "lifecycle"
-                and (subject is None or entry.subject == subject)
+                and self._attributed(entry, subject)
             )
 
     def clear(self, *, subject: Optional[str] = None) -> None:
@@ -974,7 +983,7 @@ class ApiMonitor:
                 self._hidden_shared.clear()
                 return
             # A running shared row is a load in progress, not history, so it stays.
-            hidden = self._hidden_shared.setdefault(subject, set())
+            hidden = self._hidden_shared.setdefault((current_account_id(), subject), set())
             for entry in self._entries:
                 if entry.shared and entry.status != "running":
                     hidden.add(entry.id)
@@ -984,7 +993,9 @@ class ApiMonitor:
             self._entries = deque(
                 entry
                 for entry in self._entries
-                if entry.shared or entry.subject != subject or entry.status == "running"
+                if entry.shared
+                or not self._attributed(entry, subject)
+                or entry.status == "running"
             )
 
     def _visible(self, entry: ApiMonitorEntry, subject: Optional[str]) -> bool:
@@ -992,13 +1003,13 @@ class ApiMonitor:
             return True
         if entry.shared:
             # Every subject minus the cleared ones. Before ownership, so a clear hides own rows.
-            if entry.id in self._hidden_shared.get(subject, ()):
+            if entry.id in self._hidden_shared.get((current_account_id(), subject), ()):
                 return False
             # A load row names the model, and for a trained model that is a path
             # inside the loading account's workspace. Another managed account
             # gets no row; the owner and the loading account keep it.
             return _lifecycle_row_visible_to_caller(entry, subject)
-        return entry.subject == subject
+        return entry.subject == subject and entry.account_id == current_account_id()
 
     def _attributed(self, entry: ApiMonitorEntry, subject: Optional[str]) -> bool:
         """Whether *subject* is the caller this row's API traffic belongs to.
@@ -1008,7 +1019,7 @@ class ApiMonitor:
         """
         if subject is None:
             return True
-        return entry.subject == subject
+        return entry.subject == subject and entry.account_id == current_account_id()
 
     def _find_locked(self, entry_id: str) -> Optional[ApiMonitorEntry]:
         for entry in self._entries:
@@ -1029,10 +1040,10 @@ class ApiMonitor:
         self._entries = kept
         # Keep hidden sets to live rows so they stay bounded by the ring buffer.
         live = {entry.id for entry in kept}
-        for subject, hidden in list(self._hidden_shared.items()):
+        for key, hidden in list(self._hidden_shared.items()):
             hidden &= live
             if not hidden:
-                del self._hidden_shared[subject]
+                del self._hidden_shared[key]
 
 
 api_monitor = ApiMonitor(enabled = not _api_monitor_disabled())
@@ -1043,7 +1054,9 @@ def _lifecycle_row_visible_to_caller(entry: "ApiMonitorEntry", subject: str) -> 
     trained model that is a path inside the loading account's workspace. The owner
     and the account that loaded it see the row; another managed account does not.
     With one account nothing is hidden."""
-    if entry.kind != "lifecycle" or entry.subject in (None, subject):
+    if entry.kind != "lifecycle" or entry.subject is None:
+        return True
+    if entry.subject == subject and entry.account_id == current_account_id():
         return True
     from utils.account_context import is_owner_context
 

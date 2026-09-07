@@ -139,7 +139,10 @@ def test_monitor_hides_a_foreign_load_row_from_managed_accounts():
     monitor = (
         api_monitor.ApiMonitor() if hasattr(api_monitor, "ApiMonitor") else api_monitor.api_monitor
     )
-    entry = api_monitor.ApiMonitorEntry(
+    # Built inside Alice's context, as the request path that records it is.
+    entry = run_as(
+        ALICE,
+        api_monitor.ApiMonitorEntry,
         id = "load-1",
         endpoint = "",
         method = "",
@@ -167,6 +170,59 @@ def test_monitor_hides_a_foreign_load_row_from_managed_accounts():
         assert run_as(BOB, monitor._visible, entry, "bob")
     finally:
         policy.installation_is_multi_user = monkeypatch_single
+
+
+def test_a_recreated_username_cannot_read_the_previous_accounts_monitor_rows():
+    """Deleting an account frees its username, and the monitor lives in memory, so its
+    rows outlive the account. Attribution is by immutable account id: a replacement
+    handed the same username must not read, count, or clear the predecessor's traffic."""
+    old_alice = AccountContext("alice-first-id", "alice")
+    new_alice = AccountContext("alice-second-id", "alice")
+    monitor = api_monitor.ApiMonitor()
+
+    request_id = run_as(
+        old_alice,
+        lambda: monitor.start(
+            endpoint = "/v1/chat/completions",
+            method = "POST",
+            model = "org/Repo",
+            prompt = "ALICE-PRIVATE-PROMPT",
+            subject = "alice",
+        ),
+    )
+    run_as(old_alice, monitor.record_lifecycle, event = "load", model = "/alice/secret.gguf",
+           subject = "alice")
+
+    assert run_as(new_alice, monitor.get, request_id, subject = "alice") is None
+    assert run_as(new_alice, monitor.snapshot, subject = "alice") == []
+    assert run_as(new_alice, monitor.active_count, subject = "alice") == 0
+    run_as(new_alice, monitor.clear, subject = "alice")
+    assert len(monitor._entries) == 2
+
+    # The account that made them still sees and counts them, and can clear them.
+    assert run_as(old_alice, monitor.get, request_id, subject = "alice") is not None
+    assert run_as(old_alice, monitor.active_count, subject = "alice") == 1
+    assert len(run_as(old_alice, monitor.snapshot, subject = "alice")) == 2
+    run_as(old_alice, monitor.clear, subject = "alice")
+    assert run_as(old_alice, monitor.get, request_id, subject = "alice") is not None  # still running
+
+
+def test_one_account_installs_keep_every_monitor_row(monkeypatch):
+    """The owner's id is constant, so a single-account install compares as before."""
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
+    monitor = api_monitor.ApiMonitor()
+    request_id = monitor.start(
+        endpoint = "/v1/chat/completions",
+        method = "POST",
+        model = "org/Repo",
+        prompt = "hello",
+        subject = "unsloth",
+    )
+    monitor.finish(request_id)
+    assert monitor.get(request_id, subject = "unsloth") is not None
+    assert len(monitor.snapshot(subject = "unsloth")) == 1
+    monitor.clear(subject = "unsloth")
+    assert monitor.snapshot(subject = "unsloth") == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason = "symlinks need privileges on Windows")
