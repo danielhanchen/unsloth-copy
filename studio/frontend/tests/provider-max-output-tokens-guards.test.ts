@@ -26,6 +26,9 @@ const {
   EXTERNAL_MAX_OUTPUT_TOKENS,
   getExternalMaxOutputTokens,
   getExternalMinOutputTokens,
+  externalMaxOutputTokensNeedsConnectionCap,
+  getGroundedExternalMaxOutputTokens,
+  getPublishedExternalMaxOutputTokens,
   resolveExternalMaxTokensClamp,
 } = await import("../src/features/chat/provider-capabilities.ts");
 
@@ -258,5 +261,80 @@ test("every clamp site waits for a resolved provider", () => {
   assert.match(
     store,
     /if \(provider\) \{\s*const cap = getExternalMaxOutputTokens\(\s*provider\.providerType/,
+  );
+});
+
+
+test("a grounded ceiling is only sent when something documents or overrides it", () => {
+  // Nothing documents a self-hosted model, and the generic 32768 fallback is a guess: a
+  // 32k-context server has to fit the prompt in the same window, so asking for it fails.
+  assert.equal(getExternalMaxOutputTokens("custom", "some-self-hosted-model", null), 32768);
+  assert.equal(
+    getGroundedExternalMaxOutputTokens("custom", "some-self-hosted-model", null),
+    null,
+  );
+
+  // The user's own connection override grounds it.
+  assert.equal(
+    getGroundedExternalMaxOutputTokens("custom", "some-self-hosted-model", 20000),
+    20000,
+  );
+
+  // So does a published per-model cap.
+  assert.equal(
+    getGroundedExternalMaxOutputTokens("gemini", "gemini-3.6-flash", null),
+    getExternalMaxOutputTokens("gemini", "gemini-3.6-flash", null),
+  );
+});
+
+test("an openrouter model is not grounded by the direct provider's published cap", () => {
+  // The id resolves through the direct provider's table, and a router endpoint is not that
+  // provider: OpenRouter serves deepseek at a fraction of the direct API's ceiling. Fine as
+  // a slider maximum, wrong as a budget sent unattended.
+  assert.equal(
+    getExternalMaxOutputTokens("openrouter", "deepseek/deepseek-r1-0528", null),
+    384000,
+  );
+  assert.equal(
+    getGroundedExternalMaxOutputTokens("openrouter", "deepseek/deepseek-r1-0528", null),
+    null,
+  );
+
+  // The user's own override still grounds a router connection.
+  assert.equal(
+    getGroundedExternalMaxOutputTokens("openrouter", "deepseek/deepseek-r1-0528", 32000),
+    32000,
+  );
+});
+
+test("the grounding of a ceiling is reported alongside it", () => {
+  // Nothing documents a self-hosted id, so only the connection's own cap can ground it, and
+  // a durable run has to be told that: clearing the cap leaves the number standing on nothing.
+  assert.equal(
+    externalMaxOutputTokensNeedsConnectionCap("custom", "some-self-hosted-model"),
+    true,
+  );
+  // A router id resolves through the direct provider's table, which does not describe the
+  // endpoint, so it counts as undocumented here too.
+  assert.equal(
+    externalMaxOutputTokensNeedsConnectionCap("openrouter", "deepseek/deepseek-r1-0528"),
+    true,
+  );
+  // A published cap keeps standing on its own after the override goes.
+  assert.equal(externalMaxOutputTokensNeedsConnectionCap("gemini", "gemini-3.6-flash"), false);
+});
+
+test("the published ceiling is reported without the override folded in", () => {
+  // The number the report floor turns on: a 65536 model on a connection capped at 8192 must
+  // stay distinguishable from a model that genuinely stops at 8192.
+  assert.equal(getPublishedExternalMaxOutputTokens("gemini", "gemini-3.6-flash"), 65536);
+  assert.equal(
+    getExternalMaxOutputTokens("gemini", "gemini-3.6-flash", 8192),
+    8192,
+  );
+  assert.equal(getPublishedExternalMaxOutputTokens("custom", "some-self-hosted-model"), null);
+  assert.equal(
+    getPublishedExternalMaxOutputTokens("openrouter", "deepseek/deepseek-r1-0528"),
+    null,
   );
 });

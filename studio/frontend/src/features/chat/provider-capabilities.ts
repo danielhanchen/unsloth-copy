@@ -165,8 +165,75 @@ export function getExternalMaxOutputTokens(
   return Math.max(resolved, getExternalMinOutputTokens(providerType));
 }
 
-/** The published per-model cap, or null when nothing documents this id. Generic Custom
- *  connections always read undocumented. OpenRouter `provider/model` prefixes are stripped. */
+/**
+ * The ceiling only when something actually grounds it: a published per-model cap, or the
+ * user's own connection override. Null otherwise.
+ *
+ * `getExternalMaxOutputTokens` falls back to `EXTERNAL_MAX_OUTPUT_TOKENS` for a model nothing
+ * documents, which is fine for a slider the user can see and lower, but it is a guess to send
+ * as a request budget: a self-hosted 32k-context server has to fit the prompt in that same
+ * window, so asking it for 32768 output tokens fails the call outright.
+ */
+export function getGroundedExternalMaxOutputTokens(
+  providerType: string | null | undefined,
+  modelId: string | null | undefined,
+  connectionMaxOutputTokens?: number | null,
+): number | null {
+  const override = normalizeProviderMaxOutputTokens(connectionMaxOutputTokens);
+  if (override == null && _publishedMaxOutputTokens(providerType, modelId) == null) return null;
+  return getExternalMaxOutputTokens(providerType, modelId, connectionMaxOutputTokens);
+}
+
+/**
+ * True when the connection's own override is the ONLY thing that can ground this model's
+ * ceiling, so clearing that override leaves nothing behind it.
+ *
+ * A durable research run carries the ceiling it was created with. The backend can tell that
+ * the saved cap is gone, but not whether anything else was holding the number up, so it is
+ * told here.
+ */
+export function externalMaxOutputTokensNeedsConnectionCap(
+  providerType: string | null | undefined,
+  modelId: string | null | undefined,
+): boolean {
+  return _publishedMaxOutputTokens(providerType, modelId) == null;
+}
+
+/**
+ * The model's own published output limit, before any connection override is folded in.
+ *
+ * `getGroundedExternalMaxOutputTokens` returns the override-folded number, which is the right
+ * thing to spend but the wrong thing to reason about: it cannot tell a model that genuinely
+ * stops at 8192 from a 65536 model on a connection the user capped at 8192. Deep Research
+ * needs the difference, because the first may lower its report budget and the second may not.
+ */
+export function getPublishedExternalMaxOutputTokens(
+  providerType: string | null | undefined,
+  modelId: string | null | undefined,
+): number | null {
+  return _publishedMaxOutputTokens(providerType, modelId);
+}
+
+/**
+ * `_documentedMaxOutputTokens`, minus the entries that do not survive being sent unattended.
+ *
+ * An OpenRouter id resolves through the direct provider's table, and a router endpoint is not
+ * that provider: `deepseek/deepseek-r1` reads as the direct API's 384000 while the router
+ * serves it at a fraction of that. Good enough for a slider maximum, not for a request budget.
+ */
+function _publishedMaxOutputTokens(
+  providerType: string | null | undefined,
+  modelId: string | null | undefined,
+): number | null {
+  if (providerType === "openrouter") return null;
+  return _documentedMaxOutputTokens(providerType, modelId);
+}
+
+/**
+ * The published per-model cap, or null when nothing documents this id. No table entry
+ * targets a generic Custom connection, so those always read as undocumented. OpenRouter
+ * `provider/model` ids have the prefix stripped before matching.
+ */
 function _documentedMaxOutputTokens(
   providerType: string | null | undefined,
   modelId: string | null | undefined,
