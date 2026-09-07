@@ -2700,8 +2700,12 @@ def _resolve_diffusion_data_dir(raw: str) -> Path:
     dataset (preflight 400 "not a directory", or training the wrong data). Prefer the
     image dataset root for a bare single-component name that exists there; everything
     else (explicit "uploads/..." / "recipes/..." prefixes, absolute paths, missing
-    names) resolves exactly as before."""
-    account_path(raw)
+    names) resolves exactly as before.
+
+    The account check runs on the RESOLVED directory, not on ``raw``: the UI sends the
+    bare folder name, and validating that spelling would resolve it against the server
+    process's working directory rather than the account's datasets root, refusing a
+    managed account its own upload."""
     from utils.paths import datasets_root
 
     value = str(raw or "").strip()
@@ -2713,8 +2717,12 @@ def _resolve_diffusion_data_dir(raw: str) -> Path:
             # Route a bare name through the same protected resolver the CRUD routes use, so a symlink to an external
             # directory is rejected here too. A broken symlink is included so it is rejected, not passed on.
             if direct.is_dir() or direct.is_symlink():
-                return _resolve_dataset_folder(value)
-    return resolve_dataset_path(raw)
+                resolved = _resolve_dataset_folder(value)
+                account_path(resolved)
+                return resolved
+    resolved = resolve_dataset_path(raw)
+    account_path(resolved)
+    return resolved
 
 
 def _preflight_diffusion_resume(

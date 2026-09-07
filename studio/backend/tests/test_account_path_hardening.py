@@ -10,6 +10,7 @@ import os
 import sys
 
 import pytest
+from fastapi import HTTPException
 
 from auth import policy
 from core.inference import api_monitor
@@ -114,6 +115,24 @@ def test_scan_folder_storage_refuses_a_foreign_directory(monkeypatch):
     )
     with pytest.raises(ValueError, match = "outside this account's workspace"):
         run_as(BOB, scan_folders.add_scan_folder_with_status, str(foreign))
+
+
+def test_image_training_dataset_name_resolves_before_the_account_check():
+    """The Images panel posts the bare folder name, so the account guard has to run on
+    the resolved directory. Validating the raw spelling resolved it against the server
+    process's working directory and refused a managed account its own upload."""
+    from routes import training
+
+    for account in (OWNER, ALICE):
+        root = run_as(account, storage_roots.datasets_root)
+        (root / "my-images").mkdir(parents = True, exist_ok = True)
+        assert run_as(account, training._resolve_diffusion_data_dir, "my-images") == (
+            root / "my-images"
+        )
+    # A foreign absolute path is still refused, and so is one that escapes by link.
+    foreign = run_as(ALICE, storage_roots.datasets_root) / "my-images"
+    with pytest.raises((HTTPException, ValueError)):
+        run_as(BOB, training._resolve_diffusion_data_dir, str(foreign))
 
 
 def test_monitor_hides_a_foreign_load_row_from_managed_accounts():
