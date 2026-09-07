@@ -212,8 +212,15 @@ def acquire_for(
                 raise GpuBusyForAnotherAccountError(_owner, busy)
             logger.info("gpu_arbiter: evicting %s for %s", _owner, owner)
             _EVICTORS[_owner]()
+        # ``_owner_account`` records who LOADED what is resident, so a plain
+        # reassertion of an owner that is already held must not rewrite it. The
+        # already-loaded fast paths in routes/inference.py re-assert CHAT with
+        # neither a register callback nor ``replacing``; overwriting here handed the
+        # resident model to whoever asked for it last and left the account that
+        # loaded it hidden from its own model.
+        if _owner != owner or register is not None or replacing:
+            _owner_account = acting
         _owner = owner
-        _owner_account = acting
         _owner_epoch += 1
         return register() if register is not None else None
 

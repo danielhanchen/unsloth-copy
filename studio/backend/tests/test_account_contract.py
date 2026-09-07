@@ -328,6 +328,42 @@ def test_a_load_never_evicts_another_accounts_active_generation(monkeypatch):
     ag.reset_for_tests()
 
 
+def test_reusing_a_resident_model_leaves_the_loader_in_control(monkeypatch):
+    """The already-loaded fast paths re-assert CHAT with no register callback and no
+    ``replacing``. That is a claim on the GPU, not a load, so it must not rewrite the
+    account that loaded what is resident: doing so hid the loader from its own model."""
+    from auth import policy
+    from core.inference import gpu_arbiter as arb
+    from hub.services.models import account_access as access
+    from state import active_generations as ag
+
+    ag.reset_for_tests()
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: True)
+    monkeypatch.setitem(arb._EVICTORS, arb.CHAT, lambda: None)
+    monkeypatch.setitem(arb._EVICTORS, arb.DIFFUSION, lambda: None)
+    arb.release(arb.CHAT)
+    arb.release(arb.DIFFUSION)
+
+    assert run_as(ALICE, arb.acquire_for, arb.CHAT, lambda: "loaded") == "loaded"
+    assert arb.owner_account() == ALICE.account_id
+
+    run_as(BOB, arb.acquire_for_request, arb.CHAT)
+    assert arb.owner_account() == ALICE.account_id
+    assert not run_as(ALICE, access.resident_hidden, "chat")
+
+    # A real load, and a load without a callback, still transfer the identity.
+    run_as(BOB, arb.acquire_for, arb.CHAT, lambda: None)
+    assert arb.owner_account() == BOB.account_id
+    run_as(ALICE, arb.acquire_for, arb.CHAT, replacing = True)
+    assert arb.owner_account() == ALICE.account_id
+    # So does taking the GPU from another owner.
+    run_as(BOB, arb.acquire_for, arb.DIFFUSION)
+    assert arb.owner_account() == BOB.account_id
+
+    arb.release(arb.DIFFUSION)
+    ag.reset_for_tests()
+
+
 def test_the_owner_alone_behaves_exactly_as_before(monkeypatch):
     """Single-user install: every generation and every lease is the owner's, so
     nothing here can ever refuse."""
