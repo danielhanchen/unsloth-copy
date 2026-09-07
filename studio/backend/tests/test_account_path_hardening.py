@@ -105,16 +105,28 @@ def test_managed_export_write_dir_stays_inside_its_roots():
     assert run_as(OWNER, storage_roots.resolve_export_write_dir, str(foreign)) == foreign
 
 
-def test_scan_folder_storage_refuses_a_foreign_directory(monkeypatch):
+@pytest.mark.parametrize("module_name", ["hub.storage.scan_folders", "storage.studio_db"])
+def test_scan_folder_storage_refuses_a_foreign_directory(monkeypatch, module_name):
+    """Both scan-folder storage helpers carry the guard: a registered folder joins the
+    browse allowlist and the local model index, so it must be the acting account's own."""
+    import importlib
+
+    module = importlib.import_module(module_name)
     foreign = run_as(ALICE, storage_roots.outputs_root)
-    foreign.mkdir(parents = True)
+    foreign.mkdir(parents = True, exist_ok = True)
+    own = run_as(BOB, storage_roots.outputs_root)
+    own.mkdir(parents = True, exist_ok = True)
+    # The owner may still register anything, and an account registers its own.
+    assert run_as(OWNER, module.add_scan_folder_with_status, str(foreign))[1]
+    assert run_as(BOB, module.add_scan_folder_with_status, str(own))[1]
+    # A foreign directory is refused before the database is opened.
     monkeypatch.setattr(
-        scan_folders,
+        module,
         "get_connection",
         lambda: (_ for _ in ()).throw(AssertionError("opened the database")),
     )
     with pytest.raises(ValueError, match = "outside this account's workspace"):
-        run_as(BOB, scan_folders.add_scan_folder_with_status, str(foreign))
+        run_as(BOB, module.add_scan_folder_with_status, str(foreign))
 
 
 def test_image_training_dataset_name_resolves_before_the_account_check():

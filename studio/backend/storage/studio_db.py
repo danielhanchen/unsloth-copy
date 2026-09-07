@@ -1837,6 +1837,13 @@ def add_scan_folder_with_status(path: str) -> tuple[dict, bool]:
         raise ValueError("The filesystem root cannot be registered")
     if _contains_sensitive_path_component(normalized):
         raise ValueError("Credential or configuration directories are not allowed")
+    # A registered folder joins the browse allowlist and the local model index, so it has
+    # to be the acting account's own. Mirrors hub/storage/scan_folders.py; always true for
+    # the owner, whose roots are the whole install.
+    from utils.paths.storage_roots import within_account
+
+    if not within_account(Path(normalized)):
+        raise ValueError("Path is outside this account's workspace")
 
     # Windows: normcase for the denylist check but store original casing (e.g. C:\Models).
     is_win = platform.system() == "Windows"
