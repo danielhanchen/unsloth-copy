@@ -193,6 +193,8 @@ _CLAUDE_ENV_UNSET = (
     "CLAUDE_CODE_USE_MANTLE",
 )
 _CODEX_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
+# OpenClaw tries CODEX_API_KEY first, so dropping only OPENAI_API_KEY still embeds via OpenAI.
+_OPENCLAW_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
 # Shared by every agent command; only the config/env/command differ.
 # Help is grouped into rich panels so `--help` reads as Model / Server / Session
@@ -4714,6 +4716,8 @@ def write_openclaw_config(
         search.update({"provider": "none", "fallback": "none"})
         search.pop("model", None)
         search.pop("remote", None)
+    # ORed with OPENCLAW_LOAD_SHELL_ENV: a persisted true re-enables the login-shell key import.
+    _subdict(_subdict(config, "env"), "shellEnv")["enabled"] = False
     # Pin a default model, else OpenClaw drops into its setup agent ("no models available").
     agents = _subdict(config, "agents")
     defaults = _subdict(agents, "defaults")
@@ -5319,7 +5323,15 @@ def codex(
     with _session_config("codex", launch, persist = persist) as home:
         write_codex_config(base, entry, home)
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
-        _run(base, entry, env, command, launch = launch, install_hint = install_hint)
+        _run(
+            base,
+            entry,
+            env,
+            command,
+            launch = launch,
+            install_hint = install_hint,
+            unset_env = _CODEX_ENV_UNSET,
+        )
 
 
 @start_app.command("openclaw", cls = _PassthroughCommand, context_settings = _PASSTHROUGH)
@@ -5406,7 +5418,12 @@ def openclaw(
             embedding_model = _studio_embedding_model(base, key),
         )
         # Scope both config and state so OpenClaw never touches the user's ~/.openclaw.
-        env = {"OPENCLAW_CONFIG_PATH": str(config_path), "OPENCLAW_STATE_DIR": str(cfg)}
+        # Off, else OpenClaw re-imports any provider key it cannot see from a login shell.
+        env = {
+            "OPENCLAW_CONFIG_PATH": str(config_path),
+            "OPENCLAW_STATE_DIR": str(cfg),
+            "OPENCLAW_LOAD_SHELL_ENV": "0",
+        }
         _run(
             base,
             entry,
@@ -5414,6 +5431,7 @@ def openclaw(
             command,
             launch = launch,
             install_hint = install_hint,
+            unset_env = _OPENCLAW_ENV_UNSET,
             cwd_env = ("OPENCLAW_WORKSPACE_DIR",),
         )
 
