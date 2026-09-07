@@ -993,9 +993,7 @@ class ApiMonitor:
             self._entries = deque(
                 entry
                 for entry in self._entries
-                if entry.shared
-                or not self._attributed(entry, subject)
-                or entry.status == "running"
+                if entry.shared or not self._attributed(entry, subject) or entry.status == "running"
             )
 
     def _visible(self, entry: ApiMonitorEntry, subject: Optional[str]) -> bool:

@@ -79,7 +79,6 @@ def test_managed_recipe_mcp_is_refused_where_chat_mcp_refuses(endpoint):
 
 def test_owner_recipe_mcp_is_unchanged():
     from core.data_recipe.service import build_mcp_providers
-
     built = run_as(OWNER, build_mcp_providers, _recipe(_PRIVATE_ENDPOINTS[0]))
     assert [provider.endpoint for provider in built] == [_PRIVATE_ENDPOINTS[0]]
 

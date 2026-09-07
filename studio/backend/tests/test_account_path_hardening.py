@@ -202,8 +202,13 @@ def test_a_recreated_username_cannot_read_the_previous_accounts_monitor_rows():
             subject = "alice",
         ),
     )
-    run_as(old_alice, monitor.record_lifecycle, event = "load", model = "/alice/secret.gguf",
-           subject = "alice")
+    run_as(
+        old_alice,
+        monitor.record_lifecycle,
+        event = "load",
+        model = "/alice/secret.gguf",
+        subject = "alice",
+    )
 
     assert run_as(new_alice, monitor.get, request_id, subject = "alice") is None
     assert run_as(new_alice, monitor.snapshot, subject = "alice") == []

@@ -659,7 +659,6 @@ async def list_cached_datasets_response() -> dict:
         rows = await asyncio.to_thread(_scan_hf_dataset_caches)
         if managed_account():
             from hub.services.models import account_access
-
             rows = await asyncio.to_thread(
                 account_access.filter_model_rows, rows, repo_type = "dataset"
             )

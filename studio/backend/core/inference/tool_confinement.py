@@ -164,7 +164,6 @@ def _readable_account_roots() -> list[str]:
     grants and every directory the server itself manages live here, and a
     tool that could rewrite them could grant itself what the owner did not."""
     from utils.paths.storage_roots import workspace_root
-
     return _ensure_dirs((workspace_root(),))
 
 
@@ -183,7 +182,6 @@ def _protected_roots() -> list[str]:
     under /opt, /var/lib or the interpreter prefix would otherwise be readable
     through the grant for that ancestor."""
     from utils.paths.storage_roots import studio_root
-
     return _existing((studio_root(),))
 
 
@@ -191,7 +189,9 @@ def _contains(ancestor: str, path: str) -> bool:
     return path == ancestor or path.startswith(ancestor.rstrip(os.sep) + os.sep)
 
 
-def _grant_excluding(path: str, access: int, protected: list[str], rules: list[tuple[str, int]]) -> None:
+def _grant_excluding(
+    path: str, access: int, protected: list[str], rules: list[tuple[str, int]]
+) -> None:
     """Grant ``access`` beneath ``path`` except for the protected roots.
 
     Landlock has no deny rule, so an ancestor of a protected root is granted

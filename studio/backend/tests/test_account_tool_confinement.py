@@ -102,7 +102,9 @@ def test_macos_profile_hides_install_root_then_allows_own_roots(tmp_path, monkey
     deny = profile.index(f'(deny file-read* file-write* (subpath "{studio}"))')
     allow = profile.index(f'(allow file-read* (subpath "{alice_root}"))')
     writable = profile.index(f'(allow file-read* file-write* (subpath "{alice_root}/sandbox"))')
-    assert deny < allow < writable, "the account roots must be allowed after the install root is denied"
+    assert (
+        deny < allow < writable
+    ), "the account roots must be allowed after the install root is denied"
     assert argv[3:] == ["bash", "-c", "true"]
 
 
@@ -229,7 +231,9 @@ def test_landlock_rules_cover_own_roots_only(tmp_path):
     assert alice_root not in writable
     assert f"{alice_root}/sandbox" in writable
     assert str((tmp_path / "projects" / "Accounts" / "alice-id" / "Projects").resolve()) in writable
-    assert alice_root in [p for p, access in rules if access != handled & ~tool_confinement._FS_MAKE_SYM]
+    assert alice_root in [
+        p for p, access in rules if access != handled & ~tool_confinement._FS_MAKE_SYM
+    ]
     assert str((tmp_path / "studio").resolve()) not in [p for p, _ in rules]
     assert all(
         not p.startswith(str((tmp_path / "studio").resolve()) + os.sep) or p.startswith(alice_root)
@@ -319,7 +323,6 @@ def test_managed_child_writes_only_its_sandbox_and_projects(tmp_path):
 
 def storage_roots_workspace():
     from utils.paths.storage_roots import workspace_root
-
     return workspace_root()
 
 
@@ -346,7 +349,6 @@ def test_install_under_a_granted_root_stays_hidden(tmp_path, monkeypatch):
         assert all(not tool_confinement._contains(p, str(home.resolve())) for p, _ in rules)
     finally:
         import shutil
-
         shutil.rmtree(home, ignore_errors = True)
 
 
