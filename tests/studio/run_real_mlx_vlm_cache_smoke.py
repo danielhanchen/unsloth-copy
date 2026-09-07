@@ -140,10 +140,55 @@ class Observer:
         return traced
 
 
+def session_probe(backend):
+    """Record what each request's session decided, so a turn that reuses nothing says why.
+
+    ``cached_tokens`` alone cannot distinguish "the store was empty", "the boundary fell
+    inside the image" and "mlx-vlm declined what it was offered". Wrapping the factory is
+    the only way to see the session object a request builds; nothing else keeps it.
+    """
+    from core.inference.mlx_inference import MLXInferenceBackend
+
+    real = MLXInferenceBackend._vlm_prompt_cache_session
+    seen = {}
+
+    def wrapper(self, adapter_state, images, prompt):
+        session = real(self, adapter_state, images, prompt)
+        seen["session"] = session
+        seen["store_entries_before"] = len(self._vlm_snapshot_store or ())
+        if session is not None:
+            inner = session.find_prefix_length
+
+            def traced(token_ids):
+                from core.inference.mlx_inference import shape_stable_prefix
+                ids = list(token_ids)
+                before = len(self._vlm_snapshot_store or ())
+                length = inner(ids)
+                seen.update(
+                    prompt_tokens = len(ids),
+                    origin = session._origin,
+                    boundary = shape_stable_prefix(len(ids), session._origin),
+                    media_end = session._media_end,
+                    served = length,
+                    store_entries_at_lookup = before,
+                    capture_at = session._forward.record.capture_at,
+                )
+                return length
+
+            session.find_prefix_length = traced
+        return session
+
+    MLXInferenceBackend._vlm_prompt_cache_session = wrapper
+    return seen, lambda: setattr(
+        MLXInferenceBackend, "_vlm_prompt_cache_session", real,
+    )
+
+
 def run_turn(backend, observer, messages, image, max_new_tokens):
     import mlx_vlm
 
     observer.reset()
+    probe, restore = session_probe(backend)
     # ``_generate_vlm`` does `from mlx_vlm import stream_generate` at call time, so
     # rebinding the attribute here is what the request will pick up.
     real = mlx_vlm.stream_generate
@@ -167,6 +212,7 @@ def run_turn(backend, observer, messages, image, max_new_tokens):
             text = snapshot          # cumulative snapshots, not deltas
     finally:
         mlx_vlm.stream_generate = real
+        restore()
     elapsed = time.perf_counter() - started
 
     stats = copy.deepcopy(backend.last_generation_stats or {})
@@ -181,6 +227,7 @@ def run_turn(backend, observer, messages, image, max_new_tokens):
         "prefill_step": observer.prefill_step,
         "had_session": observer.had_session,
         "seconds": round(elapsed, 3),
+        "session": {k: v for k, v in probe.items() if k != "session"},
     }
 
 
@@ -227,11 +274,15 @@ def compare(name, warm, cold, allow_no_reuse):
     """Every warm turn must match its cold twin exactly, and reuse must have happened."""
     problems = []
     for index, (w, c) in enumerate(zip(warm, cold), start = 1):
+        s = w.get("session") or {}
         log(
             f"  turn {index}: warm cached={w['cached_tokens']:>5} prompt={w['prompt_tokens']:>5} "
             f"{w['seconds']:>6}s | cold cached={c['cached_tokens']:>5} "
             f"prompt={c['prompt_tokens']:>5} {c['seconds']:>6}s | "
             f"{'MATCH' if w['ids'] == c['ids'] else 'DIVERGED'}"
+            f" | store={s.get('store_entries_at_lookup')} served={s.get('served')}"
+            f" boundary={s.get('boundary')} media_end={s.get('media_end')}"
+            f" origin={s.get('origin')} capture_at={s.get('capture_at')}"
         )
         if w["ids"] != c["ids"]:
             first = next(
@@ -251,10 +302,16 @@ def compare(name, warm, cold, allow_no_reuse):
             )
     reused = sum(1 for w in warm[1:] if w["cached_tokens"] > 0)
     log(f"  {name}: {reused}/{max(len(warm) - 1, 0)} later warm turns reused a prefix")
-    if not reused and not allow_no_reuse:
-        problems.append(
-            f"{name}: no warm turn reused anything, so token equality proves nothing"
-        )
+    if not reused:
+        # Token equality with nothing reused says only that the fallback path is intact.
+        # Gating on it for the text lane, where reuse is expected from turn 2; reporting it
+        # for the image lane, where when reuse starts depends on the model and the prompt
+        # shape, so a shortfall is a benefit question rather than a broken invariant.
+        message = f"{name}: no warm turn reused anything, so token equality proves nothing"
+        if allow_no_reuse:
+            log(f"  NOTE: {message}")
+        else:
+            problems.append(message)
     return problems
 
 
@@ -307,7 +364,7 @@ def main():
         cold_i = series(backend, observer, args.turns, image, args.max_new_tokens, cold = True)
         # An image chat on a causal model only reaches a boundary past the image after a
         # few turns, so reuse is reported rather than required.
-        problems += compare("image", warm_i, cold_i, allow_no_reuse = args.allow_no_reuse)
+        problems += compare("image", warm_i, cold_i, allow_no_reuse = True)
         report["lanes"]["image"] = {"warm": warm_i, "cold": cold_i}
 
     report["problems"] = problems
@@ -324,4 +381,10 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    code = main()
+    # mlx tears its Metal allocator down at interpreter exit and segfaults on this runner
+    # AFTER the report is written, which turns a clean verdict into exit 139. The verdict
+    # above is the whole result, so leave on it rather than on the teardown.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
