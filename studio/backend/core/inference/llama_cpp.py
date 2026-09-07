@@ -6175,6 +6175,23 @@ def _metal_capable_host() -> bool:
         return sys.platform == "darwin"
 
 
+def _write_direct_stream_key(key: str) -> "Path":
+    """Store the direct-streaming key where only the server user can read it."""
+    from utils.paths.storage_roots import auth_root
+
+    directory = auth_root()
+    directory.mkdir(parents = True, exist_ok = True)
+    path = directory / "llama_api_key"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding = "utf-8") as handle:
+        handle.write(key)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 class LlamaCppBackend:
     """Manages a llama-server subprocess for GGUF model inference.
 
@@ -22288,8 +22305,11 @@ class LlamaCppBackend:
 
                 if os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
                     self._api_key = _secrets.token_urlsafe(32)
-                    cmd.extend(["--api-key", self._api_key])
-                    logger.info("llama-server started with --api-key for direct streaming")
+                    # Through a file rather than argv: a command line is readable by
+                    # every process of this Unix user, including a managed account's
+                    # confined tool, and the auth directory is not.
+                    cmd.extend(["--api-key-file", str(_write_direct_stream_key(self._api_key))])
+                    logger.info("llama-server started with --api-key-file for direct streaming")
                 else:
                     self._api_key = None
 
