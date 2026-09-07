@@ -1,0 +1,63 @@
+name: "PR-10262 non-modal menus ubuntu-latest"
+on:
+  push:
+    branches: [pr-10262-nonmodal-crossos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  menus:
+    name: "non-modal dropdown menus (ubuntu-latest)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm ci --ignore-scripts --no-fund --no-audit
+      - name: Install Playwright and every engine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'playwright>=1.45,<2'
+          python -m playwright install chromium firefox webkit
+          python -m playwright install-deps chromium firefox webkit || true
+      - name: Frontend unit tests
+        working-directory: studio/frontend
+        run: npm test
+      - name: Non-modal dropdown menu checks (chromium)
+        env:
+          PW_ENGINE: chromium
+          PW_OUT: logs/nonmodal_chromium.json
+        run: python tests/studio/playwright_nonmodal_menus.py
+      - name: Non-modal dropdown menu checks (firefox)
+        env:
+          PW_ENGINE: firefox
+          PW_PORT: '5402'
+          PW_OUT: logs/nonmodal_firefox.json
+        run: python tests/studio/playwright_nonmodal_menus.py
+      - name: Non-modal dropdown menu checks (webkit)
+        env:
+          PW_ENGINE: webkit
+          PW_PORT: '5403'
+          PW_OUT: logs/nonmodal_webkit.json
+        run: python tests/studio/playwright_nonmodal_menus.py
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonmodal-reports-ubuntu-latest
+          path: logs/nonmodal_*.json
+          if-no-files-found: warn
