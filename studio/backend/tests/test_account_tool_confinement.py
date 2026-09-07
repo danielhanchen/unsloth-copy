@@ -28,6 +28,7 @@ LANDLOCK = sys.platform == "linux" and tool_confinement.landlock_abi() > 0
 @pytest.fixture(autouse = True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "studio"))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "projects"))
     monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_HOME", raising = False)
     monkeypatch.delenv("UNSLOTH_STUDIO_ALLOW_UNCONFINED_TOOLS", raising = False)
     # The sandbox caps the child at 10000 processes per user; a busy CI host can
@@ -99,8 +100,9 @@ def test_macos_profile_hides_install_root_then_allows_own_roots(tmp_path, monkey
     alice_root = str((tmp_path / "studio" / "accounts" / "alice-id").resolve())
     assert profile.startswith("(version 1)\n(deny default)")
     deny = profile.index(f'(deny file-read* file-write* (subpath "{studio}"))')
-    allow = profile.index(f'(allow file-read* file-write* (subpath "{alice_root}"))')
-    assert deny < allow, "the account root must be allowed after the install root is denied"
+    allow = profile.index(f'(allow file-read* (subpath "{alice_root}"))')
+    writable = profile.index(f'(allow file-read* file-write* (subpath "{alice_root}/sandbox"))')
+    assert deny < allow < writable, "the account roots must be allowed after the install root is denied"
     assert argv[3:] == ["bash", "-c", "true"]
 
 
@@ -223,7 +225,11 @@ def test_landlock_rules_cover_own_roots_only(tmp_path):
     handled = tool_confinement._handled_mask(3)
     writable = [p for p, access in rules if access == handled & ~tool_confinement._FS_MAKE_SYM]
     alice_root = str((tmp_path / "studio" / "accounts" / "alice-id").resolve())
-    assert alice_root in writable
+    # The workspace is readable, its sandbox and project roots writable.
+    assert alice_root not in writable
+    assert f"{alice_root}/sandbox" in writable
+    assert str((tmp_path / "projects" / "Accounts" / "alice-id" / "Projects").resolve()) in writable
+    assert alice_root in [p for p, access in rules if access != handled & ~tool_confinement._FS_MAKE_SYM]
     assert str((tmp_path / "studio").resolve()) not in [p for p, _ in rules]
     assert all(
         not p.startswith(str((tmp_path / "studio").resolve()) + os.sep) or p.startswith(alice_root)
@@ -284,3 +290,72 @@ def test_managed_child_cannot_signal_another_accounts_process(tmp_path):
         assert alice_job.poll() is None
     finally:
         alice_job.kill()
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_managed_child_writes_only_its_sandbox_and_projects(tmp_path):
+    """The workspace is readable but not writable: the account's database, its
+    recorded grants and the server-managed directories live there."""
+    files = _seed(tmp_path)
+    bob_root = Path(run_as(BOB, storage_roots_workspace))
+    (bob_root / "studio.db").write_text("BOB-DB")
+    (bob_root / "assets").mkdir(exist_ok = True)
+    (bob_root / "assets" / "data.jsonl").write_text('{"text": "BOB-DATA"}')
+    out = run_as(
+        BOB,
+        tools._bash_exec,
+        f"cat {bob_root}/assets/data.jsonl; echo rc=$?; "
+        f"echo TAMPERED > {bob_root}/studio.db; echo write_rc=$?; "
+        f"echo x > {bob_root}/assets/new.txt; echo assets_rc=$?; "
+        "echo mine > own.txt; echo sandbox_rc=$?",
+        session_id = "chat",
+    )
+    assert "BOB-DATA" in out and "rc=0" in out, out
+    assert "write_rc=0" not in out and "assets_rc=0" not in out, out
+    assert "sandbox_rc=0" in out, out
+    assert (bob_root / "studio.db").read_text() == "BOB-DB"
+    assert files["unsloth"].read_text() == "UNSLOTH_PRIVATE"
+
+
+def storage_roots_workspace():
+    from utils.paths.storage_roots import workspace_root
+
+    return workspace_root()
+
+
+@pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
+def test_install_under_a_granted_root_stays_hidden(tmp_path, monkeypatch):
+    """A Studio home beneath the interpreter prefix (or /opt, /var/lib) must
+    not become readable through the grant for that ancestor."""
+    home = Path(sys.prefix) / f"mu-confinement-home-{os.getpid()}"
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(home))
+    try:
+        files = _seed(home.parent)  # seeds studio under home
+        auth = home / "auth" / "auth.db"
+        auth.parent.mkdir(parents = True, exist_ok = True)
+        auth.write_text("OWNER_AUTH_DB")
+        out = run_as(
+            BOB,
+            tools._bash_exec,
+            f"cat {auth}; echo rc=$?; ls {home}; echo ls_rc=$?; python -c 'import sys; print(sys.prefix)'",
+            session_id = "chat",
+        )
+        assert "OWNER_AUTH_DB" not in out and "rc=0" not in out and "ls_rc=0" not in out, out
+        assert sys.prefix in out, out
+        rules = run_as(BOB, tool_confinement._landlock_rules, 3, tools._SANDBOX_SITE_DIR)
+        assert all(not tool_confinement._contains(p, str(home.resolve())) for p, _ in rules)
+    finally:
+        import shutil
+
+        shutil.rmtree(home, ignore_errors = True)
+
+
+def test_sandbox_home_override_is_writable(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "custom-sandboxes"))
+    roots = run_as(BOB, tool_confinement._writable_roots)
+    assert str((tmp_path / "custom-sandboxes" / "accounts" / "bob-id").resolve()) in roots
+
+
+def test_landlock_below_abi_3_is_refused(monkeypatch):
+    monkeypatch.setattr(tool_confinement, "landlock_abi", lambda: 2)
+    assert tool_confinement._linux_confinement(tools._SANDBOX_SITE_DIR) is None

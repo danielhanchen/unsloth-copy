@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from pathlib import Path
 import shutil
 import sys
 from dataclasses import dataclass
@@ -111,8 +112,8 @@ def unconfined_tools_allowed() -> bool:
 def refusal_message() -> str:
     return (
         "Code execution is unavailable for this account: this host cannot confine tool "
-        "processes to your workspace (Landlock on Linux 5.13 or later, sandbox-exec on "
-        f"macOS). The installation owner can set {_OVERRIDE_ENV}=1 to allow unconfined "
+        "processes to your workspace (Landlock ABI 3 on Linux 6.2 or later, sandbox-exec "
+        f"on macOS). The installation owner can set {_OVERRIDE_ENV}=1 to allow unconfined "
         "tool processes for managed accounts."
     )
 
@@ -144,19 +145,77 @@ def _interpreter_roots() -> list[str]:
     )
 
 
-def _writable_roots() -> list[str]:
-    """The account's own roots, created if this is its first tool call: a rule
-    can only name a path that exists, and the child's sandbox lives inside."""
-    from utils.paths.storage_roots import tmp_root, workspace_root
-
+def _ensure_dirs(paths) -> list[str]:
+    """Create the account's own roots if this is its first tool call: a rule
+    can only name a path that exists."""
     roots = []
-    for root in (workspace_root(), tmp_root()):
+    for root in paths:
         try:
-            root.mkdir(parents = True, exist_ok = True)
+            Path(root).mkdir(parents = True, exist_ok = True)
         except OSError:
             continue
         roots.append(str(root))
     return _existing(roots)
+
+
+def _readable_account_roots() -> list[str]:
+    """The account's workspace, readable so a tool can open the account's own
+    uploads and outputs. Not writable: the account's database, its recorded
+    grants and every directory the server itself manages live here, and a
+    tool that could rewrite them could grant itself what the owner did not."""
+    from utils.paths.storage_roots import workspace_root
+
+    return _ensure_dirs((workspace_root(),))
+
+
+def _writable_roots() -> list[str]:
+    """Where a tool may write: its sandbox (the account-resolved one, so a
+    configured sandbox home is honoured), its temporary root, and its project
+    workspaces."""
+    from core.inference.tools import sandbox_root
+    from utils.paths.storage_roots import project_workspaces_root, tmp_root
+
+    return _ensure_dirs((sandbox_root(), tmp_root(), project_workspaces_root()))
+
+
+def _protected_roots() -> list[str]:
+    """Paths no read grant may contain: the installation itself. A Studio home
+    under /opt, /var/lib or the interpreter prefix would otherwise be readable
+    through the grant for that ancestor."""
+    from utils.paths.storage_roots import studio_root
+
+    return _existing((studio_root(),))
+
+
+def _contains(ancestor: str, path: str) -> bool:
+    return path == ancestor or path.startswith(ancestor.rstrip(os.sep) + os.sep)
+
+
+def _grant_excluding(path: str, access: int, protected: list[str], rules: list[tuple[str, int]]) -> None:
+    """Grant ``access`` beneath ``path`` except for the protected roots.
+
+    Landlock has no deny rule, so an ancestor of a protected root is granted
+    child by child, descending only along the chain that leads to it.
+    """
+    inside = [p for p in protected if _contains(path, p)]
+    if not inside:
+        # A rule on a plain file may not carry directory rights.
+        rules.append((path, access if os.path.isdir(path) else access & ~_FS_READ_DIR))
+        return
+    if any(p == path for p in inside):
+        return
+    try:
+        children = sorted(os.listdir(path))
+    except OSError:
+        return
+    for name in children:
+        child = os.path.join(path, name)
+        if os.path.islink(child):
+            # A link is opened by its target; a target inside a protected
+            # root must not be reachable through it.
+            if any(_contains(p, os.path.realpath(child)) for p in protected):
+                continue
+        _grant_excluding(child, access, protected, rules)
 
 
 # ---------------------------------------------------------------- Linux ----
@@ -228,11 +287,14 @@ def _landlock_rules(abi: int, sandbox_site_dir: str) -> list[tuple[str, int]]:
     read = _FS_READ_FILE | _FS_READ_DIR | _FS_EXECUTE
     device = _FS_READ_FILE | _FS_WRITE_FILE | (_FS_IOCTL_DEV if abi >= 5 else 0)
     rules: list[tuple[str, int]] = []
+    protected = _protected_roots()
     for path in _existing(_SYSTEM_READ_ROOTS):
-        rules.append((path, read))
+        _grant_excluding(path, read, protected, rules)
     for path in _interpreter_roots():
-        rules.append((path, read))
+        _grant_excluding(path, read, protected, rules)
     for path in _existing((sandbox_site_dir,)):
+        _grant_excluding(path, read, protected, rules)
+    for path in _readable_account_roots():
         rules.append((path, read))
     for path in _existing((_DEVICE_ROOT,)):
         rules.append((path, device))
@@ -282,9 +344,14 @@ def _landlock_preexec(
         os.close(ruleset_fd)
 
 
+# Truncation is only handled from ABI 3 (Linux 6.2): below that a confined
+# child could still empty a foreign file it cannot otherwise write.
+_MIN_LANDLOCK_ABI = 3
+
+
 def _linux_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     abi = landlock_abi()
-    if abi <= 0:
+    if abi < _MIN_LANDLOCK_ABI:
         return None
     handled = _handled_mask(abi)
     rules = _landlock_rules(abi, sandbox_site_dir)
@@ -307,7 +374,11 @@ def _sbpl(path: str) -> str:
 
 
 def macos_profile(
-    *, read_roots: list[str], hidden_roots: list[str], writable_roots: list[str]
+    *,
+    read_roots: list[str],
+    hidden_roots: list[str],
+    writable_roots: list[str],
+    account_read_roots: list[str] = (),
 ) -> str:
     """A sandbox-exec profile: later rules win, so the account's own roots are
     allowed after the install root and the home directory are denied."""
@@ -330,6 +401,8 @@ def macos_profile(
         lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")
     for path in hidden_roots:
         lines.append(f"(deny file-read* file-write* (subpath {_sbpl(path)}))")
+    for path in account_read_roots:
+        lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")
     for path in writable_roots:
         lines.append(f"(allow file-read* file-write* (subpath {_sbpl(path)}))")
     return "\n".join(lines) + "\n"
@@ -360,6 +433,7 @@ def _macos_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     profile = macos_profile(
         read_roots = read_roots,
         hidden_roots = hidden_roots,
+        account_read_roots = _readable_account_roots(),
         writable_roots = _writable_roots(),
     )
     return Confinement(mechanism = "sandbox-exec", wrapper = (sandbox_exec, "-p", profile))
