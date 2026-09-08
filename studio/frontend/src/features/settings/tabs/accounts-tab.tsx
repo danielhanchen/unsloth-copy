@@ -99,8 +99,7 @@ function OwnerAccountsTab() {
     });
   }
 
-  // Regenerating a setup code is as destructive as deleting: it replaces the
-  // password, ends the sessions and drops the API keys. Both confirm here.
+  // Regenerating a setup code replaces the password, ends sessions and drops API keys.
   const confirming = resetting ?? retiring;
 
   return (

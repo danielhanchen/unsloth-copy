@@ -80,8 +80,7 @@ async function doTauriAutoAuth(options: TauriAutoAuthOptions): Promise<boolean> 
     const tokens = await invoke<DesktopAuthResponse>("desktop_auth");
     if ("login_required" in tokens) {
       tauriLoginRequired = true;
-      // A managed account signs in in the document, so the shell answering
-      // "login required" must not discard the session the document already holds.
+      // A managed account signs in in the document; do not discard the session it holds.
       if (hasRefreshToken() && (await refreshSession()) && hasAuthToken()) {
         clearTauriAuthFailure();
         if (mustChangePassword()) {

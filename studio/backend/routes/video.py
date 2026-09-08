@@ -417,7 +417,6 @@ def _note_generation_account() -> None:
 
 
 def _generation_hidden(backend) -> bool:
-    """Whether this caller may not see or stop the clip the backend is holding."""
     with _generation_lock:
         started_by = _generation_account
     if started_by is not None:

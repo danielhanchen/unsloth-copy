@@ -33,13 +33,7 @@ _job_accounts_lock = threading.Lock()
 
 
 def record_download_account(registry, key: str) -> None:
-    """Attribute *key* to the acting account.
-
-    Called the moment the registry claim succeeds, before anything slow: the job is
-    observable to other requests from that instant, and until this lands the key still
-    carries whichever account last downloaded it, so a stale owner would pass
-    ``require_download_account`` for someone else's fresh job.
-    """
+    """Attribute *key* the instant the claim succeeds: until then it names the last downloader."""
     if account_access.account_scope() is None:
         return
     with _job_accounts_lock:

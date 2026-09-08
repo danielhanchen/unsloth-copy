@@ -43,8 +43,7 @@ KEYLESS_SCOPE_FULL = "full"
 KEYLESS_SCOPES = (KEYLESS_SCOPE_OFF, KEYLESS_SCOPE_INFERENCE, KEYLESS_SCOPE_FULL)
 DEFAULT_KEYLESS_API_ACCESS_SCOPE = KEYLESS_SCOPE_OFF
 APPROVED_DUMMY_BEARERS = frozenset(
-    # ``no-key-required`` is what hermes-agent substitutes when no key is configured,
-    # because the OpenAI SDK refuses an empty one (hermes_cli/runtime_provider_backends.py).
+    # hermes-agent substitutes this when no key is set, since the OpenAI SDK refuses an empty one.
     {"not-needed", "lm-studio", "ollama", "no-key-required"}
 )
 KEYLESS_ADMISSION_STATE_KEY = "keyless_api_admitted"
@@ -72,7 +71,6 @@ _INFERENCE_ROUTES = frozenset(
 
 
 def is_empty_bearer(header: str) -> bool:
-    """Whether ``header`` is a bearer with no token: what a harness sends with no key set."""
     from fastapi.security.utils import get_authorization_scheme_param
 
     scheme, token = get_authorization_scheme_param(header)

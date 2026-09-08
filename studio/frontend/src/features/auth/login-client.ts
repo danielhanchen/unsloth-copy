@@ -23,9 +23,7 @@ export type TokenResponse = {
   account_id?: string | null;
 };
 
-// Hides Full access before React mounts, with no extra startup request for owner-only
-// browsers. "multi" also picks the login form; "restricted" is a single-account form on
-// an install that still holds a deactivated account.
+// Hides Full access before React mounts, with no extra startup request for owner-only browsers.
 export const LOGIN_MODE_HINT_KEY = "unsloth.auth-login-mode.v1";
 function authHint(): string | null {
   try {
@@ -67,8 +65,7 @@ function onLoginModeStorage(event: StorageEvent): void {
   if (event.newValue === "multi") setLoginMode("multi");
   else if (event.newValue === "restricted") setLoginMode(loginMode, false);
 }
-// The server refuses Full access whenever another account exists, active or not, so
-// either hint withholds it. Before a status arrives, the hint is all we have.
+// The server refuses Full access whenever another account exists, active or not.
 let fullAccessAllowed: boolean = authHint() === null;
 export const getFullAccessAllowed = (): boolean => fullAccessAllowed;
 export function setLoginMode(mode: LoginMode, fullAccess?: boolean): void {
@@ -108,7 +105,6 @@ export async function fetchAuthStatus(): Promise<AuthStatusResponse> {
   }
 }
 export function ensureLoginMode(): void {
-  // Only a server status can relax what a persisted hint withheld.
   if (!statusKnown && (loginMode === "multi" || !fullAccessAllowed))
     void fetchAuthStatus().catch(() => undefined);
 }

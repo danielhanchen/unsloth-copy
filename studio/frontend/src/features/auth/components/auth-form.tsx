@@ -201,8 +201,7 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
   // reuse that password; the Current password input is only rendered for the
   // admin-forced must_change_password path where no bootstrap is available.
   const hasBootstrapPassword = Boolean(window.__UNSLOTH_BOOTSTRAP__?.password);
-  // A managed account only reaches the forced change through a setup-code login,
-  // and that same code is the current password it must re-enter here.
+  // A managed account arrives here via setup-code login, so that code is the current password.
   const changingFromSetupCode =
     !isLoginMode && sessionAccount(getAuthToken())?.isOwner === false;
   const invalidChangePasswordForm =

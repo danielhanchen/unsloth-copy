@@ -52,8 +52,7 @@ _dataset_size_cache_lock = threading.Lock()
 _registry = download_registry.get_datasets_registry()
 _account_registries = {}
 _account_registry_lock = threading.Lock()
-# Repos reserved for deletion. Jobs are per account, the Hugging Face cache underneath them is
-# not, so the reservation has to be held in every registry, including one created while it is.
+# The HF cache is shared across per-account registries, so a reservation must reach all of them.
 _deleting: set[str] = set()
 
 
@@ -65,7 +64,7 @@ def _account_registry():
         registry = _account_registries.get(account_id)
         if registry is None:
             registry = download_registry.DownloadRegistry()
-            # An account whose first download starts mid-delete must not claim the repo either.
+            # A registry created mid-delete must inherit the reservations.
             for reserved in _deleting:
                 registry.begin_delete(reserved)
             _account_registries[account_id] = registry
@@ -73,13 +72,7 @@ def _account_registry():
 
 
 def begin_delete(repo_id: str) -> bool:
-    """Reserve *repo_id* for deletion across every account's registry.
-
-    One cache is shared by all of them, so a download another account started blocks the
-    delete exactly as the owner's own download does, and the reservation keeps any account's
-    next claim out until :func:`end_delete`. Deleting a repo under a running download leaves
-    its snapshot symlinks pointing at blobs that are gone.
-    """
+    """Reserve *repo_id* until :func:`end_delete`: deleting under a live download strands blobs."""
     key = download_registry.normalize_repo_key(repo_id)
     with _account_registry_lock:
         reserved = []

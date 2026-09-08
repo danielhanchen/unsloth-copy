@@ -208,8 +208,7 @@ def acquire_for(
         _owner = owner
         _owner_epoch += 1
         result = register() if register is not None else None
-        # After ``register``: a registration that raised loaded nothing, so it must not take
-        # residency visibility from the account that did.
+        # After ``register``: a raising registration loaded nothing and must not take residency.
         if claims:
             _owner_account = acting
         return result

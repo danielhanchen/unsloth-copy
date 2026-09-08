@@ -2364,7 +2364,6 @@ class UnslothTrainer:
         return result_dataset
 
     def _preprocess_audio_eval_split(self, eval_dataset, preprocess, custom_format_mapping):
-        """Preprocess eval data, warning and dropping it on failure."""
         if eval_dataset is None:
             return None
         try:
@@ -2377,7 +2376,6 @@ class UnslothTrainer:
             return None
 
     def _audio_eval_config(self, training_args):
-        """Build audio evaluation arguments and return the eval dataset."""
         eval_dataset = training_args.get("eval_dataset", None)
         eval_steps = training_args.get("eval_steps", 0.00)
         if eval_dataset is None:

@@ -1127,8 +1127,7 @@ class ResearchSupervisor:
 
     def note_server_address(self, server: Any) -> None:
         state = self.app.state
-        # run_server publishes the port before it binds and the address only once the listener is
-        # up, so a known port must not suppress the address.
+        # The port is published before the bind, the address only once the listener is up.
         published = getattr(state, "server_request_host", None)
         if not (isinstance(published, str) and published):
             host = scope_request_host(server)

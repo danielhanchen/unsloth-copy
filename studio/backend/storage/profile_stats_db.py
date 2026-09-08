@@ -652,8 +652,7 @@ def compute_profile_stats(
     subject = canonical_api_subject(subject)
     conn = get_connection()
     try:
-        # The path is in the fingerprint, not just the account id, so a reused id cannot
-        # be served a payload aggregated from a different database.
+        # The path is in the fingerprint, so a reused account id cannot read another database.
         fingerprint = (
             str(studio_db_path()),
             _fingerprint(conn, subject),

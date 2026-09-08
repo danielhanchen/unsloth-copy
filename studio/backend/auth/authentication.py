@@ -384,7 +384,7 @@ async def credentials_for_token(
     """
     from utils.keyless_api_access import APPROVED_DUMMY_BEARERS, keyless_request_allowed
 
-    # /api/health slices the bearer out itself, so a blank one arrives as "", not as None.
+    # /api/health slices the bearer itself, so a blank one arrives as "", not None.
     if token is not None and not token.strip():
         token = None
     # Settings/listener reads hit SQLite and DNS, so keep them off the event loop.
@@ -551,11 +551,9 @@ async def _get_current_credential(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = "Invalid token payload",
         )
-    # Bind from this same query, no second read; every storage lookup below the route
-    # resolves through that binding. After the decode, so a rejected token binds nothing.
+    # After the decode, so a rejected token binds nothing.
     bind_account(AccountContext(record["account_id"], record["username"], record["role"]))
-    # The desktop shell signs in as the owner; a managed token carrying the
-    # marker is not entitled to the owner's password-change bypass.
+    # A managed token carrying the desktop marker gets no owner password-change bypass.
     is_desktop = payload.get("desktop") is True and record.get("role") == "owner"
     if must_change_password and not allow_password_change and not is_desktop:
         raise HTTPException(

@@ -82,7 +82,6 @@ def account_path(
 
 
 def visible_cached_path(value, repo_type: str = "model"):
-    """Accept a Hub cache path the picker handed back for a repo this account can see."""
     if not value or not managed_account():
         return value
     from hub.services.models import account_access
@@ -406,15 +405,7 @@ def job_accounts() -> list[AccountContext]:
 
 
 def startup_reconciliation_accounts() -> list[AccountContext]:
-    """The accounts whose databases a boot-time reconciliation has to visit.
-
-    Runs and durable generations live in the acting account's ``studio.db``, so a pass made
-    only in the owner's context leaves every managed account's interrupted row reading
-    ``running`` for good. ``[OWNER]`` on a one-account install, where this changes nothing.
-
-    A managed account is skipped until its database exists: opening one would create it for
-    an account that has never used Studio.
-    """
+    """Accounts a boot-time reconciliation must visit; a managed account with no database yet is skipped, since opening one would create it."""
     from utils.paths.storage_roots import studio_db_path
 
     accounts: list[AccountContext] = []

@@ -974,9 +974,7 @@ _CONTENT_TYPES = {
 }
 
 
-# The uploads root and rag.db are per-account, so the token names the account it was
-# minted for, exactly as utils.preview_token does: the id is signed and carried, and the
-# server cannot resolve the file without it. Empty means the owner.
+# The signed token carries the account it was minted for; empty means the owner.
 _DOCUMENT_TOKEN_VERSION = "v2"
 
 
@@ -993,11 +991,7 @@ def _sign_document(document_id: str) -> str:
 
 
 def _verify_document_token(document_id: str, token: str) -> AccountContext | None:
-    """The account whose uploads ``token`` opens for ``document_id``, or None.
-
-    A managed token names its account and that row is read here, so the link stops working
-    the moment the account is deactivated or deleted.
-    """
+    """The account whose uploads ``token`` opens for ``document_id``, or None once deactivated."""
     try:
         exp_s, account_id, sig = token.split(".", 2)
     except ValueError:
@@ -1095,8 +1089,7 @@ def document_file_signed(document_id: str, token: str = Query(...)) -> FileRespo
     account = _verify_document_token(document_id, token)
     if account is None:
         raise HTTPException(status_code = 401, detail = "Invalid or expired token")
-    # This route has no auth dependency, and that dependency is the only thing that binds
-    # an account, so without this every read below runs against the owner's store.
+    # No auth dependency on this route, so without this bind every read below hits the owner's store.
     marker = bind_account(account)
     try:
         _require_rag()
@@ -1110,7 +1103,6 @@ def document_file_signed(document_id: str, token: str = Query(...)) -> FileRespo
         stored_path = (doc or {}).get("stored_path")
         if not doc or not stored_path or not os.path.isfile(stored_path):
             raise HTTPException(status_code = 404, detail = "Document file not found")
-        # Confine to the uploads root (defense in depth).
         if not _is_managed_preview_path(stored_path):
             raise HTTPException(status_code = 403, detail = "Forbidden")
     finally:

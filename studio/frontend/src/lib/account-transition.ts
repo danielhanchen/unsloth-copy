@@ -25,7 +25,7 @@ export const ACCOUNT_CHROME_PREFIXES = [
 export const ACCOUNT_DATABASES = [
   "unsloth-data-recipes",
   "unsloth-data-recipe-executions",
-  // Legacy chat store: the one-shot import would push its threads into the next account.
+  // Legacy store: its one-shot import would push these threads into the next account.
   "unsloth-chat",
 ] as const;
 
@@ -43,11 +43,7 @@ export type BrowserAccount = { username: string; accountId?: string | null };
 
 const ACCOUNT_ID_MARKER_PREFIX = "account:";
 
-/**
- * The name the backend stores. `auth/storage.py` casefolds, then requires
- * `[a-z0-9_-]{3,32}`, so every stored name is ASCII and lowercase says the same thing.
- * A name that survives this and still does not exist server-side simply fails to log in.
- */
+/** Must match what `auth/storage.py` stores: casefolded `[a-z0-9_-]{3,32}`. */
 export function normalizeAccountUsername(username: string): string {
   return username.trim().toLowerCase();
 }

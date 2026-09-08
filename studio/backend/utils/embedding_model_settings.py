@@ -58,7 +58,6 @@ _resolved_gguf_memo: dict[
 
 
 def _store_cached(key: tuple[str, str], value: _StoredState) -> None:
-    """Cache under ``_lock``, sweeping expired entries and capping the map."""
     now = time.monotonic()
     if key not in _cached and len(_cached) >= _CACHE_MAX:
         for stale in [k for k, (at, _v) in _cached.items() if now - at >= _CACHE_TTL_S]:

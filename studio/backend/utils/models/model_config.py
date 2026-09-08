@@ -1362,7 +1362,7 @@ def _local_audio_metadata_fingerprint(model_name: str) -> tuple:
             identities.append((relative, identity))
         return tuple(identities)
     except Exception:
-        # Keep cache-key construction from turning an unreadable path into a request failure.
+        # An unreadable path must not turn cache-key construction into a request failure.
         return (("unreadable", None),)
 
 
@@ -1956,8 +1956,7 @@ def detect_mmproj_file(
     ``path``: directory or a .gguf file. ``search_root``: optional ancestor
     to also walk (snapshot layouts where the weight is in ``snapshot/BF16/``
     but the projector sits at ``snapshot/``). A trusted cache resolver may set
-    ``allow_disjoint_search_root`` for another revision of the same repository.
-    Returns the projector path or ``None``."""
+    ``allow_disjoint_search_root`` for another revision of the same repository."""
     p = Path(path)
     start_dir = p.parent if p.is_file() else p
     if not start_dir.is_dir():
@@ -4123,7 +4122,6 @@ class ModelConfig:
                         None,
                     )
 
-                # Separate speculative-decoding companions, mirroring mmproj.
                 mtp_file = _find_drafter(detect_mtp_file, "mtp")
                 if mtp_file:
                     logger.info(f"Detected MTP drafter: {mtp_file}")

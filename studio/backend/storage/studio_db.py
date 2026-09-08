@@ -1271,8 +1271,7 @@ def get_connection(
                     conn.close()
                     raise
     _apply_wal_synchronous(conn)
-    # Only the owner's database gets a lifespan keeper at startup (main.py); without one here a
-    # managed account is routinely the last WAL participant and checkpoints on every close.
+    # main.py only keeps the owner's DB open, so a managed account would checkpoint on every close.
     if (
         _manage_keeper
         and not is_owner_context()
@@ -1296,11 +1295,7 @@ _wal_unsupported: set[Path] = set()
 
 
 def open_wal_keeper(*, replace: bool = True) -> bool:
-    """Hold this database's WAL open for the process. Returns whether a keeper is engaged.
-
-    ``replace = False`` is the idempotent form used on the connection path: an existing keeper,
-    or a database already known to refuse WAL, is left alone.
-    """
+    """Hold this database's WAL open. ``replace = False`` leaves an existing keeper alone."""
     db_path = studio_db_path().resolve()
     with _wal_keeper_lock:
         if not replace:

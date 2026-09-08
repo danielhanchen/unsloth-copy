@@ -195,8 +195,7 @@ function RemoteUrlPanel({ url }: { url: string | null }) {
   );
 }
 
-// The desktop owner signs in with a local secret, so the owner password exists
-// only for remote browsers and is managed here rather than in the General tab.
+// The desktop owner signs in with a local secret, so this password is for remote browsers only.
 function RemotePasswordRow({
   status,
   onDone,

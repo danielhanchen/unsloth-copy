@@ -50,11 +50,7 @@ _link_accounts_lock = threading.Lock()
 
 
 def _signed_link_account(account_id: str) -> AccountContext | None:
-    """The account a signed link names, or None once it is deactivated or deleted.
-
-    Cached against the policy generation, which every account lifecycle change bumps, so a
-    deactivation revokes the outstanding links on the next request rather than at the TTL.
-    """
+    """The account a signed link names, or None once deactivated. Keyed on the policy generation so a deactivation revokes links immediately, not at the TTL."""
     generation = policy.account_generation()
     with _link_accounts_lock:
         cached = _link_accounts.get(account_id)
@@ -71,10 +67,7 @@ def _signed_link_account(account_id: str) -> AccountContext | None:
 
 
 def media_link_account(target: str | None, media_id: str) -> AccountContext | None:
-    """Resolve an already signature-verified target, never an unsigned account selector.
-
-    A valid signature is not enough: the link must not outlive the account that minted it.
-    """
+    """Signature-verified targets only, and the link must not outlive the account that minted it."""
     if target == media_id:
         return OWNER
     if not target:
@@ -102,15 +95,13 @@ def account_scope() -> str | None:
 
 _resident_accounts: dict[str, tuple[str, frozenset[str]]] = {}
 
-# Residency belongs to the account that loaded the model; an in-flight generation belongs to the
-# account that started it, and an authorized second account can run one on a shared resident.
+# Residency belongs to the loading account; a generation belongs to whoever started it.
 _generation_accounts: dict[str, dict[str, int]] = {}
 _generation_lock = threading.Lock()
 
 
 @contextmanager
 def media_generation(modality: str):
-    """Hold this account's claim on a media generation for as long as it runs."""
     if not policy.installation_is_multi_user():
         yield
         return
@@ -133,7 +124,6 @@ def media_generation(modality: str):
 
 
 def generation_is_mine(modality: str) -> bool:
-    """True while this account has a generation of its own in flight on this modality."""
     if not policy.installation_is_multi_user():
         return False
     account_id = current_account_id()
@@ -142,7 +132,6 @@ def generation_is_mine(modality: str) -> bool:
 
 
 def generation_is_foreign(modality: str) -> bool:
-    """True while another account's generation is in flight, whoever loaded the model."""
     if not policy.installation_is_multi_user():
         return False
     account_id = current_account_id()
@@ -225,11 +214,7 @@ def ambient_hf_token():
 
 
 def account_hf_token(token):
-    """False is Hugging Face's explicit anonymous sentinel; None lends the ambient token.
-
-    A blank string is no credential either, so a managed caller goes anonymous rather than
-    falling back to the installation's token. The value itself is passed through as given.
-    """
+    """False is Hugging Face's anonymous sentinel; None would lend the installation token instead."""
     if managed_account() and (not token or (isinstance(token, str) and not token.strip())):
         return False
     return token
@@ -244,7 +229,6 @@ _PUBLIC_TTL = 300.0
 _PRIVATE_TTL = 30.0
 _public_repos: dict[tuple[str, str], tuple[float, bool]] = {}
 _public_lock = threading.Lock()
-# One in-progress probe per repo, so concurrent misses cost one Hub call between them.
 _public_flights: dict[tuple[str, str], Future] = {}
 _PROBE_FANOUT = 8
 
@@ -305,7 +289,6 @@ def _hub_public_answer(repo_id: str, repo_type: str) -> bool | None:
 
 
 def _public_verdict(repo_id: str, repo_type: str) -> bool | None:
-    """The live cached answer, or None when the Hub still has to be asked."""
     key = (repo_type, repo_id.lower())
     with _public_lock:
         cached = _public_repos.get(key)
@@ -330,7 +313,6 @@ def repo_is_public(repo_id: str, repo_type: str = "model") -> bool:
         if leading:
             flight = _public_flights[key] = Future()
     if not leading:
-        # Someone is already asking about this repo; take their answer rather than a second call.
         return flight.result()
     try:
         answer = _hub_public_answer(repo_id, repo_type)
@@ -357,11 +339,7 @@ def repo_is_public(repo_id: str, repo_type: str = "model") -> bool:
 
 
 def _hub_probe_targets(references, repo_type: str, grants: set[str]) -> set[str]:
-    """Distinct repo ids ``model_visible`` would have to ask the Hub about.
-
-    Staged cheapest first: string parsing, then one cache read for the whole listing,
-    then a filesystem check only for what is left. A warm listing stops at stage two.
-    """
+    """Distinct repo ids ``model_visible`` would have to ask the Hub about, staged cheapest first."""
     candidates = {}
     for reference in references:
         if not isinstance(reference, str) or not reference:
@@ -384,7 +362,7 @@ def _hub_probe_targets(references, repo_type: str, grants: set[str]) -> set[str]
             for repo_id, reference in candidates.items()
             if (entry := _public_repos.get((repo_type, repo_id.lower()))) is None or entry[0] <= now
         }
-    # A local path that happens to spell a repo id is resolved against the cache, not the Hub.
+    # A local path that happens to spell a repo id resolves against the cache, not the Hub.
     return {
         repo_id
         for repo_id, reference in unknown.items()
@@ -393,10 +371,7 @@ def _hub_probe_targets(references, repo_type: str, grants: set[str]) -> set[str]
 
 
 def _warm_public_repos(repo_ids: set[str], repo_type: str) -> None:
-    """Ask about distinct unknown repos together instead of one 5 s call after another.
-
-    Threads are created and joined here, so nothing outlives the request that needed them.
-    """
+    """Probe unknown repos concurrently; threads are joined here so none outlives the request."""
     if len(repo_ids) < 2:
         return
     pending = deque(repo_ids)

@@ -52,8 +52,7 @@ async function fetchAuthStatus(): Promise<AuthStatus> {
       }
       const status = (await res.json()) as AuthStatus;
       authStatusCheckedAt = Date.now();
-      // This path has its own request, so it also owns keeping the document-wide
-      // account policy current; otherwise a guard read leaves a stale hint standing.
+      // This path owns its request, so it must refresh the document-wide policy hint too.
       setLoginMode(status.login_mode ?? "single", status.full_access);
       // Public status describes the owner bootstrap, not the signed-in account.
       // Multi-account login/refresh supplies the session's password-change flag.
