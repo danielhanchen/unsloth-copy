@@ -230,8 +230,17 @@ def project_workspaces_root() -> Path:
     return base / "Accounts" / current_account().account_id / "Projects"
 
 
+def shared_tmp_root() -> Path:
+    """The Studio temporary base every account's ``tmp_root`` lives under.
+
+    Named on its own because a confinement profile has to hide it before it can allow
+    the acting account's own subtree back.
+    """
+    return Path(tempfile.gettempdir()) / "unsloth-studio"
+
+
 def tmp_root() -> Path:
-    root = Path(tempfile.gettempdir()) / "unsloth-studio"
+    root = shared_tmp_root()
     if is_owner_context():
         return root
     return root / "accounts" / current_account().account_id

@@ -108,6 +108,33 @@ def test_macos_profile_hides_install_root_then_allows_own_roots(tmp_path, monkey
     assert argv[3:] == ["bash", "-c", "true"]
 
 
+def test_macos_profile_hides_other_accounts_temporary_roots(tmp_path, monkeypatch):
+    """Every account's tmp_root lives under one per-user temp directory, which the
+    profile's runtime grants open wholesale; the account's own subtree is allowed back."""
+    import tempfile as _tempfile
+
+    from utils.paths import storage_roots
+
+    shared_tmp = tmp_path / "tmp"
+    shared_tmp.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(shared_tmp))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    # Bob has been active, so his temporary root exists before Alice's tool starts.
+    run_as(BOB, storage_roots.tmp_root).mkdir(parents = True, exist_ok = True)
+    (run_as(BOB, storage_roots.tmp_root) / "dataset.jsonl").write_text("BOB_PRIVATE")
+
+    profile = run_as(ALICE, tools._account_confinement).wrap(["bash"])[2]
+    base = str((shared_tmp / "unsloth-studio").resolve())
+    alice_tmp = str(run_as(ALICE, storage_roots.tmp_root).resolve())
+    bob_tmp = str(run_as(BOB, storage_roots.tmp_root).resolve())
+
+    deny = profile.index(f'(deny file-read* file-write* (subpath "{base}"))')
+    allow = profile.index(f'(allow file-read* file-write* (subpath "{alice_tmp}"))')
+    assert deny < allow, "the account's own temporary root must be allowed after the deny"
+    assert f'(subpath "{bob_tmp}")' not in profile
+
+
 @pytest.mark.skipif(not LANDLOCK, reason = "Landlock not available on this kernel")
 @pytest.mark.parametrize("tool", ["terminal", "python"])
 def test_managed_child_cannot_read_or_write_other_accounts(tool, tmp_path):
