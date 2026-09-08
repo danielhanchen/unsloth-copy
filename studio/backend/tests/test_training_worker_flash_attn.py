@@ -14,6 +14,121 @@ import pytest
 
 from core.training import worker
 
+
+# Shared setup for test_install_appends_to_existing_hipcc_compile_flags, test_install_does_not_inject_env_on_cuda, test_install_injects_gcc_install_dir_on_hip_source_build and 1 more.
+def _shared_setup_1(fake_run, monkeypatch):
+    monkeypatch.setattr(worker._sp, "run", fake_run)
+
+    worker._install_package_wheel_first(
+        event_queue = [],
+        import_name = "causal_conv1d",
+        display_name = "causal-conv1d",
+        pypi_name = "causal-conv1d",
+        pypi_version = "1.6.2.post1",
+        filename_prefix = "causal_conv1d",
+        release_tag = "v1.6.2.post1",
+        release_base_url = "https://example.com",
+    )
+
+
+# Shared setup for test_hook_does_install_tilelang_for_qwen35, test_hook_handles_install_failure_gracefully, test_hook_idempotent_on_repeat_call and 5 more.
+def _shared_setup_2(monkeypatch):
+    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
+
+    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
+
+    from transformers.utils import import_utils as _iu
+    return _iu
+
+
+# Shared setup for test_tilelang_backend_skipped_below_python_3_10, test_tilelang_backend_skipped_on_unsupported_linux_arch, test_tilelang_backend_skipped_on_windows and 1 more.
+def _shared_setup_3(monkeypatch):
+    run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
+    monkeypatch.setattr(worker._sp, "run", run_mock)
+
+    worker._ensure_tilelang_backend(
+        event_queue = [],
+        model_name = "unsloth/Qwen3.5-2B",
+    )
+
+    run_mock.assert_not_called()
+
+
+# Shared setup for test_tilelang_backend_installs_pinned_pair_for_qwen3_5, test_tilelang_backend_pins_only_binary, test_tilelang_backend_reinstalls_when_tvm_ffi_is_broken and 2 more.
+def _shared_setup_4():
+    worker._ensure_tilelang_backend(
+        event_queue = [],
+        model_name = "unsloth/Qwen3.5-2B",
+    )
+
+
+# Shared setup for test_runtime_flash_attn_prefers_prebuilt_wheel, test_runtime_flash_attn_rejected_wheel_is_not_reported_installed, test_runtime_flash_attn_wheel_that_does_not_import_falls_back.
+def _shared_setup_5(monkeypatch, statuses):
+    monkeypatch.setattr(
+        worker,
+        "flash_attn_wheel_url",
+        lambda env: "https://example.com/fa.whl",
+    )
+    monkeypatch.setattr(worker, "url_exists", lambda url: True)
+    monkeypatch.setattr(
+        worker,
+        "_send_status",
+        lambda queue, message: statuses.append(message),
+    )
+
+
+# Shared setup for test_flash_linear_attention_install_includes_einops, test_flash_linear_attention_installs_pinned_pair_for_qwen3_5, test_flash_linear_attention_logs_post_install_import_failure and 3 more.
+def _shared_setup_6():
+    worker._ensure_flash_linear_attention(
+        event_queue = [],
+        model_name = "unsloth/Qwen3.5-2B",
+    )
+
+
+# Shared setup for test_tilelang_backend_disables_broken_runtime_offline, test_tilelang_backend_preserves_offline_user_override, test_tilelang_backend_skips_install_offline.
+def _shared_setup_7(monkeypatch):
+    run_mock = mock.Mock()
+    monkeypatch.setattr(worker, "_run_pip", run_mock)
+
+    installed = worker._ensure_tilelang_backend_unconditional(event_queue = [])
+
+    assert installed is False
+    return run_mock
+
+
+# Shared setup for test_install_fast_path_hooks_does_not_set_fla_tilelang_on_cuda, test_install_fast_path_hooks_respects_user_fla_tilelang_override, test_install_fast_path_hooks_sets_fla_tilelang_zero_on_hip.
+def _shared_setup_8(monkeypatch):
+    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", lambda eq: True)
+    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", lambda eq: True)
+    monkeypatch.setattr(worker, "_install_package_wheel_first", lambda **kw: True)
+
+    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
+
+
+# Shared setup for test_tilelang_backend_installs_pinned_pair_for_qwen3_5, test_tilelang_backend_pins_only_binary, test_tilelang_backend_swallows_install_timeout.
+def _shared_setup_9(monkeypatch):
+    _pin_fla_model_types(monkeypatch)
+    monkeypatch.delenv(worker._TILELANG_SKIP_ENV, raising = False)
+    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: None)
+
+
+# Shared setup for test_hook_does_install_tilelang_for_qwen35, test_hook_does_not_install_tilelang_for_model_outside_allowlist, test_hook_runs_tilelang_repair_when_fla_already_true.
+def _shared_setup_10(fla_install, monkeypatch):
+    tile_install = mock.Mock(return_value = True)
+    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
+    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
+    monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
+    return tile_install
+
+
+# Shared setup for test_hipcc_gcc_install_dir_picks_14_when_headers_exist, test_hipcc_gcc_install_dir_picks_highest_with_headers, test_hipcc_gcc_install_dir_returns_none_when_no_match.
+def _shared_setup_11(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    import platform as _platform
+
+    monkeypatch.setattr(_platform, "machine", lambda: "x86_64")
+
 # The runtime install is Linux-only, so elsewhere these return before any status.
 linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -293,17 +408,7 @@ def test_runtime_flash_attn_prefers_prebuilt_wheel(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _flash_attn_import_until_installed(state))
     # The post-install probe runs in a child; model it off the same flag.
     monkeypatch.setattr(worker, "_is_importable_isolated", lambda name: state["installed"])
-    monkeypatch.setattr(
-        worker,
-        "flash_attn_wheel_url",
-        lambda env: "https://example.com/fa.whl",
-    )
-    monkeypatch.setattr(worker, "url_exists", lambda url: True)
-    monkeypatch.setattr(
-        worker,
-        "_send_status",
-        lambda queue, message: statuses.append(message),
-    )
+    _shared_setup_5(monkeypatch, statuses)
     monkeypatch.setattr(worker, "install_wheel", _install)
 
     worker._ensure_flash_attn_for_long_context(event_queue = [], max_seq_length = 32768)
@@ -325,17 +430,7 @@ def test_runtime_flash_attn_wheel_that_does_not_import_falls_back(monkeypatch):
     # Never becomes importable, however the install exits.
     monkeypatch.setattr(builtins, "__import__", _missing_flash_attn_import())
     monkeypatch.setattr(worker, "_is_importable_isolated", lambda name: False)
-    monkeypatch.setattr(
-        worker,
-        "flash_attn_wheel_url",
-        lambda env: "https://example.com/fa.whl",
-    )
-    monkeypatch.setattr(worker, "url_exists", lambda url: True)
-    monkeypatch.setattr(
-        worker,
-        "_send_status",
-        lambda queue, message: statuses.append(message),
-    )
+    _shared_setup_5(monkeypatch, statuses)
     monkeypatch.setattr(
         worker,
         "install_wheel",
@@ -375,17 +470,7 @@ def test_runtime_flash_attn_rejected_wheel_is_not_reported_installed(monkeypatch
     # The discard is state-based, so the installed-but-broken state has to be stated here.
     # Without this the test only passes on a machine that happens to have flash-attn.
     monkeypatch.setattr(worker, "_distribution_present", lambda name: True)
-    monkeypatch.setattr(
-        worker,
-        "flash_attn_wheel_url",
-        lambda env: "https://example.com/fa.whl",
-    )
-    monkeypatch.setattr(worker, "url_exists", lambda url: True)
-    monkeypatch.setattr(
-        worker,
-        "_send_status",
-        lambda queue, message: statuses.append(message),
-    )
+    _shared_setup_5(monkeypatch, statuses)
     monkeypatch.setattr(
         worker,
         "install_wheel",
@@ -658,10 +743,7 @@ def test_flash_linear_attention_installs_pinned_pair_for_qwen3_5(monkeypatch):
     statuses: list[str] = []
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     run_mock.assert_called_once()
     args = run_mock.call_args[0][0]
@@ -768,10 +850,7 @@ def test_flash_linear_attention_skipped_below_python_3_10(monkeypatch):
     run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
     monkeypatch.setattr(worker._sp, "run", run_mock)
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     run_mock.assert_not_called()
 
@@ -781,10 +860,7 @@ def test_flash_linear_attention_skipped_via_env(monkeypatch):
     run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
     monkeypatch.setattr(worker._sp, "run", run_mock)
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     run_mock.assert_not_called()
 
@@ -799,10 +875,7 @@ def test_flash_linear_attention_skipped_below_torch_2_7(monkeypatch):
     statuses: list[str] = []
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     run_mock.assert_not_called()
     assert any("torch>=" in s for s in statuses)
@@ -819,10 +892,7 @@ def test_flash_linear_attention_install_includes_einops(monkeypatch):
     monkeypatch.setattr(worker._sp, "run", run_mock)
     monkeypatch.setattr(worker, "_send_status", lambda *a, **k: None)
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     args = run_mock.call_args[0][0]
     assert "--no-deps" in args
@@ -856,10 +926,7 @@ def test_flash_linear_attention_logs_post_install_import_failure(monkeypatch):
     statuses: list[str] = []
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
-    worker._ensure_flash_linear_attention(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_6()
 
     assert import_calls["count"] == 2
     assert any("not importable" in s for s in statuses)
@@ -871,23 +938,12 @@ def test_tilelang_backend_skipped_on_unsupported_linux_arch(monkeypatch):
     import platform as _platform
 
     monkeypatch.setattr(_platform, "machine", lambda: "ppc64le")
-    run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
-    monkeypatch.setattr(worker._sp, "run", run_mock)
-
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
-
-    run_mock.assert_not_called()
+    _shared_setup_3(monkeypatch)
 
 
 @linux_only
 def test_tilelang_backend_pins_only_binary(monkeypatch):
-    _pin_fla_model_types(monkeypatch)
-    monkeypatch.delenv(worker._TILELANG_SKIP_ENV, raising = False)
-    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: None)
+    _shared_setup_9(monkeypatch)
     monkeypatch.setattr(worker, "_tilelang_importable", lambda: False)
     run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
     monkeypatch.setattr(worker._sp, "run", run_mock)
@@ -903,10 +959,7 @@ def test_tilelang_backend_pins_only_binary(monkeypatch):
 
     monkeypatch.setattr(worker, "_tilelang_importable", fake_probe)
 
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_4()
 
     args = run_mock.call_args[0][0]
     assert "--only-binary=:all:" in args
@@ -929,12 +982,7 @@ def test_tilelang_backend_skips_install_offline(monkeypatch):
     monkeypatch.setattr(worker, "_tilelang_platform_supported", lambda: True)
     monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: None)
     monkeypatch.setattr(worker, "_tilelang_importable", lambda: False)
-    run_mock = mock.Mock()
-    monkeypatch.setattr(worker, "_run_pip", run_mock)
-
-    installed = worker._ensure_tilelang_backend_unconditional(event_queue = [])
-
-    assert installed is False
+    run_mock = _shared_setup_7(monkeypatch)
     run_mock.assert_not_called()
 
 
@@ -957,12 +1005,7 @@ def test_tilelang_backend_disables_broken_runtime_offline(monkeypatch):
     monkeypatch.delenv("FLA_TILELANG", raising = False)
     monkeypatch.setattr(worker, "_tilelang_platform_supported", lambda: True)
     monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: "0.1.11")
-    run_mock = mock.Mock()
-    monkeypatch.setattr(worker, "_run_pip", run_mock)
-
-    installed = worker._ensure_tilelang_backend_unconditional(event_queue = [])
-
-    assert installed is False
+    run_mock = _shared_setup_7(monkeypatch)
     assert worker.os.environ["FLA_TILELANG"] == "0"
     run_mock.assert_not_called()
 
@@ -972,32 +1015,21 @@ def test_tilelang_backend_preserves_offline_user_override(monkeypatch):
     monkeypatch.setenv("FLA_TILELANG", "1")
     monkeypatch.setattr(worker, "_tilelang_platform_supported", lambda: True)
     monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: "0.1.10")
-    run_mock = mock.Mock()
-    monkeypatch.setattr(worker, "_run_pip", run_mock)
-
-    installed = worker._ensure_tilelang_backend_unconditional(event_queue = [])
-
-    assert installed is False
+    run_mock = _shared_setup_7(monkeypatch)
     assert worker.os.environ["FLA_TILELANG"] == "1"
     run_mock.assert_not_called()
 
 
 @linux_only
 def test_tilelang_backend_installs_pinned_pair_for_qwen3_5(monkeypatch):
-    _pin_fla_model_types(monkeypatch)
-    monkeypatch.delenv(worker._TILELANG_SKIP_ENV, raising = False)
-    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: None)
+    _shared_setup_9(monkeypatch)
     run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
     monkeypatch.setattr(worker._sp, "run", run_mock)
     _force_missing_tilelang_imports(monkeypatch)
     statuses: list[str] = []
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_4()
 
     run_mock.assert_called_once()
     args = run_mock.call_args[0][0]
@@ -1024,10 +1056,7 @@ def test_tilelang_backend_reinstalls_when_tvm_ffi_is_broken(monkeypatch):
     monkeypatch.setattr(worker._sp, "run", run_mock)
     monkeypatch.setattr(worker, "_send_status", lambda *a, **k: None)
 
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_4()
 
     assert run_mock.call_count == 2
     repair_args, install_args = (call[0][0] for call in run_mock.call_args_list)
@@ -1052,37 +1081,18 @@ def test_tilelang_backend_skipped_below_python_3_10(monkeypatch):
     # sys.version_info is a structseq, not constructible; substitute a
     # plain tuple so the `< _FLA_MIN_PYTHON` comparison still works.
     monkeypatch.setattr(worker.sys, "version_info", (3, 9, 0, "final", 0))
-    run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
-    monkeypatch.setattr(worker._sp, "run", run_mock)
-
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
-
-    run_mock.assert_not_called()
+    _shared_setup_3(monkeypatch)
 
 
 def test_tilelang_backend_skipped_on_windows(monkeypatch):
     monkeypatch.delenv(worker._TILELANG_SKIP_ENV, raising = False)
     monkeypatch.setattr(worker.sys, "platform", "win32")
-    run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
-    monkeypatch.setattr(worker._sp, "run", run_mock)
-
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
-
-    run_mock.assert_not_called()
+    _shared_setup_3(monkeypatch)
 
 
 @linux_only
 def test_tilelang_backend_swallows_install_timeout(monkeypatch):
-    _pin_fla_model_types(monkeypatch)
-    monkeypatch.delenv(worker._TILELANG_SKIP_ENV, raising = False)
-    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: None)
+    _shared_setup_9(monkeypatch)
     _force_missing_tilelang_imports(monkeypatch)
 
     def raise_timeout(*a, **kw):
@@ -1093,10 +1103,7 @@ def test_tilelang_backend_swallows_install_timeout(monkeypatch):
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
     # Must not raise.
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_4()
 
     assert any("timed out" in s.lower() for s in statuses)
 
@@ -1121,15 +1128,7 @@ def test_tilelang_backend_skipped_for_ssm_models(monkeypatch):
 
 def test_tilelang_backend_skipped_via_env(monkeypatch):
     monkeypatch.setenv(worker._TILELANG_SKIP_ENV, "1")
-    run_mock = mock.Mock(return_value = mock.Mock(returncode = 0, stdout = ""))
-    monkeypatch.setattr(worker._sp, "run", run_mock)
-
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
-
-    run_mock.assert_not_called()
+    _shared_setup_3(monkeypatch)
 
 
 @linux_only
@@ -1145,10 +1144,7 @@ def test_tilelang_backend_swallows_install_failure(monkeypatch):
     monkeypatch.setattr(worker, "_send_status", lambda queue, msg: statuses.append(msg))
 
     # Should not raise even when pip exits non-zero.
-    worker._ensure_tilelang_backend(
-        event_queue = [],
-        model_name = "unsloth/Qwen3.5-2B",
-    )
+    _shared_setup_4()
 
     run_mock.assert_called_once()
     assert any("failed" in s.lower() for s in statuses)
@@ -1242,11 +1238,7 @@ def test_hook_installs_when_gate_returns_false(monkeypatch):
     monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
     monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
     monkeypatch.setattr(worker, "_install_package_wheel_first", conv_install)
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     # Both gates wrapped; calling them should drive the install.
     assert _iu.is_flash_linear_attention_available() is True
@@ -1275,11 +1267,7 @@ def test_hook_skips_install_when_gate_already_true(monkeypatch):
     # would call tile_install, correct but out of scope here).
     monkeypatch.setattr(worker, "_tilelang_importable", lambda: True)
     monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: "0.1.9")
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     assert _iu.is_flash_linear_attention_available() is True
     assert _iu.is_causal_conv1d_available() is True
@@ -1309,11 +1297,7 @@ def test_hook_idempotent_on_repeat_call(monkeypatch):
     monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
     monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
     monkeypatch.setattr(worker, "_install_package_wheel_first", conv_install)
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     # First call: hook fires.
     _iu.is_flash_linear_attention_available()
@@ -1335,11 +1319,7 @@ def test_hook_handles_install_failure_gracefully(monkeypatch):
     monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", raising_install)
     monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", lambda eq: None)
     monkeypatch.setattr(worker, "_install_package_wheel_first", lambda **kw: None)
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     # Must not raise; returns False so transformers uses the torch loop.
     assert _iu.is_flash_linear_attention_available() is False
@@ -1470,10 +1450,7 @@ def test_hook_does_not_install_tilelang_for_model_outside_allowlist(monkeypatch)
         return True
 
     fla_install = mock.Mock(side_effect = _fla_install)
-    tile_install = mock.Mock(return_value = True)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
+    tile_install = _shared_setup_10(fla_install, monkeypatch)
     monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
     # Hermetize the auto-discovered set so the test stays valid as new
     # transformers releases add FLA-using model_types (eg olmo_hybrid in
@@ -1508,15 +1485,8 @@ def test_hook_does_install_tilelang_for_qwen35(monkeypatch):
         return True
 
     fla_install = mock.Mock(side_effect = _fla_install)
-    tile_install = mock.Mock(return_value = True)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    tile_install = _shared_setup_10(fla_install, monkeypatch)
+    _iu = _shared_setup_2(monkeypatch)
 
     _iu.is_flash_linear_attention_available()
     fla_install.assert_called_once()
@@ -1570,11 +1540,7 @@ def test_hook_trusts_installer_bool_not_metadata(monkeypatch):
         worker, "_ensure_tilelang_backend_unconditional", mock.Mock(return_value = True)
     )
     monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     # Hook MUST return False (installer's verdict), not True (metadata lies).
     assert _iu.is_flash_linear_attention_available() is False
@@ -1626,11 +1592,7 @@ def test_hook_skips_tilelang_when_fla_install_is_skipped(monkeypatch):
     tile_install = mock.Mock(return_value = True)
     monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
     monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     # FLA gate stays False (env-skipped, install never ran).
     assert _iu.is_flash_linear_attention_available() is False
@@ -1648,18 +1610,11 @@ def test_hook_runs_tilelang_repair_when_fla_already_true(monkeypatch):
     _patch_iu_gates(monkeypatch, fla_gate, conv_gate)
 
     fla_install = mock.Mock(return_value = True)
-    tile_install = mock.Mock(return_value = True)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", fla_install)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", tile_install)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", mock.Mock(return_value = True))
+    tile_install = _shared_setup_10(fla_install, monkeypatch)
     # tilelang missing AND tvm-ffi on broken list — both trigger repair.
     monkeypatch.setattr(worker, "_tilelang_importable", lambda: False)
     monkeypatch.setattr(worker, "_installed_tvm_ffi_version", lambda: "0.1.11")
-    monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
-
-    from transformers.utils import import_utils as _iu
+    _iu = _shared_setup_2(monkeypatch)
 
     _iu.is_flash_linear_attention_available()
     # FLA install NOT needed; tilelang repair still triggered.
@@ -1756,11 +1711,7 @@ def test_install_fast_path_hooks_sets_fla_tilelang_zero_on_hip(monkeypatch):
     monkeypatch.delenv("FLA_TILELANG", raising = False)
     monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
     monkeypatch.setattr(worker, "_torch_has_hip", lambda: True)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", lambda **kw: True)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
+    _shared_setup_8(monkeypatch)
 
     assert _os.environ.get("FLA_TILELANG") == "0"
 
@@ -1774,11 +1725,7 @@ def test_install_fast_path_hooks_respects_user_fla_tilelang_override(monkeypatch
     monkeypatch.setenv("FLA_TILELANG", "1")
     monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
     monkeypatch.setattr(worker, "_torch_has_hip", lambda: True)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", lambda **kw: True)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
+    _shared_setup_8(monkeypatch)
 
     assert _os.environ["FLA_TILELANG"] == "1"
 
@@ -1790,11 +1737,7 @@ def test_install_fast_path_hooks_does_not_set_fla_tilelang_on_cuda(monkeypatch):
     monkeypatch.delenv("FLA_TILELANG", raising = False)
     monkeypatch.delenv(worker._FAST_PATH_HOOKS_SKIP_ENV, raising = False)
     monkeypatch.setattr(worker, "_torch_has_hip", lambda: False)
-    monkeypatch.setattr(worker, "_ensure_flash_linear_attention_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_ensure_tilelang_backend_unconditional", lambda eq: True)
-    monkeypatch.setattr(worker, "_install_package_wheel_first", lambda **kw: True)
-
-    worker._install_fast_path_hooks(event_queue = _FakeQueue(), model_name = "unsloth/Qwen3.5-2B")
+    _shared_setup_8(monkeypatch)
 
     assert _os.environ.get("FLA_TILELANG") is None
 
@@ -1972,10 +1915,7 @@ def _isdir_for_layout(*existing: str):
 def test_hipcc_gcc_install_dir_picks_highest_with_headers(monkeypatch):
     """gcc-14 has runtime but no /usr/include/c++/14; loop falls through
     to gcc-13 which has both. The exact Ubuntu 24.04 layout."""
-    monkeypatch.setattr(sys, "platform", "linux")
-    import platform as _platform
-
-    monkeypatch.setattr(_platform, "machine", lambda: "x86_64")
+    _shared_setup_11(monkeypatch)
     monkeypatch.setattr(
         worker.os.path,
         "isdir",
@@ -1991,10 +1931,7 @@ def test_hipcc_gcc_install_dir_picks_highest_with_headers(monkeypatch):
 
 def test_hipcc_gcc_install_dir_picks_14_when_headers_exist(monkeypatch):
     """If the user has libstdc++-14-dev installed, prefer gcc-14."""
-    monkeypatch.setattr(sys, "platform", "linux")
-    import platform as _platform
-
-    monkeypatch.setattr(_platform, "machine", lambda: "x86_64")
+    _shared_setup_11(monkeypatch)
     monkeypatch.setattr(
         worker.os.path,
         "isdir",
@@ -2009,10 +1946,7 @@ def test_hipcc_gcc_install_dir_picks_14_when_headers_exist(monkeypatch):
 def test_hipcc_gcc_install_dir_returns_none_when_no_match(monkeypatch):
     """No gcc dir has both halves → return None and skip env injection
     rather than guessing wrong and causing a confusing build failure."""
-    monkeypatch.setattr(sys, "platform", "linux")
-    import platform as _platform
-
-    monkeypatch.setattr(_platform, "machine", lambda: "x86_64")
+    _shared_setup_11(monkeypatch)
     monkeypatch.setattr(worker.os.path, "isdir", lambda path: False)
     assert worker._hipcc_gcc_install_dir() is None
 
@@ -2075,18 +2009,7 @@ def test_install_injects_gcc_install_dir_on_hip_source_build(monkeypatch):
         captured.update(kwargs.get("env") or {})
         return subprocess.CompletedProcess(cmd, 0, "")
 
-    monkeypatch.setattr(worker._sp, "run", fake_run)
-
-    worker._install_package_wheel_first(
-        event_queue = [],
-        import_name = "causal_conv1d",
-        display_name = "causal-conv1d",
-        pypi_name = "causal-conv1d",
-        pypi_version = "1.6.2.post1",
-        filename_prefix = "causal_conv1d",
-        release_tag = "v1.6.2.post1",
-        release_base_url = "https://example.com",
-    )
+    _shared_setup_1(fake_run, monkeypatch)
 
     assert (
         captured.get("HIPCC_COMPILE_FLAGS_APPEND")
@@ -2106,18 +2029,7 @@ def test_install_appends_to_existing_hipcc_compile_flags(monkeypatch):
         captured.update(kwargs.get("env") or {})
         return subprocess.CompletedProcess(cmd, 0, "")
 
-    monkeypatch.setattr(worker._sp, "run", fake_run)
-
-    worker._install_package_wheel_first(
-        event_queue = [],
-        import_name = "causal_conv1d",
-        display_name = "causal-conv1d",
-        pypi_name = "causal-conv1d",
-        pypi_version = "1.6.2.post1",
-        filename_prefix = "causal_conv1d",
-        release_tag = "v1.6.2.post1",
-        release_base_url = "https://example.com",
-    )
+    _shared_setup_1(fake_run, monkeypatch)
 
     assert captured.get("HIPCC_COMPILE_FLAGS_APPEND") == (
         "-O3 -DFOO --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13"
@@ -2139,18 +2051,7 @@ def test_install_respects_user_gcc_install_dir(monkeypatch):
         captured.update(kwargs.get("env") or {})
         return subprocess.CompletedProcess(cmd, 0, "")
 
-    monkeypatch.setattr(worker._sp, "run", fake_run)
-
-    worker._install_package_wheel_first(
-        event_queue = [],
-        import_name = "causal_conv1d",
-        display_name = "causal-conv1d",
-        pypi_name = "causal-conv1d",
-        pypi_version = "1.6.2.post1",
-        filename_prefix = "causal_conv1d",
-        release_tag = "v1.6.2.post1",
-        release_base_url = "https://example.com",
-    )
+    _shared_setup_1(fake_run, monkeypatch)
 
     assert captured["HIPCC_COMPILE_FLAGS_APPEND"] == "--gcc-install-dir=/opt/custom/gcc-13"
 
@@ -2186,18 +2087,7 @@ def test_install_does_not_inject_env_on_cuda(monkeypatch):
         captured.update(kwargs.get("env") or {})
         return subprocess.CompletedProcess(cmd, 0, "")
 
-    monkeypatch.setattr(worker._sp, "run", fake_run)
-
-    worker._install_package_wheel_first(
-        event_queue = [],
-        import_name = "causal_conv1d",
-        display_name = "causal-conv1d",
-        pypi_name = "causal-conv1d",
-        pypi_version = "1.6.2.post1",
-        filename_prefix = "causal_conv1d",
-        release_tag = "v1.6.2.post1",
-        release_base_url = "https://example.com",
-    )
+    _shared_setup_1(fake_run, monkeypatch)
 
     # env is always passed (to force UTF-8), but never the HIP flag.
     assert "HIPCC_COMPILE_FLAGS_APPEND" not in captured
