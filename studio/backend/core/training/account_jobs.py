@@ -14,7 +14,6 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from auth import policy
 from utils.account_context import AccountContext, OWNER, current_account, run_as
 from utils.paths.storage_roots import project_workspaces_root, tmp_root, workspace_root
 
@@ -23,8 +22,21 @@ _services_lock = threading.RLock()
 _retired: set[str] = set()
 
 
+def _multi_user() -> bool:
+    # Lazy: the export worker imports this module on hosts without the auth stack.
+    from auth import policy
+
+    return policy.installation_is_multi_user()
+
+
+def _has_managed_accounts() -> bool:
+    from auth import policy
+
+    return policy.installation_has_managed_accounts()
+
+
 def managed_account() -> bool:
-    return not current_account().is_owner and policy.installation_is_multi_user()
+    return not current_account().is_owner and _multi_user()
 
 
 def account_key(value: str):
@@ -59,6 +71,7 @@ def account_path(
         ):
             return value
     resolved = path.resolve()
+
     roots = (workspace_root(), project_workspaces_root(), tmp_root())
     if shared_cache:
         from utils.hf_cache_settings import active_hf_hub_cache
@@ -175,7 +188,7 @@ def job_is_foreign(service) -> bool:
     return (
         isinstance(owner, AccountContext)
         and owner.account_id != current_account().account_id
-        and policy.installation_is_multi_user()
+        and _multi_user()
     )
 
 
@@ -202,7 +215,7 @@ def owned_job(*, continuation: bool = False):
     def decorate(fn):
         @wraps(fn)
         def wrapped(self, *args, **kwargs):
-            if not policy.installation_has_managed_accounts():
+            if not _has_managed_accounts():
                 return fn(self, *args, **kwargs)
             account = current_account()
             with self._account_job_lock:
@@ -234,7 +247,7 @@ def job_control(fn):
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         lock = getattr(self, "_account_job_lock", None)
-        if lock is None or not policy.installation_is_multi_user():
+        if lock is None or not _multi_user():
             return fn(self, *args, **kwargs)
         with lock:
             require_job_owner(self)
@@ -254,7 +267,7 @@ def job_read(neutral):
         @wraps(fn)
         def wrapped(self, *args, **kwargs):
             lock = getattr(self, "_account_job_lock", None)
-            if lock is None or not policy.installation_is_multi_user():
+            if lock is None or not _multi_user():
                 return fn(self, *args, **kwargs)
             with lock:
                 if self.job_account is not None:
@@ -284,7 +297,7 @@ def account_process_spec(module: str, target: str, env: dict, kwargs: dict):
     """Keep the legacy single-account spawn exactly; carry identity in multi mode."""
     if account_is_retired():
         raise HTTPException(status_code = 403, detail = "Account is retired")
-    if not policy.installation_is_multi_user():
+    if not _multi_user():
         return (module, target, env), kwargs
     return ("core.training.account_jobs", "run_account_child", env), {
         **kwargs,
@@ -378,7 +391,7 @@ def account_is_retired() -> bool:
 
 def job_accounts() -> list[AccountContext]:
     """Background supervisors enumerate accounts only on multi-account installs."""
-    if not policy.installation_is_multi_user():
+    if not _multi_user():
         return [OWNER]
     from auth import storage
 
