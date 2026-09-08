@@ -250,6 +250,18 @@ def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
     assert len(rows) == 2
 
 
+def test_a_blank_managed_token_is_anonymous_not_the_installations(monkeypatch):
+    """A whitespace-only token is no credential; lending the ambient one instead would give
+    a managed caller the installation's Hub access."""
+    assert run_as(ALICE, access.account_hf_token, "   ") is False
+    assert run_as(ALICE, access.account_hf_token, "") is False
+    assert run_as(ALICE, access.account_hf_token, None) is False
+    # Passed through exactly as given, unlike the training-jobs helper which strips.
+    assert run_as(ALICE, access.account_hf_token, " hf_real ") == " hf_real "
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
+    assert access.account_hf_token("   ") == "   "
+
+
 def test_the_shared_chat_template_read_needs_model_access(monkeypatch):
     """The template walks the shared cache and returns a private repo's raw text, so it is
     a model read like any other."""

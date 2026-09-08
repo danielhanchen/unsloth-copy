@@ -627,10 +627,6 @@ def count_active_accounts() -> int:
     return account_counts()[0]
 
 
-def count_managed_accounts() -> int:
-    return account_counts()[1]
-
-
 def account_counts() -> tuple[int, int]:
     """``(active accounts, managed accounts of any state)`` in one query.
 

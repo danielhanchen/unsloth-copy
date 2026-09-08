@@ -436,7 +436,3 @@ def account_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
         return Confinement(mechanism = "unconfined-by-owner")
     raise ToolConfinementUnavailable(refusal_message())
 
-
-def reset_probe_for_tests() -> None:
-    global _landlock_abi
-    _landlock_abi = None

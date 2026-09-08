@@ -146,8 +146,12 @@ def ambient_hf_token():
 
 
 def account_hf_token(token):
-    """False is Hugging Face's explicit anonymous sentinel; None lends the ambient token."""
-    if managed_account() and not token:
+    """False is Hugging Face's explicit anonymous sentinel; None lends the ambient token.
+
+    A blank string is no credential either, so a managed caller goes anonymous rather than
+    falling back to the installation's token. The value itself is passed through as given.
+    """
+    if managed_account() and (not token or (isinstance(token, str) and not token.strip())):
         return False
     return token
 
