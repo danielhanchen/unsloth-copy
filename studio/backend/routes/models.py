@@ -3034,9 +3034,7 @@ async def scan_diffusion_loras(
             }
             for e in entries
         ],
-        "loras_dir": str(account_access.workspace_root() / "loras/diffusion")
-        if account_access.managed_account()
-        else str(diffusion_lora.loras_dir()),
+        "loras_dir": str(diffusion_lora.loras_dir()),
     }
 
 
@@ -3071,9 +3069,7 @@ async def scan_diffusion_controlnets(
             for e in entries
         ],
         "control_types": list(diffusion_controlnet.CONTROL_TYPES),
-        "controlnets_dir": str(account_access.workspace_root() / "controlnets/diffusion")
-        if account_access.managed_account()
-        else str(diffusion_controlnet.controlnets_dir()),
+        "controlnets_dir": str(diffusion_controlnet.controlnets_dir()),
     }
 
 

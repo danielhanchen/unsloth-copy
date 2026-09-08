@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from utils.paths.storage_roots import studio_root
+from utils.paths.storage_roots import account_path
 from utils.paths.path_utils import is_appledouble_metadata
 
 # "passthrough": the supplied image IS the control map; "canny": derive an edge map here
@@ -81,8 +81,11 @@ _CURATED: tuple[ControlNetCatalogEntry, ...] = (
 
 
 def controlnets_dir() -> Path:
-    """Local directory Unsloth scans for user-provided ControlNet model folders."""
-    d = studio_root() / "controlnets" / "diffusion"
+    """Local directory Unsloth scans for user-provided ControlNet model folders.
+
+    Per-account, which is the path the Images page is already told about; the owner keeps
+    the install root."""
+    d = account_path("controlnets/diffusion")
     d.mkdir(parents = True, exist_ok = True)
     return d
 

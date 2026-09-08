@@ -523,3 +523,26 @@ def test_every_model_load_worker_is_pinned_to_its_account():
         assert all(
             isinstance(func, ast.Name) and func.id == "account_thread" for func in starters
         ), module.__name__
+
+
+def test_the_lora_and_controlnet_scanners_read_the_reported_directory(tmp_path, monkeypatch):
+    """The routes reported a per-account path while the scanner read the shared one, so a
+    managed account was shown its own folder and listed the owner's files."""
+    from core.inference import diffusion_controlnet, diffusion_lora
+    from utils.paths.storage_roots import workspace_root
+
+    for account in (OWNER, ALICE):
+        reported = {
+            "loras": run_as(account, diffusion_lora.loras_dir),
+            "controlnets": run_as(account, diffusion_controlnet.controlnets_dir),
+        }
+        root = run_as(account, workspace_root)
+        assert reported["loras"] == root / "loras" / "diffusion"
+        assert reported["controlnets"] == root / "controlnets" / "diffusion"
+
+    owner_lora = run_as(OWNER, diffusion_lora.loras_dir) / "owner-private.safetensors"
+    owner_lora.write_bytes(b"weights")
+    assert [entry.id for entry in run_as(ALICE, diffusion_lora.list_loras) if entry.source == "local"] == []
+    assert any(
+        entry.source == "local" for entry in run_as(OWNER, diffusion_lora.list_loras)
+    )
