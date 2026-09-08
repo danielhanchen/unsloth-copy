@@ -42,6 +42,8 @@ _StoredState = tuple[
 # The raw record is carried so a conditional write compares against exactly what is stored: a reconstruction never
 # matches a record written by a build with one field fewer.
 _cached: dict[tuple[str, str], tuple[float, _StoredState]] = {}
+# One entry per account, and only a write ever removes one, so the map is capped here.
+_CACHE_MAX = 256
 # Bumped on every write/invalidate. A reader captures it before the DB read and
 # only fills the cache if it is unchanged afterward, so a read that overlapped a
 # save cannot repopulate the cache with the pre-save value for the whole TTL.
@@ -53,6 +55,17 @@ _lock = threading.Lock()
 _resolved_gguf_memo: dict[
     tuple[str, str], tuple[Optional[str], Optional[str], bool, Optional[list]]
 ] = {}
+
+
+def _store_cached(key: tuple[str, str], value: _StoredState) -> None:
+    """Cache under ``_lock``, sweeping expired entries and capping the map."""
+    now = time.monotonic()
+    if key not in _cached and len(_cached) >= _CACHE_MAX:
+        for stale in [k for k, (at, _v) in _cached.items() if now - at >= _CACHE_TTL_S]:
+            del _cached[stale]
+        while len(_cached) >= _CACHE_MAX:
+            _cached.pop(next(iter(_cached)))  # insertion order: the oldest fill goes first
+    _cached[key] = (now, value)
 
 
 def _invalidate_cache() -> None:
@@ -289,7 +302,7 @@ def _get_stored_state() -> _StoredState:
         # Only cache when no save landed while reading: a pre-save value would mask the new one for the
         # whole TTL.
         if _generation.get(key, 0) == gen:
-            _cached[key] = (time.monotonic(), value)
+            _store_cached(key, value)
     return value
 
 
