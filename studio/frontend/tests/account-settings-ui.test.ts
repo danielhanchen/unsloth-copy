@@ -220,6 +220,24 @@ test("activation controls follow state and delete requires a named retirement co
   assert.ok(ui.calls.includes("delete:alice-id"));
 });
 
+test("desktop password control reaches managed accounts and the owner copy names the mode", () => {
+  const general = readFileSync(
+    new URL("../src/features/settings/tabs/general-tab.tsx", import.meta.url),
+    "utf8",
+  );
+  // Web keeps the row for everyone; on desktop only the owner is served by Remote access.
+  assert.match(general, /\{isTauri && isOwner \? null : \(/);
+  const remote = readFileSync(
+    new URL(
+      "../src/features/settings/components/remote-access-section.tsx",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(remote, /const multi = useLoginMode\(\) === "multi";/);
+  assert.doesNotMatch(remote, /description="Remote browsers sign in as unsloth/);
+});
+
 test("Accounts is registered, searchable, and filtered from managed navigation and deferred panels", () => {
   assert.deepEqual(SETTINGS_SEARCH_INDEX.accounts, [
     "settings.accounts.title",
