@@ -335,7 +335,7 @@ from hub.utils.download_registry import (
 from routes.settings import router as settings_router
 from routes.prompts import router as prompts_router
 from routes.profile_stats import router as profile_stats_router
-from auth import storage
+from auth import policy as auth_policy, storage
 from auth.authentication import get_current_subject
 from utils.hardware import (
     start_background_detection,
@@ -1970,7 +1970,10 @@ def studio_download_transport_capabilities(
     return asdict(get_download_transport_capabilities(probe = probe))
 
 
-@app.post("/api/shutdown")
+@app.post(
+    "/api/shutdown",
+    dependencies = [Depends(get_current_subject), Depends(auth_policy.require_owner)],
+)
 async def shutdown_server(request: Request, current_subject: str = Depends(get_current_subject)):
     """Gracefully shut down the Unsloth Studio server.
 
