@@ -153,3 +153,18 @@ def test_unreadable_auth_db_keeps_the_host_closed(auth_db, monkeypatch):
     policy.invalidate_account_cache()
     assert policy.login_mode() == "single"
     assert policy.full_access_permitted() is False
+
+
+def test_a_transient_auth_db_failure_is_not_cached(auth_db, monkeypatch):
+    """Nothing invalidates the policy cache on a settled one-owner install, so caching the
+    fallback would hold full access off for the life of the process."""
+    counts = storage.account_counts
+
+    def boom():
+        raise OSError("auth.db unreadable")
+
+    monkeypatch.setattr(storage, "account_counts", boom)
+    policy.invalidate_account_cache()
+    assert policy.full_access_permitted() is False
+    monkeypatch.setattr(storage, "account_counts", counts)
+    assert policy.full_access_permitted() is True

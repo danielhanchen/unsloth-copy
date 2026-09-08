@@ -42,8 +42,9 @@ def _account_counts() -> tuple[int, int]:
     try:
         active, managed = storage.account_counts()
     except Exception:  # noqa: BLE001 - an unreadable auth.db is a one-user install
-        # Single login form, but count a managed account so the host stays closed.
-        active, managed = 1, 1
+        # Single login form, but count a managed account so the host stays closed. Never
+        # cached: a transient read error would otherwise hold full access off until restart.
+        return 1, 1
     with _lock:
         if generation == _generation:
             _cached = (generation, active, managed)
