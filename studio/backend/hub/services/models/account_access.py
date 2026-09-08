@@ -518,29 +518,6 @@ def authorize_download(repo_id: str, repo_type: str, hf_token) -> None:
         raise HTTPException(status_code = 404, detail = "Repository not found") from exc
 
 
-_schema_paths: set[tuple[str, str]] = set()
-_schema_lock = threading.Lock()
-
-
-def ensure_account_schema(module) -> None:
-    """Initialize a private DB for storage modules whose schema flag is still global.
-
-    Retire this bridge once every storage module tracks readiness by database path.
-    """
-    if not managed_account():
-        return
-    path = studio_db_path()
-    key = module.__name__, str(path)
-    with _schema_lock:
-        if key in _schema_paths:
-            return
-        path.parent.mkdir(parents = True, exist_ok = True)
-        with closing(sqlite3.connect(str(path))) as conn, conn:
-            conn.row_factory = sqlite3.Row
-            module._ensure_schema(conn)
-        _schema_paths.add(key)
-
-
 def require_media_references(request) -> None:
     """Companion file overrides obey the same policy as the primary model."""
     require_media_adapters(request)

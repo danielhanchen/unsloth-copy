@@ -31,6 +31,7 @@ from loggers import get_logger
 from storage.api_usage_db import canonical_api_subject
 from storage.studio_db import count_chat_message_attachments, get_connection
 from utils.account_context import current_account_id
+from utils.paths import studio_db_path
 
 logger = get_logger(__name__)
 
@@ -651,7 +652,15 @@ def compute_profile_stats(
     subject = canonical_api_subject(subject)
     conn = get_connection()
     try:
-        fingerprint = (_fingerprint(conn, subject), days, tz_offset_minutes, tz_name)
+        # The path is in the fingerprint, not just the account id, so a reused id cannot
+        # be served a payload aggregated from a different database.
+        fingerprint = (
+            str(studio_db_path()),
+            _fingerprint(conn, subject),
+            days,
+            tz_offset_minutes,
+            tz_name,
+        )
         now = time.monotonic()
         account_id = current_account_id()
         with _cache_lock:

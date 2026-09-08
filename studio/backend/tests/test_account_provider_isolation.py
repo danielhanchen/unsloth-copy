@@ -42,7 +42,6 @@ def isolated(monkeypatch, tmp_path):
     # The owner has already initialized these modules: each new DB must still get its schema.
     for module in (credential_secrets, mcp_servers_db, providers_db):
         monkeypatch.setattr(module, "_schema_ready", set())
-    monkeypatch.setattr(access, "_schema_paths", set())
     monkeypatch.setattr(
         credential_secrets, "get_or_create_credential_encryption_key", lambda: b"k" * 32
     )
@@ -129,7 +128,6 @@ def test_mcp_server_ids_are_scoped_before_session_or_tool_access(account, other,
 
 def test_same_provider_id_can_hold_different_account_credentials():
     for account, secret in [(ALICE, "alice-secret"), (BOB, "bob-secret")]:
-        run_as(account, access.ensure_account_schema, credential_secrets)
         run_as(account, credential_secrets.save_provider_api_key, "same-provider-id", secret)
         run_as(account, credential_secrets.save_hf_token, secret)
     assert (

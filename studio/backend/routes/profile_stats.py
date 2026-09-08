@@ -9,43 +9,22 @@ Read-only aggregation over the local studio.db (see
 """
 
 import asyncio
-import threading
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
 from auth.authentication import get_current_subject
-from auth import policy
 from loggers import get_logger
 from storage.profile_stats_db import (
     MAX_DAILY_DAYS,
     MAX_TZ_OFFSET_MINUTES,
     compute_profile_stats,
-    invalidate_profile_stats_cache,
 )
 from utils.utils import log_and_http_error
-from utils.account_context import current_account_id
-from utils.paths import studio_db_path
 
 router = APIRouter()
 
 logger = get_logger(__name__)
-_stats_lock = threading.Lock()
-_stats_account = None
-
-
-def _compute_account_profile_stats(**kwargs) -> dict[str, Any]:
-    """Fence the storage cache, including when a username is deleted and reused."""
-    global _stats_account
-    if not policy.installation_is_multi_user():
-        _stats_account = None
-        return compute_profile_stats(**kwargs)
-    scope = (current_account_id(), str(studio_db_path()))
-    with _stats_lock:
-        if _stats_account != scope:
-            invalidate_profile_stats_cache()
-            _stats_account = scope
-        return compute_profile_stats(**kwargs)
 
 
 @router.get("/stats")
@@ -66,7 +45,7 @@ async def get_profile_stats(
         # messages, ~1.2 s at 260k. Off the event loop so it cannot stall token
         # streaming when Settings is opened mid-generation.
         return await asyncio.to_thread(
-            _compute_account_profile_stats,
+            compute_profile_stats,
             days = days,
             tz_offset_minutes = tz_offset_minutes,
             tz_name = tz,

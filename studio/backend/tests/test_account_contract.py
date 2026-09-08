@@ -236,7 +236,7 @@ def test_the_policy_cache_costs_nothing_on_the_hot_path(auth_db, monkeypatch):
     auth_db.create_initial_user("unsloth", "owner-password", secrets.token_urlsafe(32))
     assert policy.installation_is_multi_user() is False
     calls = []
-    monkeypatch.setattr(auth_db, "count_active_accounts", lambda: calls.append(1) or 1)
+    monkeypatch.setattr(auth_db, "account_counts", lambda: calls.append(1) or (1, 0))
     for _ in range(50):
         policy.installation_is_multi_user()
     assert calls == []
