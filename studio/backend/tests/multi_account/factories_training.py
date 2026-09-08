@@ -257,6 +257,7 @@ FACTORIES = {
     "routes.data_recipe.seed:DELETE:/seed/unstructured-block/{block_id}": Factory(
         "training-unstructured-upload",
         fragment = "true",
+        absent = "true",
         owner = (200,),
         wrong = (200,),
         reason = _BLOCK_REASON,

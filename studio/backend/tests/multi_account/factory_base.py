@@ -10,6 +10,7 @@ unauthenticated caller gets 401/403 and a deactivated account gets 401. Any rout
 contract differs states the deviation together with a one-line reason.
 """
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -31,6 +32,14 @@ def seeder(name: str):
     return decorate
 
 
+def call_seeder(name: str, account, actor: str):
+    """Call a seeder, passing the acting actor only to the seeders that ask for it."""
+    function = SEEDERS[name]
+    if "actor" in inspect.signature(function).parameters:
+        return function(account, actor = actor)
+    return function(account)
+
+
 def format_path(path: str, params: dict) -> str:
     """Fill a router path, dropping Starlette converters such as ``{filename:path}``."""
     return _CONVERTER.sub(r"{\1}", path).format(**params)
@@ -42,6 +51,7 @@ class Factory:
     body: dict | list | None = None
     success: int = 200
     fragment: str | None = None
+    absent: str | None = None
     owner: tuple[int, ...] = (404,)
     wrong: tuple[int, ...] = (404,)
     unauthenticated: tuple[int, ...] = (401, 403)

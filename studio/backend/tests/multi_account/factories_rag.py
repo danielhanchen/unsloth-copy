@@ -207,8 +207,8 @@ _MULTIPART = (
     "at 400 after the ownership check that returns 404 to everyone else"
 )
 _MULTIPART_UNSCOPED = (
-    "thread uploads have no thread-existence check, so every actor stops at the same 400 for "
-    "the missing multipart body before any account data is touched"
+    "thread uploads have no thread-existence check and need a multipart body the JSON matrix "
+    "client cannot send, so every actor stops at the same 400 and no case can discriminate"
 )
 _LEASE = (
     "linking needs a signed desktop path grant, so the owning account stops at 400 after the "
@@ -221,6 +221,7 @@ FACTORIES = {
     "routes.rag:GET:/knowledge-bases/{kb_id}/documents": Factory(
         "rag-document",
         fragment = FILENAME,
+        absent = FILENAME,
         owner = (200,),
         wrong = (200,),
         reason = _LIST_SCOPE,
@@ -251,6 +252,7 @@ FACTORIES = {
     "routes.rag:GET:/jobs/{job_id}/events": Factory(
         "rag-job",
         fragment = "[DONE]",
+        absent = DOCUMENT_ID,
         owner = (200,),
         wrong = (200,),
         reason = _INGESTION_SSE,
@@ -258,6 +260,7 @@ FACTORIES = {
     "routes.rag:POST:/jobs/{job_id}/events": Factory(
         "rag-job",
         fragment = "[DONE]",
+        absent = DOCUMENT_ID,
         owner = (200,),
         wrong = (200,),
         reason = _INGESTION_SSE,
@@ -296,22 +299,16 @@ FACTORIES = {
     "routes.rag:GET:/threads/{thread_id}/documents": Factory(
         "rag-thread-document",
         fragment = FILENAME,
+        absent = FILENAME,
         owner = (200,),
         wrong = (200,),
         reason = _LIST_SCOPE,
     ),
-    "routes.rag:POST:/threads/{thread_id}/documents": Factory(
-        "rag-thread-document",
-        success = 400,
-        fragment = "No file was provided",
-        owner = (400,),
-        wrong = (400,),
-        self_expected = (400,),
-        reason = _MULTIPART_UNSCOPED,
-    ),
 }
 
 SKIPPED = {
+    # No thread ownership check and a multipart body the JSON matrix client cannot send.
+    "routes.rag:POST:/threads/{thread_id}/documents": _MULTIPART_UNSCOPED,
     # Product finding: no auth dependency binds the account, so it reads the owner's store.
     "routes.rag:GET:/documents/{document_id}/file-signed": (
         "signed document downloads resolve in the owner's store for every account, so the route "

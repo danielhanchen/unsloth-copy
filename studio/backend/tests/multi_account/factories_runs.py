@@ -4,8 +4,6 @@
 """Durable Deep Research run routes and the public per-checkpoint preview routes."""
 
 import json
-import os
-import re
 
 from .factory_base import Factory, seeder
 
@@ -29,23 +27,12 @@ PREVIEW_CHAT_BODY = {
 # Mutated by the preview seeder: /p takes a signed capability token, never the actor's JWT.
 PREVIEW_RUN_KEY: dict = {}
 PREVIEW_CHECKPOINT_KEY: dict = {}
-_ACTORS = ("owner", "right", "wrong", "unauthenticated", "deactivated")
-_ACTOR_IN_NODE_ID = re.compile(r"\[(" + "|".join(_ACTORS) + r")\]")
-
-
 # /p authenticates a signed link, not the actor's JWT, so each actor presents the link it would hold.
-def _acting_actor() -> str:
-    """The matrix actor this case runs as, read from the pytest node id, else the resource owner."""
-    found = _ACTOR_IN_NODE_ID.search(os.environ.get("PYTEST_CURRENT_TEST", ""))
-    return found.group(1) if found else "right"
-
-
-def _link_holder(seeded):
+def _link_holder(seeded, actor: str):
     """The account whose preview link the acting actor really holds, or None for no link at all."""
     from auth import storage
     from utils.account_context import OWNER
 
-    actor = _acting_actor()
     if actor == "unauthenticated":
         return None
     if actor == "owner":
@@ -126,7 +113,7 @@ def seed_stopped_research_run(account) -> dict[str, str]:
 
 
 @seeder("runs-preview")
-def seed_preview_run(account) -> dict[str, str]:
+def seed_preview_run(account, actor: str = "right") -> dict[str, str]:
     from utils.paths import outputs_root
     from utils.account_context import run_as
     from utils.preview_token import sign_preview_ref
@@ -137,7 +124,7 @@ def seed_preview_run(account) -> dict[str, str]:
         json.dumps({"base_model_name_or_path": MARKER}), encoding = "utf-8"
     )
     run.joinpath(PREVIEW_CHECKPOINT, "adapter_config.json").write_text("{}", encoding = "utf-8")
-    holder = _link_holder(account)
+    holder = _link_holder(account, actor)
     PREVIEW_RUN_KEY.clear()
     PREVIEW_CHECKPOINT_KEY.clear()
     if holder is not None:

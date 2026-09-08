@@ -75,7 +75,7 @@ def test_object_route_account_matrix(case, actor, request):
     auth_db = request.getfixturevalue("isolated_auth")
     factory = FACTORIES[case.key]
     initialize_workspaces(accounts)
-    params = seed_resource(factory, accounts["alice"])
+    params = seed_resource(factory, accounts["alice"], actor)
     before = snapshot_resource(accounts["alice"])
     username = {"owner": "unsloth", "right": "alice", "wrong": "bob", "deactivated": "alice"}.get(
         actor
@@ -108,6 +108,8 @@ def test_object_route_account_matrix(case, actor, request):
             assert factory.fragment in response.text
     else:
         assert snapshot_resource(accounts["alice"]) == before
+        if factory.absent:
+            assert factory.absent not in response.text, response.text
         if factory.name == "api-key":
             assert len(auth_db.list_api_keys("alice")) == 1
 

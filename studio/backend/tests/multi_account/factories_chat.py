@@ -210,6 +210,7 @@ FACTORIES = {
     "routes.chat_history:GET:/threads/{thread_id}/forks": Factory(
         "chat-fork-tree",
         fragment = f'"{FORK_MESSAGE_ID}":1',
+        absent = f'"{FORK_MESSAGE_ID}"',
         owner = (200,),
         wrong = (200,),
         reason = _FORK_COUNT_REASON,
@@ -217,6 +218,7 @@ FACTORIES = {
     "routes.chat_history:GET:/threads/{thread_id}/messages/{message_id}/forks": Factory(
         "chat-fork-tree",
         fragment = '"count":1',
+        absent = '"count":1',
         owner = (200,),
         wrong = (200,),
         reason = _FORK_COUNT_REASON,

@@ -265,6 +265,7 @@ FACTORIES = {
     "routes.inference:GET:/sandbox/{session_id}": Factory(
         "media-sandbox",
         fragment = SANDBOX_FILE,
+        absent = SANDBOX_FILE,
         owner = (200,),
         wrong = (200,),
         reason = "a session id resolves inside the caller's own sandbox root, so another account "

@@ -13,7 +13,7 @@ from auth import storage
 from utils.account_context import run_as
 from utils.paths import workspace_root
 
-from .factory_base import Factory, SEEDERS, format_path, merge, seeder
+from .factory_base import Factory, call_seeder, format_path, merge, seeder
 from .seed import MESSAGE_ID, SENTINEL, THREAD_ID, seed_studio_db
 
 PROJECT_ID = "matrix-project"
@@ -174,8 +174,8 @@ def initialize_workspaces(accounts: dict) -> None:
             """)
 
 
-def seed_resource(factory: Factory, account) -> dict[str, str]:
-    params = dict(SEEDERS[factory.name](account))
+def seed_resource(factory: Factory, account, actor: str = "right") -> dict[str, str]:
+    params = dict(call_seeder(factory.name, account, actor))
     params.update(factory.extra_params)
     return params
 
