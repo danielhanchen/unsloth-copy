@@ -2104,6 +2104,7 @@ export const ja = {
       memoryEfficient: "メモリ効率化",
       weightDecomposed: "重み分解",
       notSupportedAppleSilicon: "Apple Silicon ではサポートされていません",
+      doraNeedsVisionLayersOff: "DoRA を使うにはビジョンレイヤーの学習をオフにしてください",
       optimization: "最適化",
       schedule: "スケジュール",
       memory: "メモリ",
