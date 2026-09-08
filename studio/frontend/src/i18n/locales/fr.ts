@@ -203,6 +203,8 @@ export const fr = {
       active: "Actif",
       inactive: "Inactif",
       regenerate: "Régénérer le code de configuration",
+      resetTitle: "Réinitialiser le mot de passe de {username} ?",
+      resetDescription: "Régénérer le code de configuration remplace le mot de passe de {username}, ferme ses sessions et révoque ses clés API. Donnez-lui le nouveau code pour qu'il choisisse à nouveau un mot de passe.",
       deactivate: "Désactiver",
       reactivate: "Réactiver",
       delete: "Supprimer le compte",

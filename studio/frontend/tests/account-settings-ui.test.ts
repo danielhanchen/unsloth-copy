@@ -146,6 +146,12 @@ function tab(owner = true) {
     },
   };
 }
+const confirm = async (tree: unknown) => {
+  const action = nodes(tree).find((node) => node.type === "AlertDialogAction");
+  assert.ok(action);
+  (action.props.onClick as (event: unknown) => void)({ preventDefault() {} });
+  await tick();
+};
 const click = async (tree: unknown, label: string) => {
   const button = nodes(tree).find(
     (node) => node.type === "Button" && content(node) === label,
@@ -198,7 +204,24 @@ test("create shows a copyable expiring setup code once and regeneration replaces
   await click(ui.render(), "Done");
   assert.doesNotMatch(content(ui.render()), /one-time-secret/);
   await click(ui.render(), "Regenerate setup code");
+  assert.ok(!ui.calls.some((call) => call.startsWith("regenerate:")));
+  await confirm(ui.render());
+  assert.ok(ui.calls.includes("regenerate:alice-id"));
   assert.match(content(ui.render()), /regenerated-secret/);
+});
+
+test("regenerating a setup code names what it destroys before it runs", async () => {
+  const ui = tab();
+  await click(await ui.initialize(), "Regenerate setup code");
+  const tree = ui.render();
+  assert.match(content(tree), /Reset alice's password\?/);
+  assert.match(content(tree), /revokes their API keys/);
+  const dialog = nodes(tree).find((node) => node.type === "AlertDialog");
+  assert.ok(dialog);
+  (dialog.props.onOpenChange as (open: boolean) => void)(false);
+  await tick();
+  assert.ok(!ui.calls.some((call) => call.startsWith("regenerate:")));
+  assert.doesNotMatch(content(ui.render()), /regenerated-secret/);
 });
 
 test("activation controls follow state and delete requires a named retirement confirmation", async () => {
@@ -214,9 +237,7 @@ test("activation controls follow state and delete requires a named retirement co
   assert.match(content(tree), /Delete alice\?/);
   assert.match(content(tree), /revokes alice's sessions/);
   assert.match(content(tree), /renamed aside, never deleted/);
-  const action = nodes(tree).find((node) => node.type === "AlertDialogAction");
-  (action?.props.onClick as (event: unknown) => void)({ preventDefault() {} });
-  await tick();
+  await confirm(tree);
   assert.ok(ui.calls.includes("delete:alice-id"));
 });
 

@@ -201,6 +201,8 @@ export const ja = {
       active: "有効",
       inactive: "無効",
       regenerate: "セットアップコードを再発行",
+      resetTitle: "{username} のパスワードをリセットしますか?",
+      resetDescription: "セットアップコードを再発行すると {username} のパスワードが置き換えられ、セッションは終了し、API キーは失効します。新しいコードを渡して、もう一度パスワードを選んでもらってください。",
       deactivate: "無効化",
       reactivate: "再有効化",
       delete: "アカウントを削除",

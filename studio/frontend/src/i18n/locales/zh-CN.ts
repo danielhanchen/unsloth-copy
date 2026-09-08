@@ -197,6 +197,8 @@ export const zhCN = {
       active: "已启用",
       inactive: "已停用",
       regenerate: "重新生成设置码",
+      resetTitle: "重置 {username} 的密码？",
+      resetDescription: "重新生成设置码会替换 {username} 的密码、结束其会话并吊销其 API 密钥。请把新的设置码交给对方，让其重新设置密码。",
       deactivate: "停用",
       reactivate: "重新启用",
       delete: "删除账户",

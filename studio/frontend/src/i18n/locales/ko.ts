@@ -199,6 +199,8 @@ export const ko = {
       active: "활성",
       inactive: "비활성",
       regenerate: "설정 코드 다시 생성",
+      resetTitle: "{username}의 비밀번호를 재설정할까요?",
+      resetDescription: "설정 코드를 다시 생성하면 {username}의 비밀번호가 바뀌고 세션이 종료되며 API 키가 취소됩니다. 새 코드를 전달해 비밀번호를 다시 정하도록 하세요.",
       deactivate: "비활성화",
       reactivate: "다시 활성화",
       delete: "계정 삭제",

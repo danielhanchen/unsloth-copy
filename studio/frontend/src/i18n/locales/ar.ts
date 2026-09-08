@@ -199,6 +199,8 @@ export const ar = {
       active: "نشط",
       inactive: "غير نشط",
       regenerate: "إعادة إنشاء رمز الإعداد",
+      resetTitle: "إعادة تعيين كلمة مرور {username}؟",
+      resetDescription: "إعادة إنشاء رمز الإعداد تستبدل كلمة مرور {username} وتُنهي جلساته وتُلغي مفاتيح API الخاصة به. أعطه الرمز الجديد ليختار كلمة مرور من جديد.",
       deactivate: "تعطيل",
       reactivate: "إعادة التفعيل",
       delete: "حذف الحساب",
