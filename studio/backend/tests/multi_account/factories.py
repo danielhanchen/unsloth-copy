@@ -87,7 +87,6 @@ def seed_api_key(account) -> dict[str, str]:
 @seeder("mcp")
 def seed_mcp(account) -> dict[str, str]:
     from storage import mcp_servers_db
-
     run_as(
         account,
         mcp_servers_db.create_server,
@@ -174,7 +173,11 @@ def initialize_workspaces(accounts: dict) -> None:
             """)
 
 
-def seed_resource(factory: Factory, account, actor: str = "right") -> dict[str, str]:
+def seed_resource(
+    factory: Factory,
+    account,
+    actor: str = "right",
+) -> dict[str, str]:
     params = dict(call_seeder(factory.name, account, actor))
     params.update(factory.extra_params)
     return params

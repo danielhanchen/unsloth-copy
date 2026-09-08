@@ -1452,7 +1452,6 @@ def _snapshot_chat_images() -> Optional[set[str]]:
     """The registry and the thumbnail cache are both account-scoped, so the snapshot, and
     the reap it bounds, only ever reach the acting account's images."""
     from core.inference.search_images import snapshot_and_fence_registrations
-
     return snapshot_and_fence_registrations()
 
 

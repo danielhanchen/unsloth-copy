@@ -435,4 +435,3 @@ def account_confinement(sandbox_site_dir: str) -> Optional[Confinement]:
     if unconfined_tools_allowed():
         return Confinement(mechanism = "unconfined-by-owner")
     raise ToolConfinementUnavailable(refusal_message())
-

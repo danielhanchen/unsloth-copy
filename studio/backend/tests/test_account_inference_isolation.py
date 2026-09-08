@@ -542,7 +542,7 @@ def test_the_lora_and_controlnet_scanners_read_the_reported_directory(tmp_path, 
 
     owner_lora = run_as(OWNER, diffusion_lora.loras_dir) / "owner-private.safetensors"
     owner_lora.write_bytes(b"weights")
-    assert [entry.id for entry in run_as(ALICE, diffusion_lora.list_loras) if entry.source == "local"] == []
-    assert any(
-        entry.source == "local" for entry in run_as(OWNER, diffusion_lora.list_loras)
-    )
+    assert [
+        entry.id for entry in run_as(ALICE, diffusion_lora.list_loras) if entry.source == "local"
+    ] == []
+    assert any(entry.source == "local" for entry in run_as(OWNER, diffusion_lora.list_loras))

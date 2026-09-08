@@ -472,7 +472,9 @@ def _login_failure_detail() -> str:
             f"the account, by running this on the Studio host: {_reset_password_command()} "
             "--username <name>"
         )
-    return f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}"
+    return (
+        f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}"
+    )
 
 
 @router.post("/login", response_model = Token)

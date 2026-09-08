@@ -500,11 +500,7 @@ def require_model_access(reference: str, repo_type: str = "model") -> None:
 
 
 def _row_reference(row):
-    get = (
-        row.get
-        if isinstance(row, dict)
-        else lambda key, default = None: getattr(row, key, default)
-    )
+    get = row.get if isinstance(row, dict) else lambda key, default = None: getattr(row, key, default)
     return get("path") or get("local_path") or get("repo_id") or get("model_id") or get("id")
 
 

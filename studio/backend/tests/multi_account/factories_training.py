@@ -46,7 +46,6 @@ _EVENTS_REASON = (
 def _claim_in_process_job(service) -> None:
     """Tag an in-memory job service for the acting account, as account_jobs.owned_job does."""
     from utils.account_context import current_account
-
     with service._account_job_lock:
         service._result_account = service.job_account = current_account()
 

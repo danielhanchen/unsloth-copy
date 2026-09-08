@@ -414,6 +414,9 @@ def test_the_per_identity_cache_is_bounded(settings_store, monkeypatch):
         ems._get_stored_state()
     assert len(ems._cached) <= ems._CACHE_MAX
     # The newest fill survives the sweep.
-    assert (f"account-{ems._CACHE_MAX * 2 - 1}", ems.EMBEDDING_RESOLUTION_SETTING_KEY) in ems._cached
+    assert (
+        f"account-{ems._CACHE_MAX * 2 - 1}",
+        ems.EMBEDDING_RESOLUTION_SETTING_KEY,
+    ) in ems._cached
     ems._cached.clear()
     ems._generation.clear()

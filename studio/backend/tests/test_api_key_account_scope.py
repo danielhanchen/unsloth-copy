@@ -136,9 +136,7 @@ def test_a_key_row_that_outlived_its_account_is_not_resolved_by_a_namesake(auth_
 
     conn = sqlite3.connect(storage.DB_PATH)
     with conn:
-        conn.execute(
-            "UPDATE auth_user SET account_id = ? WHERE username = 'alice'", ("f" * 32,)
-        )
+        conn.execute("UPDATE auth_user SET account_id = ? WHERE username = 'alice'", ("f" * 32,))
     conn.close()
     assert storage.validate_api_key_account(raw) is None
 

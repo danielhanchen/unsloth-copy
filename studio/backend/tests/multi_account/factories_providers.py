@@ -69,7 +69,6 @@ def _create_provider(provider_id: str, provider_type: str, display_name: str) ->
 def _drop_in_process_flows(provider_id: str) -> None:
     """Forget flow objects an earlier test left bound to a closed event loop."""
     from core.inference import openai_codex_auth as codex_auth
-
     for flow_id, flow in list(codex_auth._flows.items()):
         if flow.provider_id != provider_id:
             continue

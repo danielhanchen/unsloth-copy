@@ -154,9 +154,7 @@ def seed_chat_fork_source(account) -> dict[str, str]:
     from utils.account_context import run_as
 
     run_as(account, studio_db.upsert_chat_thread, _thread(FORK_THREAD_ID))
-    run_as(
-        account, studio_db.upsert_chat_message, _user_message(FORK_MESSAGE_ID, FORK_THREAD_ID)
-    )
+    run_as(account, studio_db.upsert_chat_message, _user_message(FORK_MESSAGE_ID, FORK_THREAD_ID))
     return {"thread_id": FORK_THREAD_ID, "message_id": FORK_MESSAGE_ID}
 
 

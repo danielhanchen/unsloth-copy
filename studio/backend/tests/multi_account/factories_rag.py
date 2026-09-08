@@ -30,7 +30,6 @@ def _connection(account):
 def _uploads_dir(account):
     from utils.account_context import run_as
     from utils.paths import ensure_dir, rag_uploads_root
-
     return run_as(account, lambda: ensure_dir(rag_uploads_root()))
 
 
@@ -43,7 +42,6 @@ def _store_file(account) -> str:
 
 def _create_kb(conn) -> None:
     from core.rag import store
-
     store.create_kb(conn, name = KB_NAME, description = None, kb_id = KB_ID)
 
 
@@ -51,7 +49,6 @@ def _create_document(account, conn, *, scope: str, **columns) -> None:
     import hashlib
 
     from core.rag import store
-
     store.create_document(
         conn,
         scope = scope,
@@ -185,9 +182,7 @@ def seed_rag_thread_document(account) -> dict[str, str]:
 
     conn = _connection(account)
     try:
-        _create_document(
-            account, conn, scope = store.thread_scope(THREAD_ID), thread_id = THREAD_ID
-        )
+        _create_document(account, conn, scope = store.thread_scope(THREAD_ID), thread_id = THREAD_ID)
     finally:
         conn.close()
     return {"thread_id": THREAD_ID, "document_id": DOCUMENT_ID}
@@ -266,12 +261,8 @@ FACTORIES = {
         reason = _INGESTION_SSE,
     ),
     "routes.rag:GET:/linked-folder-jobs/{job_id}": Factory("rag-folder", fragment = FOLDER_JOB_ID),
-    "routes.rag:GET:/linked-folder-jobs/{job_id}/events": Factory(
-        "rag-folder", fragment = "[DONE]"
-    ),
-    "routes.rag:POST:/linked-folder-jobs/{job_id}/events": Factory(
-        "rag-folder", fragment = "[DONE]"
-    ),
+    "routes.rag:GET:/linked-folder-jobs/{job_id}/events": Factory("rag-folder", fragment = "[DONE]"),
+    "routes.rag:POST:/linked-folder-jobs/{job_id}/events": Factory("rag-folder", fragment = "[DONE]"),
     "routes.rag:PATCH:/linked-folders/{folder_id}": Factory(
         "rag-folder", {"name": EDITED}, fragment = EDITED
     ),

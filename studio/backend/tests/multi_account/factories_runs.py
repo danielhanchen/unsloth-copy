@@ -27,6 +27,8 @@ PREVIEW_CHAT_BODY = {
 # Mutated by the preview seeder: /p takes a signed capability token, never the actor's JWT.
 PREVIEW_RUN_KEY: dict = {}
 PREVIEW_CHECKPOINT_KEY: dict = {}
+
+
 # /p authenticates a signed link, not the actor's JWT, so each actor presents the link it would hold.
 def _link_holder(seeded, actor: str):
     """The account whose preview link the acting actor really holds, or None for no link at all."""
@@ -180,9 +182,7 @@ FACTORIES = {
     "routes.preview:GET:/{run}/{checkpoint}": _preview(
         f"{PREVIEW_RUN}/{PREVIEW_CHECKPOINT}", PREVIEW_CHECKPOINT_KEY
     ),
-    "routes.preview:GET:/{run}/v1/models": _preview(
-        f'"id":"{PREVIEW_RUN}"', PREVIEW_RUN_KEY
-    ),
+    "routes.preview:GET:/{run}/v1/models": _preview(f'"id":"{PREVIEW_RUN}"', PREVIEW_RUN_KEY),
     "routes.preview:GET:/{run}/{checkpoint}/v1/models": _preview(
         f'"id":"{PREVIEW_RUN}/{PREVIEW_CHECKPOINT}"', PREVIEW_CHECKPOINT_KEY
     ),
