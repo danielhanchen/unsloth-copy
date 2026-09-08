@@ -430,3 +430,17 @@ test("a legacy marker still compares on the name when neither side has an id", a
   );
   assert.equal(other.data.has("unsloth-private"), false);
 });
+
+test("switching accounts clears the legacy browser-only chat store", async () => {
+  // The one-shot import would otherwise carry the last account's threads into this one.
+  const b = browserWith({ [BROWSER_ACCOUNT_KEY]: "unsloth" });
+  await transitionBrowserAccount("alice", "/chat", () => {}, b.browser);
+  // DEXIE_DB_NAME in src/features/chat/db.ts.
+  assert.ok(b.deleted.includes("unsloth-chat"));
+});
+
+test("the owner's own first login keeps the legacy chat store to import", async () => {
+  const b = browserWith({});
+  await transitionBrowserAccount("unsloth", "/chat", () => {}, b.browser);
+  assert.deepEqual(b.deleted, []);
+});

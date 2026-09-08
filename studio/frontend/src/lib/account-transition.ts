@@ -25,6 +25,8 @@ export const ACCOUNT_CHROME_PREFIXES = [
 export const ACCOUNT_DATABASES = [
   "unsloth-data-recipes",
   "unsloth-data-recipe-executions",
+  // Legacy chat store: the one-shot import would push its threads into the next account.
+  "unsloth-chat",
 ] as const;
 
 export type AccountTransitionBrowser = Pick<
