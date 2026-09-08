@@ -68,6 +68,17 @@ def account_path(
     return value
 
 
+def visible_cached_path(value, repo_type: str = "model"):
+    """Accept a Hub cache path the picker handed back for a repo this account can see."""
+    if not value or not managed_account():
+        return value
+    from hub.services.models import account_access
+
+    if account_access.model_visible(str(value), repo_type = repo_type):
+        return value
+    return account_path(value)
+
+
 def account_hf_token(token):
     """False explicitly disables the Hub's environment and saved-token fallback."""
     if managed_account():
@@ -108,13 +119,17 @@ def validate_job_paths(values: dict, *, cached_resources: bool = False) -> None:
         return
     for key in ("model_name", "base_model", "base_model_id", "hf_dataset"):
         account_path(values.get(key), reference = True)
-    for key in (
-        "model_local_path",
-        "dataset_local_path",
-        "model_snapshot_path",
-        "dataset_snapshot_path",
+    for key, repo_type in (
+        ("model_local_path", "model"),
+        ("dataset_local_path", "dataset"),
+        ("model_snapshot_path", "model"),
+        ("dataset_snapshot_path", "dataset"),
     ):
-        account_path(values.get(key), shared_cache = cached_resources)
+        value = values.get(key)
+        if value and not cached_resources:
+            visible_cached_path(value, repo_type)
+            continue
+        account_path(value, shared_cache = cached_resources)
     for key in (
         "checkpoint_path",
         "resume_from_checkpoint",

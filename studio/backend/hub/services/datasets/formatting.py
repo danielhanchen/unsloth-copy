@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
-from core.training.account_jobs import account_hf_token, account_path
+from core.training.account_jobs import (
+    account_hf_token,
+    account_path,
+    visible_cached_path,
+)
 import base64
 import errno
 import io
@@ -345,7 +349,7 @@ def check_format_response(
     """
     hf_token = account_hf_token(hf_token)
     account_path(request.dataset_name, reference = True)
-    account_path(getattr(request, "local_path", None))
+    visible_cached_path(getattr(request, "local_path", None), "dataset")
     try:
         from itertools import islice
 
@@ -567,7 +571,7 @@ def ai_assist_mapping_response(
     """
     hf_token = account_hf_token(hf_token)
     account_path(request.dataset_name, reference = True)
-    account_path(getattr(request, "local_path", None))
+    visible_cached_path(getattr(request, "local_path", None), "dataset")
     try:
         from hub.utils.llm_assist import llm_conversion_advisor
 
