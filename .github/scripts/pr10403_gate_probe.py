@@ -42,6 +42,9 @@ def probe(skip_base: bool) -> dict:
 
     stack._progress = fake_progress
     stack.pip_install = lambda label, *a, **k: installs.append((label, a))
+    # pip_install_try is a second entry point that shells out to uv; a bare runner has
+    # no uv, and leaving it live also means the probe really installs things.
+    stack.pip_install_try = lambda label, *a, **k: True
     stack.run = lambda label, *a, **k: True
     for name, value in {
         "_bootstrap_uv": True,

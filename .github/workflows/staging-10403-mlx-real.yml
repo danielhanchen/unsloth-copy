@@ -89,6 +89,9 @@ jobs:
           export UV_OVERRIDE="$PWD/studio/backend/requirements/single-env/overrides-darwin-arm64.txt"
           uv pip install --python .mlxenv/bin/python --no-cache-dir --upgrade \
             'mlx==0.32.1' 'mlx-metal==0.32.1' 'mlx-lm==0.31.3' 'mlx-vlm>=0.4.4,<0.7.0'
+          # Studio's own verdict is read from backend/utils/mlx_repair.py, which imports
+          # the backend package; these are what that import needs on a bare runner.
+          uv pip install --python .mlxenv/bin/python structlog pyyaml
           uv pip list --python .mlxenv/bin/python | grep -i mlx
       - name: Imports, Metal compute, and Studio's own verdict
         run: .mlxenv/bin/python .github/scripts/pr10403_mlx_probe.py
