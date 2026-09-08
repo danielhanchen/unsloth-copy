@@ -375,6 +375,15 @@ def macos_profile(
         lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")
     for path in hidden_roots:
         lines.append(f"(deny file-read* file-write* (subpath {_sbpl(path)}))")
+    # Later rules win: re-allow read roots the denies above covered (the venv under the
+    # install root), then re-deny any hidden root nested inside them.
+    for path in read_roots:
+        if not any(_contains(root, path) and root != path for root in hidden_roots):
+            continue
+        lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")
+        for root in hidden_roots:
+            if _contains(path, root) and root != path:
+                lines.append(f"(deny file-read* file-write* (subpath {_sbpl(root)}))")
     for path in account_read_roots:
         lines.append(f"(allow file-read* (subpath {_sbpl(path)}))")
     for path in writable_roots:

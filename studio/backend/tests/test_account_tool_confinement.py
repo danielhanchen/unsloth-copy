@@ -108,6 +108,23 @@ def test_macos_profile_hides_install_root_then_allows_own_roots(tmp_path, monkey
     assert argv[3:] == ["bash", "-c", "true"]
 
 
+def test_macos_profile_keeps_the_interpreter_readable_under_a_hidden_root(tmp_path, monkeypatch):
+    """Later rules win: an interpreter prefix inside the install root must be allowed again."""
+    venv = tmp_path / "studio" / "unsloth_studio"
+    (venv / "lib").mkdir(parents = True)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(tool_confinement.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(tool_confinement, "_interpreter_roots", lambda: [str(venv)])
+    run_as(ALICE, tools._get_workdir, "chat")
+    profile = run_as(ALICE, tools._account_confinement).wrap(["bash"])[2]
+
+    studio = str((tmp_path / "studio").resolve())
+    deny = profile.rindex(f'(deny file-read* file-write* (subpath "{studio}"))')
+    allow = profile.rindex(f'(allow file-read* (subpath "{venv}"))')
+    assert deny < allow, "the interpreter must be readable after the install root is denied"
+    assert f'(allow file-read* (subpath "{studio}"))' not in profile
+
+
 def test_macos_profile_hides_other_accounts_temporary_roots(tmp_path, monkeypatch):
     """Every account's tmp_root lives under one per-user temp directory, which the
     profile's runtime grants open wholesale; the account's own subtree is allowed back."""
