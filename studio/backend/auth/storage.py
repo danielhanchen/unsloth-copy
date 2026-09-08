@@ -1838,7 +1838,9 @@ def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tu
 
     The record is read in the statement that matched the key, so the request binds to
     that identity rather than a second lookup by a username that may be recreated
-    meanwhile. A deactivated account does not validate.
+    meanwhile. The join carries the id too, so a key row that outlived its account is
+    not resolved by a namesake; only the owner's rows are allowed to carry no id. A
+    deactivated account does not validate.
 
     The key check and the credential read share one write transaction, so a reset
     committing right after cannot hand its new generation to this request.
@@ -1859,6 +1861,7 @@ def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tu
                    u.account_id, u.role, u.is_active AS account_active,
                    COALESCE(u.account_jwt_secret, u.jwt_secret) AS jwt_secret
             FROM api_keys k JOIN auth_user u ON u.username = k.username
+              AND (k.account_id = u.account_id OR (k.account_id IS NULL AND u.role = 'owner'))
             WHERE k.key_hash {_FENCED_HASH_SQL}
             """,
             _hash_candidates(key_hash),

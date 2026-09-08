@@ -125,3 +125,33 @@ def test_a_managed_key_minted_without_an_explicit_scope_is_still_pinned(auth_db)
     alice = _alice()
     _raw, row = storage.create_api_key("alice", name = "data-recipe workflow", internal = True)
     assert row["account_id"] == alice
+
+
+def test_a_key_row_that_outlived_its_account_is_not_resolved_by_a_namesake(auth_db):
+    """The join matched on username alone, so a key row surviving a delete and recreate
+    authenticated as the new account."""
+    old_id = _alice()
+    raw, _row = storage.create_api_key("alice", name = "old", account_id = old_id)
+    assert storage.validate_api_key_account(raw)[0]["account_id"] == old_id
+
+    conn = sqlite3.connect(storage.DB_PATH)
+    with conn:
+        conn.execute(
+            "UPDATE auth_user SET account_id = ? WHERE username = 'alice'", ("f" * 32,)
+        )
+    conn.close()
+    assert storage.validate_api_key_account(raw) is None
+
+
+def test_a_managed_key_with_no_id_does_not_validate(auth_db):
+    """An older build minting a key for a managed username leaves the id unset; only the
+    owner's rows may carry none."""
+    alice = _alice()
+    raw, _row = storage.create_api_key("alice", name = "old-build", account_id = alice)
+    conn = sqlite3.connect(storage.DB_PATH)
+    with conn:
+        conn.execute("UPDATE api_keys SET account_id = NULL WHERE username = 'alice'")
+    conn.close()
+    assert storage.validate_api_key_account(raw) is None
+    owner_raw, _owner_row = storage.create_api_key("unsloth", name = "cli")
+    assert storage.validate_api_key_account(owner_raw)[0]["account_id"] == "owner"
