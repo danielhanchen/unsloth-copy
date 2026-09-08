@@ -20,7 +20,6 @@ from .inventory import (
     looks_like_object_id,
     render_inventory,
     walk_router,
-    worker_for,
 )
 from .support import bearer
 
@@ -29,18 +28,17 @@ ACTORS = ("owner", "right", "wrong", "unauthenticated", "deactivated")
 
 def matrix_parameters():
     for case in OBJECT_ROUTES:
-        for actor in ACTORS:
-            marks = []
-            if case.key not in FACTORIES:
-                marks.append(pytest.mark.xfail(strict = True, reason = f"worker {worker_for(case)}"))
-            yield pytest.param(case, actor, id = f"{case.key}[{actor}]", marks = marks)
+        if case.key in FACTORIES:
+            for actor in ACTORS:
+                yield pytest.param(case, actor, id = f"{case.key}[{actor}]")
+
+
+def test_object_route_factory_completeness():
+    assert not [case.key for case in OBJECT_ROUTES if case.key not in FACTORIES]
 
 
 @pytest.mark.parametrize("case,actor", list(matrix_parameters()))
 def test_object_route_account_matrix(case, actor, request):
-    assert (
-        case.key in FACTORIES
-    ), f"Uncovered resource factory: {case.key}; see artifacts/route_inventory.md"
     accounts = request.getfixturevalue("accounts")
     auth_db = request.getfixturevalue("isolated_auth")
     factory = FACTORIES[case.key]
@@ -119,7 +117,9 @@ def test_inventory_contains_hidden_routes_and_no_duplicate_method_paths():
     generated = {
         (parameter.values[0].key, parameter.values[1]) for parameter in matrix_parameters()
     }
-    assert generated == {(case.key, actor) for case in OBJECT_ROUTES for actor in ACTORS}
+    assert generated == {
+        (case.key, actor) for case in OBJECT_ROUTES if case.key in FACTORIES for actor in ACTORS
+    }
     report = render_inventory()
     assert all(f"`{case.path}`" in report for case in OBJECT_ROUTES)
 
