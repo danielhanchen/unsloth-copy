@@ -133,13 +133,11 @@ def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:
     Call under the lifecycle gate before touching any backend, including replacements
     within CHAT or DIFFUSION where the modality owner does not change.
     """
-    from auth.policy import installation_is_multi_user
     from utils.account_context import current_account_id
 
-    if installation_is_multi_user():
-        busy = other_accounts_active(account_id or current_account_id())
-        if busy:
-            raise GpuBusyForAnotherAccountError(_owner or CHAT, busy)
+    busy = other_accounts_active(account_id or current_account_id())
+    if busy:
+        raise GpuBusyForAnotherAccountError(_owner or CHAT, busy)
 
 
 def require_no_foreign_generations(
