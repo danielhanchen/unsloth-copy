@@ -31,6 +31,15 @@ def invalidate_account_cache() -> None:
         _cached = None
 
 
+def account_generation() -> int:
+    """Bumped by every account create, delete, activate and deactivate.
+
+    A per-account answer cached against this is revoked by the lifecycle change itself
+    rather than expiring on a timer.
+    """
+    return _generation
+
+
 def _account_counts() -> tuple[int, int]:
     global _cached
     with _lock:

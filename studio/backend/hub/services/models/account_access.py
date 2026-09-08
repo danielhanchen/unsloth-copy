@@ -45,8 +45,36 @@ def media_link_target(media_id: str) -> str:
     return f"{current_account().account_id}:{media_id}"
 
 
+_link_accounts: dict[str, tuple[int, AccountContext | None]] = {}
+_link_accounts_lock = threading.Lock()
+
+
+def _signed_link_account(account_id: str) -> AccountContext | None:
+    """The account a signed link names, or None once it is deactivated or deleted.
+
+    Cached against the policy generation, which every account lifecycle change bumps, so a
+    deactivation revokes the outstanding links on the next request rather than at the TTL.
+    """
+    generation = policy.account_generation()
+    with _link_accounts_lock:
+        cached = _link_accounts.get(account_id)
+        if cached is not None and cached[0] == generation:
+            return cached[1]
+    from auth.storage import get_account_by_id
+
+    account = get_account_by_id(account_id)
+    with _link_accounts_lock:
+        if len(_link_accounts) >= 256:
+            _link_accounts.clear()
+        _link_accounts[account_id] = (generation, account)
+    return account
+
+
 def media_link_account(target: str | None, media_id: str) -> AccountContext | None:
-    """Resolve an already signature-verified target, never an unsigned account selector."""
+    """Resolve an already signature-verified target, never an unsigned account selector.
+
+    A valid signature is not enough: the link must not outlive the account that minted it.
+    """
     if target == media_id:
         return OWNER
     if not target:
@@ -56,7 +84,8 @@ def media_link_account(target: str | None, media_id: str) -> AccountContext | No
         return None
     if account_id == OWNER.account_id:
         return OWNER
-    return AccountContext(account_id, "", "user")
+    account = _signed_link_account(account_id)
+    return None if account is None or account.is_owner else account
 
 
 def managed_account() -> bool:
