@@ -20,6 +20,14 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 import utils.mlx_repair as mr  # noqa: E402
+import importlib.metadata as metadata
+import utils.hardware.hardware as hw
+
+
+class _Result:
+    returncode = 0
+    stdout = ""
+
 
 
 @pytest.fixture(autouse = True)
@@ -120,10 +128,6 @@ def test_repair_install_pins_transformers_and_cleans_up(monkeypatch):
     monkeypatch.setattr(mr, "_transformers_constraint_args", _spy_args)
     monkeypatch.setattr(mr, "_uv_executable", lambda: "/usr/bin/uv")
 
-    class _Result:
-        returncode = 0
-        stdout = ""
-
     def _fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env")
@@ -159,10 +163,6 @@ def test_install_requires_prebuilt_wheels(monkeypatch):
     # mlx-lm/mlx-vlm publish py3-none-any wheels, so a healthy self-heal still works.
     pytest.importorskip("transformers")
     captured = {}
-
-    class _Result:
-        returncode = 0
-        stdout = ""
 
     monkeypatch.setattr(mr, "_uv_executable", lambda: "/usr/bin/uv")
     monkeypatch.setattr(
@@ -216,10 +216,6 @@ def test_install_env_drops_secrets_and_source_redirects(monkeypatch):
 def test_repair_rejects_inadequate_stack(monkeypatch):
     # A successful uv run that still leaves an old/missing mlx-vlm must NOT clear
     # chat-only: attempt_mlx_repair returns False so Train/Export stay disabled.
-    class _Result:
-        returncode = 0
-        stdout = ""
-
     monkeypatch.setattr(mr.subprocess, "run", lambda *a, **k: _Result())
     monkeypatch.setattr(mr, "mlx_stack_available", lambda: False)
     assert mr.attempt_mlx_repair() is False
@@ -229,10 +225,6 @@ def test_inadequate_stack_warning_names_the_floors_not_the_install_pins(monkeypa
     # The gate this message reports on is mlx_stack_available(), which tests the
     # floors. Quoting the install pins instead would tell an operator running a
     # perfectly usable mlx 0.33 that they need exactly 0.32.1.
-    class _Result:
-        returncode = 0
-        stdout = ""
-
     warnings = []
     # Pin both, or this test measures the host. attempt_mlx_repair returns early
     # when _uv_executable() finds nothing, long before the message under test, so
@@ -254,10 +246,6 @@ def test_inadequate_stack_warning_names_the_floors_not_the_install_pins(monkeypa
 def test_repair_invalidates_import_caches_before_stack_check(monkeypatch):
     events = []
 
-    class _Result:
-        returncode = 0
-        stdout = ""
-
     def _stack_available():
         events.append("check")
         assert events == ["invalidate", "check"]
@@ -274,8 +262,6 @@ def test_repair_invalidates_import_caches_before_stack_check(monkeypatch):
 
 
 def test_stack_unavailable_without_mlx(monkeypatch):
-    import importlib.metadata as metadata
-
     def _missing(_name):
         raise metadata.PackageNotFoundError(_name)
 
@@ -284,8 +270,6 @@ def test_stack_unavailable_without_mlx(monkeypatch):
 
 
 def test_stack_unavailable_checks_versions_before_imports(monkeypatch):
-    import importlib.metadata as metadata
-
     def _version(name):
         if name == "mlx":
             return "0.21.0"
@@ -300,8 +284,6 @@ def test_stack_unavailable_checks_versions_before_imports(monkeypatch):
 
 
 def test_stack_unavailable_when_companion_import_fails(monkeypatch):
-    import importlib.metadata as metadata
-
     monkeypatch.setattr(metadata, "version", lambda name: mr._MLX_MIN_VERSIONS[name])
 
     def _import_module(name):
@@ -314,8 +296,6 @@ def test_stack_unavailable_when_companion_import_fails(monkeypatch):
 
 
 def test_stack_available_requires_runtime_imports_and_versions(monkeypatch):
-    import importlib.metadata as metadata
-
     imported = []
 
     def _import_module(name):
@@ -370,8 +350,6 @@ def test_apple_silicon_missing_mlx_starts_repair_and_redetects(monkeypatch):
     # _run_repair_and_redetect imports utils.hardware.hardware lazily; stub repair
     # and capture that re-detection is invoked on success.
     monkeypatch.setattr(mr, "attempt_mlx_repair", _fake_repair)
-
-    import utils.hardware.hardware as hw
 
     monkeypatch.setattr(hw, "detect_hardware", lambda: redetected.__setitem__("called", True))
 
@@ -537,8 +515,6 @@ def _published_verdict(monkeypatch, *, chat_only: bool, reason):
     """Settled means a device and a set event beside the reason (a chat-only Mac measured its
     way to CPU, not to nothing), or a success check ignoring the verdict would pass. The state
     is monkeypatched, so nothing leaks to the next test."""
-    import utils.hardware.hardware as hw
-
     settled = threading.Event()
     settled.set()
     monkeypatch.setattr(hw, "DEVICE", hw.DeviceType.CPU if chat_only else hw.DeviceType.MLX)
@@ -581,7 +557,6 @@ def _join_the_repair_worker():
 
 def test_a_stack_that_measures_usable_overturns_the_verdict(monkeypatch):
     # The #9120 shape: chat-only cached from a race the warm has since finished importing.
-    import utils.hardware.hardware as hw
 
     monkeypatch.setattr(mr, "is_apple_silicon", lambda: True)
     monkeypatch.setattr(mr, "mlx_stack_available", lambda: True)
@@ -646,8 +621,6 @@ def test_the_overturn_cannot_republish_into_a_stopped_lifespan(monkeypatch):
     """detect_hardware() reads the current epoch when it owns none, so an unscoped re-detect
     adopts the one shutdown moved to and publishes for a dead lifespan, which the next then
     inherits instead of measuring for itself."""
-    import utils.hardware.hardware as hw
-
     monkeypatch.setattr(mr, "is_apple_silicon", lambda: True)
     _published_verdict(monkeypatch, chat_only = True, reason = "mlx_unavailable")
     settled = (hw.DEVICE, hw.CHAT_ONLY, hw.CHAT_ONLY_REASON)
@@ -669,8 +642,6 @@ def test_the_overturn_cannot_republish_into_a_stopped_lifespan(monkeypatch):
 def test_a_redetect_that_publishes_nothing_is_not_announced(monkeypatch):
     """Nothing is published either way, and #9120 was diagnosed entirely from these lines:
     one claiming a recovery that did not happen is worse than silence."""
-    import utils.hardware.hardware as hw
-
     monkeypatch.setattr(mr, "is_apple_silicon", lambda: True)
     _published_verdict(monkeypatch, chat_only = True, reason = "mlx_unavailable")
     announced = _recorded_announcements(monkeypatch)
@@ -728,8 +699,6 @@ def test_an_opted_out_host_with_nothing_to_overturn_imports_nothing(monkeypatch)
 def test_the_repair_worker_is_scoped_to_the_epoch_read_before_the_measurement(monkeypatch):
     """The measurement imports the MLX runtime, so shutdown can land inside it: reading the
     epoch afterwards binds the repair to the one shutdown moved to."""
-    import utils.hardware.hardware as hw
-
     monkeypatch.setattr(mr, "is_apple_silicon", lambda: True)
     _published_verdict(monkeypatch, chat_only = True, reason = "mlx_unavailable")
     before = hw.current_detection_epoch()

@@ -19,6 +19,13 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import routes.inference as inference_route
+
+
+class _Config:
+    is_gguf = True
+    gguf_variant = ""
+
 
 _BACKEND = Path(__file__).resolve().parent.parent
 _LSA_PATH = _BACKEND / "core" / "inference" / "llama_server_args.py"
@@ -136,8 +143,6 @@ def test_a_control_character_in_a_stored_value_is_dropped_too():
 
 
 def test_the_inherited_load_path_drops_only_the_denied_flag(monkeypatch):
-    import routes.inference as inference_route
-
     assert hasattr(inference_route, "drop_managed_flags"), (
         "the resolver reads this from module globals; an unlisted import NameErrors "
         "only when a model with stored flags is loaded"
@@ -148,10 +153,6 @@ def test_the_inherited_load_path_drops_only_the_denied_flag(monkeypatch):
         # Same model and variant, or the resolver refuses the pickup before it ever
         # reaches the drop and the test proves nothing.
         extra_args_source = ("local/x", "")
-
-    class _Config:
-        is_gguf = True
-        gguf_variant = ""
 
     class _Request:
         llama_extra_args = None
@@ -169,15 +170,9 @@ def test_the_inherited_load_path_drops_only_the_denied_flag(monkeypatch):
 
 def _inherit_with_ctx_flag(monkeypatch, stored, fields_set, max_seq_length):
     """Drive the real resolver for a same-model reload that inherits its extras."""
-    import routes.inference as inference_route
-
     class _Backend:
         extra_args = list(stored)
         extra_args_source = ("local/x", "")
-
-    class _Config:
-        is_gguf = True
-        gguf_variant = ""
 
     class _Request:
         llama_extra_args = None
@@ -328,8 +323,6 @@ def test_validate_sizes_itself_with_the_arguments_the_caller_sent():
     # preflight approved a different command from the one that runs.
     import inspect
 
-    import routes.inference as inference_route
-
     source = inspect.getsource(inference_route)
     assert (
         "_resolve_inherited_extra_args(\n            request, config, model_identifier, None\n        )"
@@ -342,10 +335,6 @@ def test_validate_sizes_itself_with_the_arguments_the_caller_sent():
 
     class _Request:
         llama_extra_args = ["--ctx-size", "8192"]
-
-    class _Config:
-        is_gguf = True
-        gguf_variant = ""
 
     # The helper's own contract: an explicit list is returned as given.
     assert inference_route._resolve_inherited_extra_args(
