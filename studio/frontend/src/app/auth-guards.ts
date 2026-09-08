@@ -4,6 +4,7 @@
 import { redirect } from "@tanstack/react-router";
 import { apiUrl, isTauri } from "@/lib/api-base";
 import { isTauriLoginRequired } from "@/features/auth/tauri-auto-auth";
+import { setLoginMode } from "@/features/auth/login-client";
 import {
   getPostAuthRoute,
   hasAuthToken,
@@ -23,6 +24,7 @@ interface AuthStatus {
   initialized: boolean;
   requires_password_change: boolean;
   login_mode?: "single" | "multi";
+  full_access?: boolean;
 }
 
 const AUTH_STATUS_TTL_MS = 30_000;
@@ -50,6 +52,9 @@ async function fetchAuthStatus(): Promise<AuthStatus> {
       }
       const status = (await res.json()) as AuthStatus;
       authStatusCheckedAt = Date.now();
+      // This path has its own request, so it also owns keeping the document-wide
+      // account policy current; otherwise a guard read leaves a stale hint standing.
+      setLoginMode(status.login_mode ?? "single", status.full_access);
       // Public status describes the owner bootstrap, not the signed-in account.
       // Multi-account login/refresh supplies the session's password-change flag.
       if (status.login_mode === "multi") {

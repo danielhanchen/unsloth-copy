@@ -179,6 +179,9 @@ function environment(t: TestContext) {
       setItem: (key: string, value: string) => {
         values.set(key, value);
       },
+      removeItem: (key: string) => {
+        values.delete(key);
+      },
     },
   } as unknown as Window & typeof globalThis;
   t.after(() => {
@@ -495,7 +498,11 @@ test("a deactivated account keeps full access hidden while the form is back in s
     window.localStorage.getItem("unsloth_chat_permission_mode"),
     "auto",
   );
-  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), null);
+  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), "restricted");
+  // The hint outlives the document, so a reload cannot offer Full access back.
+  const reloaded = client();
+  assert.equal(reloaded.getLoginMode(), "single");
+  assert.equal(reloaded.getFullAccessAllowed(), false);
   // A status without the flag keeps what is known; the next explicit answer wins.
   api.setLoginMode("single");
   assert.equal(api.getFullAccessAllowed(), false);
@@ -506,8 +513,46 @@ test("a deactivated account keeps full access hidden while the form is back in s
       login_mode: "single",
       full_access: true,
     });
+  // Only a status can relax the hint, so the reloaded document has to ask for one.
+  reloaded.ensureLoginMode();
+  await tick();
+  assert.equal(reloaded.getFullAccessAllowed(), true);
   await api.fetchAuthStatus();
   assert.equal(api.getFullAccessAllowed(), true);
+  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), null);
   api.setLoginMode("multi");
   assert.equal(api.getFullAccessAllowed(), false);
+});
+
+test("a deactivated account hides full access in peer tabs without changing the login form", (t) => {
+  environment(t);
+  const handlers = new Set<(event: Partial<StorageEvent>) => void>();
+  window.addEventListener = ((
+    _name: string,
+    handler: (event: Partial<StorageEvent>) => void,
+  ) => {
+    handlers.add(handler);
+  }) as typeof window.addEventListener;
+  window.removeEventListener = ((
+    _name: string,
+    handler: (event: Partial<StorageEvent>) => void,
+  ) => {
+    handlers.delete(handler);
+  }) as typeof window.removeEventListener;
+  const api = client();
+  let notified = 0;
+  const unsubscribe = api.subscribeLoginMode(() => {
+    notified++;
+  });
+  for (const handler of handlers)
+    handler({
+      key: api.LOGIN_MODE_HINT_KEY,
+      oldValue: null,
+      newValue: "restricted",
+    });
+  assert.equal(api.getLoginMode(), "single");
+  assert.equal(api.getFullAccessAllowed(), false);
+  assert.equal(notified, 1);
+  unsubscribe();
+  assert.equal(handlers.size, 0);
 });
