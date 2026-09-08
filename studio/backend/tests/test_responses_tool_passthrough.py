@@ -29,6 +29,67 @@ import sys
 import asyncio
 from types import SimpleNamespace
 
+
+# Shared setup for test_final_chunk_timings_reach_the_monitor, test_final_visible_text_updates_monitor, test_function_call_chunk_updates_monitor_reply and 2 more.
+def _shared_setup_1(monitor):
+    monitor_id = monitor.start(
+        endpoint = "/v1/responses",
+        method = "POST",
+        model = "m",
+        prompt = "hi",
+    )
+    payload = ResponsesRequest(input = "hi", stream = True)
+    messages = [ChatMessage(role = "user", content = "hi")]
+    return messages, monitor_id, payload
+
+
+# Shared setup for test_non_reasoning_gguf_stream_keeps_literal_think_tags_visible, test_reasoning_capable_gguf_stream_parses_think_tags_by_default, test_reasoning_only_stream_stays_out_of_visible_message_text and 4 more.
+def _shared_setup_2(run, self):
+    lines = asyncio.run(run())
+
+    reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
+    text_deltas = self._payloads(lines, "response.output_text.delta")
+    return lines, reasoning_deltas, text_deltas
+
+
+# Shared setup for test_a_healed_truncated_tool_call_remains_incomplete, test_finalized_healed_tool_call_stamps_first_token, test_healed_responses_tool_call_reports_a_tool_call_stop and 2 more.
+def _shared_setup_3(api_monitor, tool):
+    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
+    messages = [ChatMessage(role = "user", content = "hi")]
+    monitor_id = api_monitor.start(
+        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
+    )
+    return messages, monitor_id, payload
+
+
+# Shared setup for test_cancelled_chat_completion_finalizes_monitor, test_monitor_records_tool_only_reply, test_monitor_records_translated_visible_text.
+def _shared_setup_4():
+    messages = [ChatMessage(role = "user", content = "hi")]
+    request = SimpleNamespace(
+        state = SimpleNamespace(),
+        url = SimpleNamespace(path = "/v1/responses"),
+        method = "POST",
+    )
+    return messages, request
+
+
+# Shared setup for test_text_format_json_schema_without_schema_is_ignored, test_text_format_text_carries_no_response_format, test_text_verbosity_only_carries_no_response_format.
+def _shared_setup_5(payload):
+    messages = [ChatMessage(role = "user", content = "hi")]
+
+    chat_req = _build_chat_request(payload, messages, stream = False)
+
+    assert _extract_response_format(chat_req) is None
+
+
+# Shared setup for test_a_healed_truncated_tool_call_remains_incomplete, test_healed_responses_tool_call_reports_a_tool_call_stop, test_healed_responses_tool_call_stamps_first_token.
+def _shared_setup_6():
+    from core.inference.api_monitor import api_monitor
+
+    xml = TestResponsesStreamHealing._XML
+    tool = TestResponsesStreamHealing._TOOL
+    return api_monitor, tool, xml
+
 _backend = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _backend)
 
@@ -448,27 +509,15 @@ class TestBuildChatRequest:
         # Codex and the Agents SDK send this on ordinary requests; constraining
         # them would route every call onto the schema path.
         payload = ResponsesRequest(input = "hi", text = {"format": {"type": "text"}})
-        messages = [ChatMessage(role = "user", content = "hi")]
-
-        chat_req = _build_chat_request(payload, messages, stream = False)
-
-        assert _extract_response_format(chat_req) is None
+        _shared_setup_5(payload)
 
     def test_text_verbosity_only_carries_no_response_format(self):
         payload = ResponsesRequest(input = "hi", text = {"verbosity": "low"})
-        messages = [ChatMessage(role = "user", content = "hi")]
-
-        chat_req = _build_chat_request(payload, messages, stream = False)
-
-        assert _extract_response_format(chat_req) is None
+        _shared_setup_5(payload)
 
     def test_text_format_json_schema_without_schema_is_ignored(self):
         payload = ResponsesRequest(input = "hi", text = {"format": {"type": "json_schema"}})
-        messages = [ChatMessage(role = "user", content = "hi")]
-
-        chat_req = _build_chat_request(payload, messages, stream = False)
-
-        assert _extract_response_format(chat_req) is None
+        _shared_setup_5(payload)
 
     def test_chat_template_kwargs_enable_thinking_true_is_lifted(self):
         payload = ResponsesRequest(
@@ -1179,12 +1228,7 @@ class TestResponsesNonStreamingAdapter:
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
         monkeypatch.setattr(inf_mod, "openai_chat_completions", fake_chat_completions)
         payload = ResponsesRequest(input = "hi", reasoning = {"effort": "high"})
-        messages = [ChatMessage(role = "user", content = "hi")]
-        request = SimpleNamespace(
-            state = SimpleNamespace(),
-            url = SimpleNamespace(path = "/v1/responses"),
-            method = "POST",
-        )
+        messages, request = _shared_setup_4()
 
         async def run():
             response = await _responses_non_streaming(payload, messages, request)
@@ -1381,12 +1425,7 @@ class TestResponsesNonStreamingAdapter:
             input = "hi",
             tools = [{"type": "function", "name": "lookup"}],
         )
-        messages = [ChatMessage(role = "user", content = "hi")]
-        request = SimpleNamespace(
-            state = SimpleNamespace(),
-            url = SimpleNamespace(path = "/v1/responses"),
-            method = "POST",
-        )
+        messages, request = _shared_setup_4()
 
         async def run():
             response = await _responses_non_streaming(payload, messages, request)
@@ -1415,12 +1454,7 @@ class TestResponsesNonStreamingAdapter:
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
         monkeypatch.setattr(inf_mod, "openai_chat_completions", fake_chat_completions)
         payload = ResponsesRequest(input = "hi")
-        messages = [ChatMessage(role = "user", content = "hi")]
-        request = SimpleNamespace(
-            state = SimpleNamespace(),
-            url = SimpleNamespace(path = "/v1/responses"),
-            method = "POST",
-        )
+        messages, request = _shared_setup_4()
 
         async def run():
             with pytest.raises(asyncio.CancelledError):
@@ -1638,10 +1672,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan"
         assert "".join(event["delta"] for event in text_deltas) == "33"
         completed = self._payloads(lines, "response.completed")[0]
@@ -1662,14 +1693,7 @@ class TestResponsesStreamAdapter:
         self._install_stream_mock(monkeypatch, chunks)
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
-        monitor_id = monitor.start(
-            endpoint = "/v1/responses",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
-        payload = ResponsesRequest(input = "hi", stream = True)
-        messages = [ChatMessage(role = "user", content = "hi")]
+        messages, monitor_id, payload = _shared_setup_1(monitor)
 
         async def run():
             response = await _responses_stream(
@@ -1703,14 +1727,7 @@ class TestResponsesStreamAdapter:
         self._install_stream_mock(monkeypatch, chunks)
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
-        monitor_id = monitor.start(
-            endpoint = "/v1/responses",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
-        payload = ResponsesRequest(input = "hi", stream = True)
-        messages = [ChatMessage(role = "user", content = "hi")]
+        messages, monitor_id, payload = _shared_setup_1(monitor)
 
         async def run():
             response = await _responses_stream(
@@ -1754,14 +1771,7 @@ class TestResponsesStreamAdapter:
         self._install_stream_mock(monkeypatch, chunks)
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
-        monitor_id = monitor.start(
-            endpoint = "/v1/responses",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
-        payload = ResponsesRequest(input = "hi", stream = True)
-        messages = [ChatMessage(role = "user", content = "hi")]
+        messages, monitor_id, payload = _shared_setup_1(monitor)
 
         async def run():
             response = await _responses_stream(
@@ -1888,14 +1898,7 @@ class TestResponsesStreamAdapter:
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
         monkeypatch.setattr(inf_mod, "_ResponsesReasoningExtractor", FakeExtractor)
-        monitor_id = monitor.start(
-            endpoint = "/v1/responses",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
-        payload = ResponsesRequest(input = "hi", stream = True)
-        messages = [ChatMessage(role = "user", content = "hi")]
+        messages, monitor_id, payload = _shared_setup_1(monitor)
 
         async def run():
             response = await _responses_stream(
@@ -1934,14 +1937,7 @@ class TestResponsesStreamAdapter:
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
         monkeypatch.setattr(inf_mod, "_ResponsesReasoningExtractor", FakeExtractor)
-        monitor_id = monitor.start(
-            endpoint = "/v1/responses",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
-        payload = ResponsesRequest(input = "hi", stream = True)
-        messages = [ChatMessage(role = "user", content = "hi")]
+        messages, monitor_id, payload = _shared_setup_1(monitor)
 
         async def run():
             response = await _responses_stream(
@@ -1974,10 +1970,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan"
         assert "".join(event["delta"] for event in text_deltas) == "answer"
         completed = self._payloads(lines, "response.completed")[0]
@@ -2002,10 +1995,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert reasoning_deltas == []
         assert "".join(event["delta"] for event in text_deltas) == "show <think>x</think> tags"
         completed = self._payloads(lines, "response.completed")[0]
@@ -2027,10 +2017,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan"
         assert text_deltas == []
         completed = self._payloads(lines, "response.completed")[0]
@@ -2051,10 +2038,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan"
         assert text_deltas == []
         completed = self._payloads(lines, "response.completed")[0]
@@ -2075,10 +2059,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan"
         assert "".join(event["delta"] for event in text_deltas) == "33"
         completed = self._payloads(lines, "response.completed")[0]
@@ -2112,10 +2093,7 @@ class TestResponsesStreamAdapter:
             response = await _responses_stream(payload, messages, self._Request())
             return await self._collect(response)
 
-        lines = asyncio.run(run())
-
-        reasoning_deltas = self._payloads(lines, "response.reasoning_text.delta")
-        text_deltas = self._payloads(lines, "response.output_text.delta")
+        lines, reasoning_deltas, text_deltas = _shared_setup_2(run, self)
         assert "".join(event["delta"] for event in reasoning_deltas) == "plan next"
         assert "".join(event["delta"] for event in text_deltas) == "33"
         assert "reasoning_text" not in "".join(event["delta"] for event in reasoning_deltas)
@@ -2906,18 +2884,11 @@ class TestResponsesStreamHealing:
 def test_healed_responses_tool_call_stamps_first_token(monkeypatch):
     # Healed output bypasses append_reply, so a text-form tool call would go untimed
     # until the item closes near end-of-stream.
-    from core.inference.api_monitor import api_monitor
-
-    xml = TestResponsesStreamHealing._XML
-    tool = TestResponsesStreamHealing._TOOL
+    api_monitor, tool, xml = _shared_setup_6()
     TestResponsesStreamAdapter._install_stream_mock(
         monkeypatch, [{"choices": [{"delta": {"content": xml}}]}]
     )
-    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
-    messages = [ChatMessage(role = "user", content = "hi")]
-    monitor_id = api_monitor.start(
-        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
-    )
+    messages, monitor_id, payload = _shared_setup_3(api_monitor, tool)
     stamped: list[str] = []
     real_mark = api_monitor.mark_first_token
     monkeypatch.setattr(
@@ -2947,11 +2918,7 @@ def test_finalized_healed_tool_call_stamps_first_token(monkeypatch):
     TestResponsesStreamAdapter._install_stream_mock(
         monkeypatch, [{"choices": [{"delta": {"content": unclosed}}]}]
     )
-    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
-    messages = [ChatMessage(role = "user", content = "hi")]
-    monitor_id = api_monitor.start(
-        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
-    )
+    messages, monitor_id, payload = _shared_setup_3(api_monitor, tool)
     stamped: list[str] = []
     real_mark = api_monitor.mark_first_token
     monkeypatch.setattr(
@@ -2976,19 +2943,12 @@ def test_finalized_healed_tool_call_stamps_first_token(monkeypatch):
 def test_healed_responses_tool_call_reports_a_tool_call_stop(monkeypatch):
     # The upstream chunk still says "stop" while this adapter emitted a function_call,
     # so the monitor would disagree with the chat stream's synthetic finish line.
-    from core.inference.api_monitor import api_monitor
-
-    xml = TestResponsesStreamHealing._XML
-    tool = TestResponsesStreamHealing._TOOL
+    api_monitor, tool, xml = _shared_setup_6()
     TestResponsesStreamAdapter._install_stream_mock(
         monkeypatch,
         [{"choices": [{"delta": {"content": xml}, "finish_reason": "stop"}]}],
     )
-    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
-    messages = [ChatMessage(role = "user", content = "hi")]
-    monitor_id = api_monitor.start(
-        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
-    )
+    messages, monitor_id, payload = _shared_setup_3(api_monitor, tool)
 
     async def run():
         response = await _responses_stream(
@@ -3011,11 +2971,7 @@ def test_unhealed_responses_stream_keeps_the_upstream_stop(monkeypatch):
         monkeypatch,
         [{"choices": [{"delta": {"content": "plain text"}, "finish_reason": "stop"}]}],
     )
-    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
-    messages = [ChatMessage(role = "user", content = "hi")]
-    monitor_id = api_monitor.start(
-        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
-    )
+    messages, monitor_id, payload = _shared_setup_3(api_monitor, tool)
 
     async def run():
         response = await _responses_stream(
@@ -3065,19 +3021,12 @@ def test_a_truncated_responses_stream_ends_on_response_incomplete(
 def test_a_healed_truncated_tool_call_remains_incomplete(
     monkeypatch, finish_reason, incomplete_reason
 ):
-    from core.inference.api_monitor import api_monitor
-
-    xml = TestResponsesStreamHealing._XML
-    tool = TestResponsesStreamHealing._TOOL
+    api_monitor, tool, xml = _shared_setup_6()
     TestResponsesStreamAdapter._install_stream_mock(
         monkeypatch,
         [{"choices": [{"delta": {"content": xml}, "finish_reason": finish_reason}]}],
     )
-    payload = ResponsesRequest(input = "hi", stream = True, tools = [tool])
-    messages = [ChatMessage(role = "user", content = "hi")]
-    monitor_id = api_monitor.start(
-        endpoint = "/v1/responses", method = "POST", model = "org/M-GGUF", prompt = "hi"
-    )
+    messages, monitor_id, payload = _shared_setup_3(api_monitor, tool)
 
     async def run():
         response = await _responses_stream(
