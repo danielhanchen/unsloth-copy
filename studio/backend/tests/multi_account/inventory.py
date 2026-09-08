@@ -42,6 +42,8 @@ def looks_like_object_id(name: str) -> bool:
         "name",
         "ref",
         "slug",
+        "run",
+        "checkpoint",
     }
 
 
@@ -87,45 +89,11 @@ ROUTES = collect_routes()
 OBJECT_ROUTES = tuple(case for case in ROUTES if case.object_parameters)
 
 
-# Provisional domain numbering until the integrator supplies the other worker prompts.
-WORKERS = {
-    "auth": "01",
-    "chat_history": "02",
-    "chat_generation_runs": "02",
-    "prompts": "02",
-    "profile_stats": "02",
-    "providers": "03",
-    "provider_credentials": "03",
-    "openai_codex_auth": "03",
-    "rag": "04",
-    "datasets": "04",
-    "youtube": "04",
-    "training": "05",
-    "training_history": "05",
-    "export": "05",
-    "data_recipe": "05",
-    "inference": "06",
-    "llama": "06",
-    "llama_compat": "06",
-    "video": "06",
-    "whisper": "06",
-    "research_runs": "07",
-    "mcp_servers": "07",
-    "preview": "08",
-    "settings": "08",
-    "models": "08",
-    "training_vram": "05",
-}
-
-
-def worker_for(case: RouteCase) -> str:
-    return WORKERS.get(case.module.split(".")[1], "10")
-
-
 def render_inventory() -> str:
-    from .factories import FACTORIES
+    from .factories import FACTORIES, SKIPPED
 
     covered = sum(case.key in FACTORIES for case in OBJECT_ROUTES)
+    skipped = sum(case.key in SKIPPED for case in OBJECT_ROUTES)
     lines = [
         "# Studio route isolation inventory",
         "",
@@ -133,28 +101,27 @@ def render_inventory() -> str:
         "mount aliases outside routes (main.py, hub, picker, MCP mounts) are outside this inventory.",
         "",
         f"{len(ROUTES)} route/method pairs; {len(OBJECT_ROUTES)} have object-like parameters; "
-        f"{covered} have factories; {len(OBJECT_ROUTES) - covered} are uncovered.",
+        f"{covered} have factories; {skipped} are skipped with a stated reason; "
+        f"{len(OBJECT_ROUTES) - covered - skipped} are uncovered.",
         "",
         "Each object route produces five cases: owner reading Alice's resource, Alice, Bob, "
         "unauthenticated, and a deactivated Alice with a previously issued JWT. "
-        "Uncovered cases fail at factory lookup under a strict worker xfail; they do not send a request. "
+        "A separate completeness assertion fails for routes without a factory. "
         "A factory means exercised, not necessarily passing. See pytest outcomes for pending behavior.",
         "",
-        "Worker numbers are provisional domain assignments; confirm them against integration ownership. "
-        "Worker 10 owns adding the remaining factories; domain workers own the underlying behavior.",
-        "",
-        "| Module | Method | Router path | Object parameters | Factory / gap | Domain worker |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Module | Method | Router path | Object parameters | Factory / gap |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for case in ROUTES:
         coverage = (
             FACTORIES[case.key].name
             if case.key in FACTORIES
-            else ("**uncovered**" if case.object_parameters else "no object-like path parameter")
+            else SKIPPED.get(case.key)
+            or ("**uncovered**" if case.object_parameters else "no object-like path parameter")
         )
         lines.append(
             f"| {case.module} | {case.method} | `{case.path}` | "
-            f"{', '.join(case.object_parameters) or '-'} | {coverage} | {worker_for(case)} |"
+            f"{', '.join(case.object_parameters) or '-'} | {coverage} |"
         )
     return "\n".join(lines) + "\n"
 
