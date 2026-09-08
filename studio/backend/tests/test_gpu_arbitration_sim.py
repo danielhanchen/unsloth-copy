@@ -476,7 +476,7 @@ def chat_switch(route, monkeypatch):
     monkeypatch.setattr(settings, "get_openai_auto_switch_enabled", lambda: True)
     monkeypatch.setattr(resolver, "warm_index_soon", lambda: None)
     monkeypatch.setattr(
-        resolver, "resolve_trusted_cached_local_gguf", lambda name: (name, None, name)
+        resolver, "resolve_trusted_cached_local_gguf", lambda name, **_kw: (name, None, name)
     )
     monkeypatch.setattr(resolver, "local_target_is_gguf", lambda *_args: True)
     monkeypatch.setattr(route, "get_llama_cpp_backend", lambda: backend)

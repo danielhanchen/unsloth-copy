@@ -431,7 +431,7 @@ def create_research_run(
         raise HTTPException(status_code = 404, detail = "Thread not found")
     supervisor = getattr(request.app.state, "research_supervisor", None)
     if supervisor is not None:
-        supervisor.note_request_port(request)
+        supervisor.note_request_address(request)
         supervisor.wake()
     return run
 
@@ -481,7 +481,7 @@ def approve_research_plan(
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     supervisor = getattr(request.app.state, "research_supervisor", None)
     if supervisor is not None:
-        supervisor.note_request_port(request)
+        supervisor.note_request_address(request)
         supervisor.wake()
     run = _require_run(run_id)
     _sync_assistant(run)
@@ -517,7 +517,7 @@ def retry_research_run(
         raise HTTPException(status_code = 409, detail = str(exc)) from exc
     supervisor = getattr(request.app.state, "research_supervisor", None)
     if supervisor is not None:
-        supervisor.note_request_port(request)
+        supervisor.note_request_address(request)
         supervisor.wake()
     run = _require_run(run_id)
     _sync_assistant(run)

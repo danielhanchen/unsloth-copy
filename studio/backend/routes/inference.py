@@ -58,7 +58,7 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager, contextmanager
-from dataclasses import fields as dataclass_fields, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 
 
 import re as _re
@@ -68,6 +68,7 @@ from urllib.parse import quote as _urlquote
 from utils.models import extract_model_size_b as _extract_model_size_b
 
 from utils.api_errors import openai_error_body, anthropic_error_body, error_body_for_path
+from utils.audio_tokens import GGUF_TTS_AUDIO_TYPES as _GGUF_TTS_AUDIO_TYPES
 from utils.upload_limits import STT_AUDIO_B64_MAX_CHARS, STT_AUDIO_RAW_MAX_BYTES
 from hub.dependencies import get_hf_token, get_request_hf_token
 from hub.utils.hf_tokens import HfTokenArg
@@ -533,6 +534,11 @@ def _tts_max_new_tokens(
     return max(1, budget)
 
 
+def _speech_budget_exhausted(context_length: int, prompt_tokens: int) -> bool:
+    """Whether *prompt_tokens* leaves a context with no room to speak."""
+    return context_length - prompt_tokens - _TTS_PROMPT_FORMAT_RESERVE < _MIN_SPEECH_OUTPUT_TOKENS
+
+
 def _raise_if_prompt_leaves_no_speech_budget(text: str) -> None:
     """400 when the prompt alone consumes the loaded context.
 
@@ -543,8 +549,7 @@ def _raise_if_prompt_leaves_no_speech_budget(text: str) -> None:
     context_length = _monitor_context_length()
     if not context_length:
         return
-    remaining = context_length - _prompt_token_estimate(text) - _TTS_PROMPT_FORMAT_RESERVE
-    if remaining < _MIN_SPEECH_OUTPUT_TOKENS:
+    if _speech_budget_exhausted(context_length, _prompt_token_estimate(text)):
         raise HTTPException(
             status_code = 400,
             detail = (
@@ -552,6 +557,18 @@ def _raise_if_prompt_leaves_no_speech_budget(text: str) -> None:
                 "Shorten it, or load the model with a larger context."
             ),
         )
+
+
+_EXTRA_PROMPT_FIELD_AUDIO_TYPES = ("higgs_tts2", "moss_tts_local")
+
+
+def _speech_prompt_for_budget(audio_type: Optional[str], budget: dict) -> str:
+    text = budget.get("text") or ""
+    if audio_type not in _EXTRA_PROMPT_FIELD_AUDIO_TYPES:
+        return text
+    return _native_tts_prompt_for_budget(
+        text, audio_type, budget.get("instructions"), budget.get("language")
+    )
 
 
 def _native_tts_prompt_for_budget(
@@ -585,9 +602,11 @@ def _prompt_token_estimate(prompt: str) -> int:
                     return count
     except Exception:  # noqa: BLE001 - an estimate must never fail the request
         pass
-    # subprocess and llama-server tokenizers are not reachable here. UTF-8 bytes are a
-    # conservative upper bound for their byte-level fallbacks; under-counting can overflow
-    # the loaded context, while over-counting only shortens the requested clip.
+    return _byte_fallback_prompt_tokens(prompt)
+
+
+def _byte_fallback_prompt_tokens(prompt: str) -> int:
+    # UTF-8 bytes conservatively bound the unreachable subprocess/llama-server tokenizers.
     return max(1, len(prompt.encode("utf-8")))
 
 
@@ -3040,6 +3059,8 @@ from models.inference import (
     InstallLatestTransformersResponse,
     TextContentPart,
     ImageContentPart,
+    InputAudioContentPart,
+    UnknownContentPart,
     ImageUrl,
     ResponsesRequest,
     ResponsesInputTextPart,
@@ -3377,11 +3398,10 @@ async def _authenticate_header_or_query(request: Request, token: Optional[str]) 
 
     Routed through ``credentials_for_token`` so a scope that covers this path serves it
     without a key, the way the routes behind ``security`` already do."""
-    auth_header = request.headers.get("authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        jwt_token = auth_header[7:]
-    else:
-        jwt_token = token or None
+    auth_header = request.headers.get("authorization") or ""
+    header_token = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+    # A blank header is the absent header, so the `?token=` an <img src> sends is still owed.
+    jwt_token = header_token.strip() or token or None
     from auth.authentication import credentials_for_token
 
     creds = await credentials_for_token(request, jwt_token)
@@ -7054,6 +7074,7 @@ def _target_is_vision(
     load_path: str,
     gguf_variant: Optional[str] = None,
     need_image: bool = True,
+    gguf_companion_roots: tuple[str, ...] = (),
 ) -> bool:
     # A local GGUF's vision capability is its companion mmproj, a filesystem check
     # (no model load). Matches the loaded backend's is_vision, so rejecting a swap
@@ -7073,6 +7094,7 @@ def _target_is_vision(
                 hf_token = account_access.ambient_hf_token(),
                 gguf_variant = gguf_variant,
                 require_image = need_image,
+                gguf_companion_roots = gguf_companion_roots or None,
             )
         )
     except Exception as exc:
@@ -7110,6 +7132,7 @@ def _target_accepts_request_input(
     gguf_variant: Optional[str] = None,
     need_image: bool = True,
     needs_video: bool = False,
+    gguf_companion_roots: tuple[str, ...] = (),
 ) -> bool:
     """Whether a switch target can accept this request's image or audio input.
 
@@ -7119,7 +7142,14 @@ def _target_accepts_request_input(
     tokenizer's special tokens.
     """
     if is_gguf:
-        return _target_is_vision(load_path, gguf_variant, need_image)
+        if not gguf_companion_roots:
+            return _target_is_vision(load_path, gguf_variant, need_image)
+        return _target_is_vision(
+            load_path,
+            gguf_variant,
+            need_image,
+            gguf_companion_roots,
+        )
     # input_video is llama.cpp's own part type, so a clip is refused right after the load.
     if needs_video:
         return False
@@ -7129,6 +7159,240 @@ def _target_accepts_request_input(
     # asked for its projector, and demanding a vision tower here would refuse the
     # audio checkpoints that can actually serve it.
     return _target_is_vision(load_path) if (needs_vision and need_image) else True
+
+
+def _resolve_target_gguf_file(load_path: str, gguf_variant: Optional[str]) -> Optional[str]:
+    from utils.models.model_config import _find_local_gguf_by_variant, detect_gguf_model
+
+    local_path = os.path.expanduser(load_path)
+    if gguf_variant and Path(local_path).is_dir():
+        return _find_local_gguf_by_variant(local_path, gguf_variant)
+    return detect_gguf_model(local_path)
+
+
+# Keep this order aligned with NativeAudioBackend._context_length.
+_NATIVE_CONTEXT_SUBCONFIGS = ("language_config", "qwen3_config", "text_config")
+_NATIVE_CONTEXT_FIELDS = (
+    "max_position_embeddings",
+    "max_sequence_length",
+    "max_seq_length",
+    "n_positions",
+    "seq_length",
+)
+
+
+def _local_config_context_length(load_path: str) -> Optional[int]:
+    import json
+
+    config_path = Path(os.path.expanduser(load_path))
+    if config_path.is_dir():
+        config_path = config_path / "config.json"
+    if not config_path.is_file():
+        return None
+    with open(config_path, encoding = "utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        return None
+    for candidate in (*(config.get(name) for name in _NATIVE_CONTEXT_SUBCONFIGS), config):
+        if not isinstance(candidate, dict):
+            continue
+        for field in _NATIVE_CONTEXT_FIELDS:
+            value = _positive_int_or_none(candidate.get(field))
+            if value is not None:
+                return value
+    return None
+
+
+def _target_native_context_length(
+    load_path: str,
+    is_gguf: bool,
+    gguf_variant: Optional[str] = None,
+) -> Optional[int]:
+    try:
+        if not is_gguf:
+            return _local_config_context_length(load_path)
+        from utils.models.gguf_metadata import read_gguf_context_length
+
+        gguf_file = _resolve_target_gguf_file(load_path, gguf_variant)
+        return read_gguf_context_length(gguf_file) if gguf_file else None
+    except Exception as exc:
+        logger.debug("auto-switch: context probe failed for %s: %s", load_path, exc)
+        return None
+
+
+def _target_effective_context_length(
+    load_path: str,
+    is_gguf: bool,
+    gguf_variant: Optional[str] = None,
+    override_id: Optional[str] = None,
+    audio_type: Optional[str] = None,
+    resolved_override: Optional[dict] = None,
+    override_is_resolved: bool = False,
+) -> Optional[int]:
+    # MiniMax has no measurable window; MOSS ignores saved context overrides.
+    if audio_type == "minimax_music3":
+        return None
+    if audio_type in _CONTEXT_OVERRIDE_IGNORED_AUDIO_TYPES:
+        return _target_native_context_length(load_path, is_gguf, gguf_variant)
+    try:
+        from utils.openai_auto_switch_settings import (
+            resolve_fit_max_seq_length,
+            resolve_override_for_load,
+        )
+
+        if override_is_resolved:
+            override = resolved_override
+        else:
+            _key, override = resolve_override_for_load(load_path, override_id, gguf_variant)
+        configured = _positive_int_or_none(
+            resolve_fit_max_seq_length(override, is_gguf = is_gguf) if override else None
+        )
+        if configured is None and override and is_gguf:
+            from core.inference.llama_server_args import parse_ctx_override
+            configured = _positive_int_or_none(parse_ctx_override(override.get("llama_extra_args")))
+        if configured is not None:
+            from core.inference.native_audio import NATIVE_AUDIO_TYPES
+            if not is_gguf and audio_type in NATIVE_AUDIO_TYPES:
+                detected = _target_native_context_length(load_path, is_gguf, gguf_variant)
+                return min(configured, detected) if detected else configured
+            return configured
+    except Exception as exc:
+        logger.debug("auto-switch: context override lookup failed for %s: %s", load_path, exc)
+    from core.inference.native_audio import NATIVE_AUDIO_TYPES
+
+    if not is_gguf and audio_type not in NATIVE_AUDIO_TYPES:
+        # The generic loader converts its zero default to 2048, not the declared window.
+        return _STANDARD_LOAD_DEFAULT_CONTEXT
+    return _target_native_context_length(load_path, is_gguf, gguf_variant)
+
+
+def _target_speech_audio_type(
+    load_path: str,
+    is_gguf: bool,
+    gguf_variant: Optional[str] = None,
+) -> Optional[str]:
+    from core.inference.local_model_resolver import _host_serves_mlx
+    from utils.models.model_config import (
+        _find_local_gguf_by_variant,
+        detect_audio_type,
+        detect_gguf_model,
+    )
+    try:
+        if not is_gguf:
+            from core.inference.native_audio import (
+                REMOTE_CODE_AUDIO_TYPES,
+                is_native_audio_model,
+            )
+
+            # Native audio precedes MLX and has an MPS path; ordinary codecs cannot serve there.
+            if _host_serves_mlx() and not is_native_audio_model(load_path):
+                return None
+            audio_type = detect_audio_type(
+                load_path, hf_token = os.environ.get("HF_TOKEN"), local_files_only = True
+            )
+            # Auto-switch never grants trust_remote_code; reject before evicting the resident.
+            if audio_type in REMOTE_CODE_AUDIO_TYPES:
+                return None
+            return audio_type if audio_type in _TRANSFORMERS_TTS_AUDIO_TYPES else None
+        from utils.models.gguf_metadata import read_gguf_tts_audio_type
+
+        gguf_file = _resolve_target_gguf_file(load_path, gguf_variant)
+        audio_type = read_gguf_tts_audio_type(gguf_file) if gguf_file else None
+        return audio_type if audio_type in _GGUF_TTS_AUDIO_TYPES else None
+    except Exception as exc:
+        logger.debug("auto-switch: speech probe failed for %s: %s", load_path, exc)
+        return None
+
+
+@dataclass(frozen = True)
+class _SpeechCodecPreflightResult:
+    cache_environment: Optional[dict[str, str]] = None
+    codec_path: Optional[str] = None
+
+
+def _preflight_speech_codec_for_switch(
+    audio_type: str,
+    load_path: str,
+    is_gguf: bool,
+    hf_token: Optional[str] = None,
+) -> _SpeechCodecPreflightResult:
+    from utils.utils import hf_env_offline
+
+    offline = hf_env_offline()
+    hub_token = hf_token or False
+    if audio_type == "snac":
+        from huggingface_hub import snapshot_download
+        from utils.hf_cache_settings import get_hf_cache_paths
+
+        cache_paths = get_hf_cache_paths()
+        staged = snapshot_download(
+            "hubertsiuzdak/snac_24khz",
+            token = hub_token,
+            cache_dir = str(cache_paths.hub_cache),
+            local_files_only = offline,
+        )
+        return _SpeechCodecPreflightResult(cache_paths.child_env({}), str(staged))
+    elif audio_type == "bicodec":
+        from core.inference.audio_codecs import resolve_bicodec_repo_path
+        from utils.hf_cache_settings import get_hf_cache_paths
+
+        cache_paths = get_hf_cache_paths()
+        staged = resolve_bicodec_repo_path(
+            None if is_gguf else load_path,
+            hf_token = hub_token,
+            local_files_only = offline,
+            cache_dir = str(cache_paths.hub_cache),
+        )
+        return _SpeechCodecPreflightResult(cache_paths.child_env({}), str(staged))
+    elif audio_type == "dac":
+        from utils.third_party_source import ensure_dac_speech_weights, ensure_outetts_source
+        from utils.hf_cache_settings import get_hf_cache_paths
+
+        cache_paths = get_hf_cache_paths()
+        ensure_outetts_source()
+        staged = ensure_dac_speech_weights(
+            hub_cache = cache_paths.hub_cache,
+            hf_token = hub_token,
+        )
+        return _SpeechCodecPreflightResult(cache_paths.child_env({}), str(staged))
+    elif audio_type == "higgs_tts2":
+        from core.inference.native_audio import (
+            higgs_tts2_codec_local_complete,
+            native_audio_security_targets,
+        )
+        from huggingface_hub import snapshot_download
+        from utils.hf_cache_settings import get_hf_cache_paths
+
+        cache_paths = get_hf_cache_paths()
+        companions = native_audio_security_targets(load_path, audio_type, hub_token)[1:]
+        if not companions:
+            raise RuntimeError("Higgs TTS 2 exposes no companion audio tokenizer.")
+        for companion in companions:
+            local_companion = Path(companion).expanduser()
+            staged = (
+                str(local_companion)
+                if local_companion.exists()
+                else snapshot_download(
+                    companion,
+                    token = hub_token,
+                    cache_dir = str(cache_paths.hub_cache),
+                    local_files_only = offline,
+                )
+            )
+            from utils.security import evaluate_file_security
+
+            security = evaluate_file_security(
+                staged,
+                hf_token = hub_token,
+                local_only_load = offline,
+            )
+            if security.blocked:
+                raise RuntimeError(security.reason)
+            if not higgs_tts2_codec_local_complete(staged):
+                raise RuntimeError(f"Higgs TTS 2 companion '{companion}' is incomplete.")
+        # Pin the verified cache across the lifecycle wait; settings may change meanwhile.
+        return _SpeechCodecPreflightResult(cache_paths.child_env({}))
+    return _SpeechCodecPreflightResult()
 
 
 _AUDIO_IMAGE_INPUT_DETAIL = (
@@ -7478,6 +7742,7 @@ async def _maybe_auto_download_model(
     fastapi_request: Optional[Request],
     *,
     require_vision: bool = False,
+    require_speech: bool = False,
     current_subject: Optional[str] = None,
 ) -> None:
     """Opt-in: start fetching a named GGUF this server doesn't have.
@@ -7501,6 +7766,7 @@ async def _maybe_auto_download_model(
             requested_model,
             hf_token = _auto_download_hf_token(fastapi_request),
             require_vision = require_vision,
+            require_speech = require_speech,
             subject = current_subject,
             # These endpoints also serve Unsloth's chat on a JWT, so only mark real API traffic.
             via_api_key = _request_used_api_key(fastapi_request),
@@ -7646,6 +7912,22 @@ def _loaded_identity_satisfies(requested: str) -> bool:
         # alias it recorded and land here.
         if advertised is None and identifier and _looks_like_local_path(identifier):
             return False
+        companion_roots = tuple(getattr(llama_backend, "_openai_gguf_companion_roots", ()) or ())
+        if companion_roots:
+            from core.inference.local_model_resolver import (
+                local_gguf_companion_roots,
+                local_gguf_companion_state,
+            )
+
+            # A revision pin drops repo scope; a repo alias must notice newly cached companions.
+            if _looks_like_local_path(base) or companion_roots != local_gguf_companion_roots(
+                identifier, repo_level = True
+            ):
+                return False
+            if getattr(
+                llama_backend, "_openai_gguf_companion_state", ()
+            ) != local_gguf_companion_state(companion_roots):
+                return False
         return _matches_any(base, (identifier, advertised)) and _loaded_satisfies(requested)
     backend = get_inference_backend()
     active = getattr(backend, "active_model_name", None)
@@ -7971,6 +8253,8 @@ async def _maybe_auto_switch_model(
     gguf_only: bool = False,
     audio_preflight: Optional[dict] = None,
     image_preflight: Optional[dict] = None,
+    require_speech: bool = False,
+    speech_budget: Optional[dict] = None,
 ) -> None:
     """Load a downloaded local model named by an OpenAI request when auto-switch is on.
 
@@ -8001,487 +8285,663 @@ async def _maybe_auto_switch_model(
     """
     # The reload-only sentinel means an omitted model to the account checks, not a name.
     named_model = requested_model if requested_model != _RELOAD_ONLY_MODEL else None
+    if account_access.managed_account():
+        if named_model:
+            await asyncio.to_thread(account_access.require_model_access, named_model)
+        elif account_access.resident_hidden("chat", _loaded_slot_ident()):
+            raise HTTPException(status_code = 404, detail = "Model not found")
 
-    async def _switch() -> None:
-        if account_access.managed_account():
-            if named_model:
-                await asyncio.to_thread(account_access.require_model_access, named_model)
-            elif account_access.resident_hidden("chat", _loaded_slot_ident()):
-                raise HTTPException(status_code = 404, detail = "Model not found")
-        from utils.openai_auto_switch_settings import (
-            get_openai_auto_switch_enabled,
-            get_model_override,
-            idle_unload_is_configured,
-            model_override_load_kwargs,
-        )
-        from core.inference.local_model_resolver import (
-            local_target_is_gguf,
-            resolve_local_gguf,
-            resolve_trusted_cached_local_gguf,
-            warm_index_soon,
-        )
-        from core.inference.llama_keepwarm import (
-            get_last_unloaded_model,
-            inference_lifecycle_gate,
-            note_admitted_inference,
-            preview_swapped_since_entry,
-        )
-
-        generation_cancel_event = getattr(
-            getattr(fastapi_request, "state", None),
-            "generation_cancel_event",
-            None,
-        )
-
-        def _raise_if_generation_cancelled() -> None:
-            if generation_cancel_event is not None and generation_cancel_event.is_set():
-                raise HTTPException(status_code = 409, detail = "Generation cancelled")
-
-        # Passed auth and reached local inference, so count it in the admitted-inference tally
-        # the preview busy guard uses instead of raw _inflight (no-op for preview scopes).
-        _swap_scope = getattr(fastapi_request, "scope", None)
-        note_admitted_inference(_swap_scope)
-        # A preview swapped a different checkpoint in since this request entered; running now
-        # would serve the preview's model to Unsloth, so reject and let the client retry. Covers a
-        # request that waited on the gate through the swap AND one that passed the gate before it
-        # but is still pre-admission. Deferred here (not a middleware 503) so an external-provider
-        # request that untracks and returns before this hook is never rejected for a swap it never
-        # touched; over-rejecting a local request is acceptable, serving the wrong checkpoint is not.
-        if preview_swapped_since_entry(_swap_scope):
-            raise HTTPException(
-                status_code = 503,
-                detail = "A preview is loading a model. Please retry shortly.",
-                headers = {"Retry-After": "1"},
-            )
-
-        # Treat a non-string model (e.g. {"model": 123} on a raw-body endpoint) as
-        # absent so it falls through instead of raising in the membership checks below.
-        if not isinstance(requested_model, str) or not requested_model:
-            # Omitted/default model on a non-preview call runs against the resident model,
-            # so claim it for Unsloth (a preview keeps its own ownership).
-            if claim_resident:
-                _claim_slot_for_non_preview(fastapi_request)
+    async def _refuse_foreign_resident() -> None:
+        """A miss falls through to the resident model, which for a managed caller may be
+        another account's hidden one: serve a named model only if the resident is its
+        own or answers to the name."""
+        if not named_model or not account_access.managed_account():
             return
-        # The public preview route opts out so a caller cannot switch away from the
-        # pinned preview checkpoint it just loaded.
-        scope = getattr(fastapi_request, "scope", None)
-        if isinstance(scope, dict) and scope.get(_DISABLE_OPENAI_AUTO_SWITCH_SCOPE_KEY):
+        if not account_access.resident_hidden("chat", _loaded_slot_ident()):
             return
-        auto_switch_on = get_openai_auto_switch_enabled()
+        if await asyncio.to_thread(_loaded_identity_satisfies, named_model):
+            return
+        raise HTTPException(status_code = 404, detail = "Model not found")
 
-        def _refuse_non_gguf_endpoint() -> None:
-            """Refuse a switch target this endpoint cannot serve.
+    from utils.openai_auto_switch_settings import (
+        get_openai_auto_switch_enabled,
+        get_model_override,
+        idle_unload_is_configured,
+        model_override_load_kwargs,
+    )
+    from core.inference.local_model_resolver import (
+        local_gguf_companion_roots,
+        local_gguf_companion_state,
+        local_target_is_gguf,
+        resolve_local_gguf,
+        resolve_trusted_cached_local_gguf,
+        warm_index_soon,
+    )
+    from core.inference.llama_keepwarm import (
+        get_last_unloaded_model,
+        inference_lifecycle_gate,
+        note_admitted_inference,
+        preview_swapped_since_entry,
+    )
 
-            Raised only for a target the resolver found and that is not already serving:
-            a resident non-GGUF model reaches the handler's own error instead, since no
-            swap is pending to refuse.
-            """
-            message = (
-                f"This endpoint serves GGUF models only, and '{requested_model}' is not one. "
-                "Use /v1/chat/completions for this model."
-            )
-            # error_body_for_path, not the OpenAI shape: the Anthropic routes reach this too
-            # and the global handler passes an already-formatted body through as is.
-            path = getattr(getattr(fastapi_request, "url", None), "path", None)
-            raise HTTPException(
-                status_code = 400,
-                detail = (
-                    error_body_for_path(
-                        path, message, status = 400, code = "invalid_value", param = "model"
-                    )
-                    if isinstance(path, str)
-                    else message
-                ),
-            )
+    generation_cancel_event = getattr(
+        getattr(fastapi_request, "state", None),
+        "generation_cancel_event",
+        None,
+    )
+    caller_hf_token = _auto_download_hf_token(fastapi_request)
 
-        # configured, not effective: residency zeroes the TTL, and the stash still has to restore.
-        if not auto_switch_on and not idle_unload_is_configured():
-            # No switching to do, but a named model must still not be answered by another.
-            # Reject first: a request that is turned away here must not claim the slot.
+    def _raise_if_generation_cancelled() -> None:
+        if generation_cancel_event is not None and generation_cancel_event.is_set():
+            raise HTTPException(status_code = 409, detail = "Generation cancelled")
+
+    # Passed auth and reached local inference, so count it in the admitted-inference tally
+    # the preview busy guard uses instead of raw _inflight (no-op for preview scopes).
+    _swap_scope = getattr(fastapi_request, "scope", None)
+    note_admitted_inference(_swap_scope)
+    # A preview swapped a different checkpoint in since this request entered; running now
+    # would serve the preview's model to Unsloth, so reject and let the client retry. Covers a
+    # request that waited on the gate through the swap AND one that passed the gate before it
+    # but is still pre-admission. Deferred here (not a middleware 503) so an external-provider
+    # request that untracks and returns before this hook is never rejected for a swap it never
+    # touched; over-rejecting a local request is acceptable, serving the wrong checkpoint is not.
+    if preview_swapped_since_entry(_swap_scope):
+        raise HTTPException(
+            status_code = 503,
+            detail = "A preview is loading a model. Please retry shortly.",
+            headers = {"Retry-After": "1"},
+        )
+
+    # Treat a non-string model (e.g. {"model": 123} on a raw-body endpoint) as
+    # absent so it falls through instead of raising in the membership checks below.
+    if not isinstance(requested_model, str) or not requested_model:
+        # Omitted/default model on a non-preview call runs against the resident model,
+        # so claim it for Unsloth (a preview keeps its own ownership).
+        if claim_resident:
+            _claim_slot_for_non_preview(fastapi_request)
+        return
+    # The public preview route opts out so a caller cannot switch away from the
+    # pinned preview checkpoint it just loaded.
+    scope = getattr(fastapi_request, "scope", None)
+    if isinstance(scope, dict) and scope.get(_DISABLE_OPENAI_AUTO_SWITCH_SCOPE_KEY):
+        return
+    auto_switch_on = get_openai_auto_switch_enabled()
+
+    def _refuse_non_gguf_endpoint() -> None:
+        """Refuse a switch target this endpoint cannot serve.
+
+        Raised only for a target the resolver found and that is not already serving:
+        a resident non-GGUF model reaches the handler's own error instead, since no
+        swap is pending to refuse.
+        """
+        message = (
+            f"This endpoint serves GGUF models only, and '{requested_model}' is not one. "
+            "Use /v1/chat/completions for this model."
+        )
+        # error_body_for_path, not the OpenAI shape: the Anthropic routes reach this too
+        # and the global handler passes an already-formatted body through as is.
+        path = getattr(getattr(fastapi_request, "url", None), "path", None)
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                error_body_for_path(path, message, status = 400, code = "invalid_value", param = "model")
+                if isinstance(path, str)
+                else message
+            ),
+        )
+
+    # configured, not effective: residency zeroes the TTL, and the stash still has to restore.
+    if not auto_switch_on and not idle_unload_is_configured():
+        # No switching to do, but a named model must still not be answered by another.
+        # Reject first: a request that is turned away here must not claim the slot.
+        await _reject_unservable_model(requested_model, fastapi_request)
+        await _refuse_foreign_resident()
+        # Auto-switch off: this non-preview turn uses the resident model, claim it.
+        if claim_resident:
+            _claim_slot_for_non_preview(fastapi_request)
+        return
+
+    # The common Unsloth path names the model that is already serving. Resolve that
+    # from resident state before consulting the filesystem index: rebuilding a stale
+    # multi-root index here used to hold the request for seconds before streaming.
+    if auto_switch_on and await asyncio.to_thread(_loaded_identity_satisfies, requested_model):
+        warm_index_soon()
+        if claim_resident:
+            _claim_slot_for_non_preview(fastapi_request)
+        return
+
+    from auth.authentication import request_admitted_without_credential
+
+    keyless_caller = request_admitted_without_credential(fastapi_request)
+    # the keyless dialog offers the loaded model, so a stranger swaps or fetches nothing
+    if auto_switch_on and keyless_caller:
+        auto_switch_on = False
+        if not idle_unload_is_configured():
             await _reject_unservable_model(requested_model, fastapi_request)
-            # Auto-switch off: this non-preview turn uses the resident model, claim it.
-            if claim_resident:
-                _claim_slot_for_non_preview(fastapi_request)
             return
 
-        # The common Unsloth path names the model that is already serving. Resolve that
-        # from resident state before consulting the filesystem index: rebuilding a stale
-        # multi-root index here used to hold the request for seconds before streaming.
-        if auto_switch_on and await asyncio.to_thread(_loaded_identity_satisfies, requested_model):
-            warm_index_soon()
-            if claim_resident:
-                _claim_slot_for_non_preview(fastapi_request)
-            return
+    async def _resolve_and_switch() -> None:
+        from core.inference.openai_auto_download import looks_like_quant, split_model_ref
 
-        from auth.authentication import request_admitted_without_credential
-
-        keyless_caller = request_admitted_without_credential(fastapi_request)
-        # the keyless dialog offers the loaded model, so a stranger swaps or fetches nothing
-        if auto_switch_on and keyless_caller:
-            auto_switch_on = False
-            if not idle_unload_is_configured():
-                await _reject_unservable_model(requested_model, fastapi_request)
-                return
-
-        async def _resolve_and_switch() -> None:
-            from core.inference.openai_auto_download import looks_like_quant, split_model_ref
-
-            _raise_if_generation_cancelled()
-            # Off the loop: a cold-cache rebuild walks several model dirs + HF caches.
-            # With auto-switch off (or an omitted-model reload-only request), skip the
-            # resolve so only the reload-stash path runs and no name is ever matched.
-            reload_only = requested_model == _RELOAD_ONLY_MODEL
-            resolved = None
-            if auto_switch_on and not reload_only:
-                # Fresh hits and entries retained across an additions-only download are
-                # safe to use immediately. An expired/config-invalidated hit, a cold
-                # cache, and every miss must refresh before an unrelated resident model
-                # can answer or an entry from a removed scan root can trigger a switch.
-                resolved = resolve_trusted_cached_local_gguf(requested_model)
-                if resolved is not None:
-                    warm_index_soon()
-                else:
-                    resolved = await asyncio.to_thread(resolve_local_gguf, requested_model)
-            if resolved is None:
-                # Not on disk. Opt-in: fetch in the background and ask the caller to retry.
-                if auto_switch_on and not reload_only:
-                    await _maybe_auto_download_model(
-                        requested_model,
-                        fastapi_request,
-                        # GGUF carries both from one mmproj, so the download guard takes
-                        # either need; splitting them here would fetch a text-only repo.
-                        require_vision = require_vision or require_audio_input,
-                        current_subject = current_subject,
-                    )
-                # Idle-unload may have freed the model; reload exactly what it freed
-                # (path + quant + advertised id) so an alias/unknown name stays servable
-                # and keeps the override keyed by the advertised id, not the load path.
-                last = get_last_unloaded_model()
-                # A non-GGUF (Unsloth/Transformers) model loaded after the idle-unload leaves the
-                # GGUF slot empty but is the live model; don't resurrect the stale GGUF over it
-                # (that load would tear the active model down).
-                if (
-                    not last
-                    or get_llama_cpp_backend().is_loaded
-                    or getattr(
-                        await asyncio.to_thread(get_inference_backend), "active_model_name", None
-                    )
-                ):
-                    # Unknown name, model already resident: the non-preview call uses it,
-                    # so claim it for Unsloth.
-                    if claim_resident:
-                        _claim_slot_for_non_preview(fastapi_request)
-                    return
-                if len(last) == 3:
-                    target_id, variant, override_id = last
-                else:  # pre-3-tuple stash: fall back to the path as the override key
-                    target_id, variant = last
-                    override_id = target_id
-                # A credential-less caller may restore only the model it explicitly
-                # named (or the reload-only sentinel used when the model is omitted).
-                # Check before loading so an unrelated name cannot trigger an expensive
-                # stash restore and only then receive the normal mismatch response.
-                if keyless_caller and not reload_only:
-                    requested_base, requested_variant = split_model_ref(requested_model)
-                    if not _matches_any(
-                        requested_base, (target_id, override_id, public_model_id(target_id))
-                    ) or (
-                        looks_like_quant(requested_variant)
-                        and (not variant or requested_variant.lower() != variant.lower())
-                    ):
-                        return
-            else:
-                # load_path is a concrete local path (never the bare repo id), so /load
-                # takes the local branch and cannot trigger a download. override_id is the
-                # advertised repo id, the launch-override key and the public model id.
-                target_id, variant, override_id = resolved
-            # Not inferred from the quant: a GGUF loaded from a local directory carries none.
-            target_is_gguf = await asyncio.to_thread(local_target_is_gguf, target_id, override_id)
-            # no orchestrator means nothing non-GGUF is resident, so the cold build only precedes a 400.
-            if (
-                gguf_only
-                and not target_is_gguf
-                and resolved is not None
-                and _peek_inference_backend() is None
-            ):
-                _refuse_non_gguf_endpoint()
-            # Resolved once, off the loop: a cold orchestrator build waits on hardware detection.
-            target_backend = (
-                get_llama_cpp_backend()
-                if target_is_gguf
-                else await asyncio.to_thread(get_inference_backend)
+        _raise_if_generation_cancelled()
+        # Off the loop: a cold-cache rebuild walks several model dirs + HF caches.
+        # With auto-switch off (or an omitted-model reload-only request), skip the
+        # resolve so only the reload-stash path runs and no name is ever matched.
+        reload_only = requested_model == _RELOAD_ONLY_MODEL
+        resolved = None
+        repo_level_companion_resolution = False
+        stashed_gguf_companion_roots: tuple[str, ...] = ()
+        if auto_switch_on and not reload_only:
+            # Fresh hits and entries retained across an additions-only download are
+            # safe to use immediately. An expired/config-invalidated hit, a cold
+            # cache, and every miss must refresh before an unrelated resident model
+            # can answer or an entry from a removed scan root can trigger a switch.
+            resolved = resolve_trusted_cached_local_gguf(
+                requested_model,
+                include_companion_scope = True,
             )
-            backend = get_llama_cpp_backend()
-            # A bare model id (no :VARIANT) is satisfied by any loaded quant of that
-            # repo, so it never reloads a different local quant that already serves it.
-            # A tag that names no quant (":latest", ":8b") means the repo, as
-            # _loaded_satisfies and the resolver read it. Treating it as a quant tears down
-            # a serving Q8 to load the preferred Q4 for a request either satisfies.
-            _, _requested_variant = split_model_ref(requested_model)
-            bare = not looks_like_quant(_requested_variant)
-
-            def _already_serving() -> bool:
-                # Match against both the concrete load path and the advertised repo id,
-                # so a model loaded manually by repo id (identifier = repo id) and one
-                # loaded by auto-switch (identifier = path, advertised = repo id) both
-                # count as already serving rather than triggering a needless reswap.
-                if not target_is_gguf:
-                    active = getattr(target_backend, "active_model_name", None)
-                    if not active:
-                        return False
-                    # _matches_any, not a lowercased set: two scan roots differing only by
-                    # case are different weights on a case-sensitive filesystem, and a false
-                    # match here records the alias on the wrong resident model.
-                    loaded_keys = [active, getattr(target_backend, "_openai_advertised_id", None)]
-                    if _matches_any(target_id, loaded_keys):
-                        return True
-                    # two scan roots can advertise one basename, so it cannot vouch for a path.
-                    if _looks_like_local_path(target_id) and _looks_like_local_path(active):
-                        return False
-                    return _matches_any(override_id, loaded_keys)
-                if not backend.is_loaded or not backend.model_identifier:
-                    return False
-                loaded_keys = {backend.model_identifier.lower()}
-                advertised = getattr(backend, "_openai_advertised_id", None)
-                if advertised:
-                    loaded_keys.add(advertised.lower())
-                if loaded_keys.isdisjoint({target_id.lower(), override_id.lower()}):
-                    return False
-                if bare:
-                    return True
-                if variant:
-                    loaded_variant = (getattr(backend, "hf_variant", None) or "").lower()
-                    return loaded_variant == variant.lower()
-                return True
-
-            def _record_serving_alias() -> None:
-                # When an advertised alias already resolves to the loaded model (e.g. loaded by
-                # local path, requested by its repo/LM Studio id), record the alias as the public
-                # id so /v1/models and responses report it (marked loaded) instead of the path
-                # basename. Resolver branch only: the reload-stash override_id can be a bare path.
-                # Lock-free is safe: an in-flight request blocks any concurrent swap (single-slot
-                # busy guard), so the loaded model can't change under this.
-                if resolved is None or not override_id:
-                    return
-                if getattr(target_backend, "_openai_advertised_id", None) != override_id:
-                    target_backend._openai_advertised_id = override_id
-
-            if _already_serving():
-                # A non-preview request adopting this model claims it for Unsloth, so a later
-                # preview can't swap it out from under an active OpenAI caller.
-                if claim_resident:
-                    _set_preview_resident(None)
-                _record_serving_alias()
-                return
-            # Below both resident fast paths, so serving the shared model stays free.
-            from core.inference.gpu_arbiter import require_no_foreign_generations
-
-            switch_path = getattr(getattr(fastapi_request, "url", None), "path", None)
-            require_no_foreign_generations(path = switch_path)
-            # Loading a non-GGUF model unloads the resident GGUF, and these endpoints read
-            # llama.cpp alone, so the swap would strand them with nothing to serve.
-            if gguf_only and not target_is_gguf and resolved is not None:
-                _refuse_non_gguf_endpoint()
-            # An image/audio request naming a different text-only target would load it
-            # here and only 400 below, evicting the working model. Reject before the
-            # swap. Only the resolver branch (an explicit new target); the reload-stash
-            # path just restores the model the request was already using. The probe hits
-            # the filesystem, so run it off the loop like the resolver above.
-            target_requires_image = require_image
-            if require_audio_input and not target_is_gguf and audio_preflight is not None:
-                target_requires_image = bool(audio_preflight.get("has_image"))
+            if resolved is not None:
+                warm_index_soon()
+            else:
+                resolved = await asyncio.to_thread(
+                    resolve_local_gguf,
+                    requested_model,
+                    include_companion_scope = True,
+                )
+        if resolved is None:
+            # Not on disk. Opt-in: fetch in the background and ask the caller to retry.
+            if auto_switch_on and not reload_only:
+                await _maybe_auto_download_model(
+                    requested_model,
+                    fastapi_request,
+                    # GGUF carries both from one mmproj, so the download guard takes
+                    # either need; splitting them here would fetch a text-only repo.
+                    require_vision = require_vision or require_audio_input,
+                    require_speech = require_speech,
+                    current_subject = current_subject,
+                )
+            # Idle-unload may have freed the model; reload exactly what it freed
+            # (path + quant + advertised id) so an alias/unknown name stays servable
+            # and keeps the override keyed by the advertised id, not the load path.
+            last = get_last_unloaded_model()
+            # A non-GGUF (Unsloth/Transformers) model loaded after the idle-unload leaves the
+            # GGUF slot empty but is the live model; don't resurrect the stale GGUF over it
+            # (that load would tear the active model down).
             if (
-                (require_vision or require_audio_input)
-                and resolved is not None
-                and not await asyncio.to_thread(
-                    _target_accepts_request_input,
-                    target_id,
-                    target_is_gguf,
-                    require_vision,
-                    require_audio_input,
-                    variant,
-                    target_requires_image,
-                    require_video,
+                not last
+                or get_llama_cpp_backend().is_loaded
+                or getattr(
+                    await asyncio.to_thread(get_inference_backend), "active_model_name", None
                 )
             ):
+                # Unknown name, model already resident: the non-preview call uses it,
+                # so claim it for Unsloth.
+                if claim_resident:
+                    _claim_slot_for_non_preview(fastapi_request)
+                return
+            if len(last) >= 3:
+                target_id, variant, override_id = last[:3]
+                if len(last) >= 4:
+                    stashed_gguf_companion_roots = tuple(last[3] or ())
+            else:  # pre-3-tuple stash: fall back to the path as the override key
+                target_id, variant = last
+                override_id = target_id
+            # A credential-less caller may restore only the model it explicitly
+            # named (or the reload-only sentinel used when the model is omitted).
+            # Check before loading so an unrelated name cannot trigger an expensive
+            # stash restore and only then receive the normal mismatch response.
+            if keyless_caller and not reload_only:
+                requested_base, requested_variant = split_model_ref(requested_model)
+                if not _matches_any(
+                    requested_base, (target_id, override_id, public_model_id(target_id))
+                ) or (
+                    looks_like_quant(requested_variant)
+                    and (not variant or requested_variant.lower() != variant.lower())
+                ):
+                    return
+        else:
+            # load_path is a concrete local path (never the bare repo id), so /load
+            # takes the local branch and cannot trigger a download. override_id is the
+            # advertised repo id, the launch-override key and the public model id.
+            if len(resolved) >= 4:
+                target_id, variant, override_id, repo_level_companion_resolution = resolved[:4]
+            else:
+                target_id, variant, override_id = resolved
+                requested_base, _requested_variant = split_model_ref(requested_model)
+                repo_level_companion_resolution = _matches_any(
+                    requested_base,
+                    (override_id, public_model_id(override_id)),
+                )
+        # Not inferred from the quant: a GGUF loaded from a local directory carries none.
+        target_is_gguf = await asyncio.to_thread(local_target_is_gguf, target_id, override_id)
+        gguf_companion_roots: tuple[str, ...] = ()
+        if target_is_gguf:
+            if resolved is None:
+                gguf_companion_roots = stashed_gguf_companion_roots
+            else:
+                gguf_companion_roots = await asyncio.to_thread(
+                    local_gguf_companion_roots,
+                    target_id,
+                    repo_level = repo_level_companion_resolution,
+                )
+        gguf_companion_state = (
+            await asyncio.to_thread(local_gguf_companion_state, gguf_companion_roots)
+            if gguf_companion_roots
+            else ()
+        )
+        # no orchestrator means nothing non-GGUF is resident, so the cold build only precedes a 400.
+        if (
+            gguf_only
+            and not target_is_gguf
+            and resolved is not None
+            and _peek_inference_backend() is None
+        ):
+            _refuse_non_gguf_endpoint()
+        # Resolved once, off the loop: a cold orchestrator build waits on hardware detection.
+        target_backend = (
+            get_llama_cpp_backend()
+            if target_is_gguf
+            else await asyncio.to_thread(get_inference_backend)
+        )
+        backend = get_llama_cpp_backend()
+        # A bare model id (no :VARIANT) is satisfied by any loaded quant of that
+        # repo, so it never reloads a different local quant that already serves it.
+        # A tag that names no quant (":latest", ":8b") means the repo, as
+        # _loaded_satisfies and the resolver read it. Treating it as a quant tears down
+        # a serving Q8 to load the preferred Q4 for a request either satisfies.
+        _, _requested_variant = split_model_ref(requested_model)
+        bare = not looks_like_quant(_requested_variant)
+
+        def _already_serving() -> bool:
+            # Match against both the concrete load path and the advertised repo id,
+            # so a model loaded manually by repo id (identifier = repo id) and one
+            # loaded by auto-switch (identifier = path, advertised = repo id) both
+            # count as already serving rather than triggering a needless reswap.
+            if not target_is_gguf:
+                active = getattr(target_backend, "active_model_name", None)
+                if not active:
+                    return False
+                # _matches_any, not a lowercased set: two scan roots differing only by
+                # case are different weights on a case-sensitive filesystem, and a false
+                # match here records the alias on the wrong resident model.
+                loaded_keys = [active, getattr(target_backend, "_openai_advertised_id", None)]
+                if _matches_any(target_id, loaded_keys):
+                    return True
+                # two scan roots can advertise one basename, so it cannot vouch for a path.
+                if _looks_like_local_path(target_id) and _looks_like_local_path(active):
+                    return False
+                return _matches_any(override_id, loaded_keys)
+            if not backend.is_loaded or not backend.model_identifier:
+                return False
+            loaded_keys = {backend.model_identifier.lower()}
+            advertised = getattr(backend, "_openai_advertised_id", None)
+            if advertised:
+                loaded_keys.add(advertised.lower())
+            if loaded_keys.isdisjoint({target_id.lower(), override_id.lower()}):
+                return False
+            loaded_companion_roots = tuple(
+                getattr(backend, "_openai_gguf_companion_roots", ()) or ()
+            )
+            if loaded_companion_roots != gguf_companion_roots:
+                return False
+            if getattr(backend, "_openai_gguf_companion_state", ()) != gguf_companion_state:
+                return False
+            if bare:
+                return True
+            if variant:
+                loaded_variant = (getattr(backend, "hf_variant", None) or "").lower()
+                return loaded_variant == variant.lower()
+            return True
+
+        def _record_serving_alias() -> None:
+            # When an advertised alias already resolves to the loaded model (e.g. loaded by
+            # local path, requested by its repo/LM Studio id), record the alias as the public
+            # id so /v1/models and responses report it (marked loaded) instead of the path
+            # basename. Resolver branch only: the reload-stash override_id can be a bare path.
+            # Lock-free is safe: an in-flight request blocks any concurrent swap (single-slot
+            # busy guard), so the loaded model can't change under this.
+            if resolved is None or not override_id:
+                return
+            if getattr(target_backend, "_openai_advertised_id", None) != override_id:
+                target_backend._openai_advertised_id = override_id
+
+        if _already_serving():
+            # A non-preview request adopting this model claims it for Unsloth, so a later
+            # preview can't swap it out from under an active OpenAI caller.
+            if claim_resident:
+                _set_preview_resident(None)
+            _record_serving_alias()
+            return
+        # Below both resident fast paths, so serving the shared model stays free.
+        from core.inference.gpu_arbiter import require_no_foreign_generations
+
+        switch_path = getattr(getattr(fastapi_request, "url", None), "path", None)
+        require_no_foreign_generations(path = switch_path)
+        # Loading a non-GGUF model unloads the resident GGUF, and these endpoints read
+        # llama.cpp alone, so the swap would strand them with nothing to serve.
+        if gguf_only and not target_is_gguf and resolved is not None:
+            _refuse_non_gguf_endpoint()
+        # An image/audio request naming a different text-only target would load it
+        # here and only 400 below, evicting the working model. Reject before the
+        # swap. Only the resolver branch (an explicit new target); the reload-stash
+        # path just restores the model the request was already using. The probe hits
+        # the filesystem, so run it off the loop like the resolver above.
+        target_requires_image = require_image
+        if require_audio_input and not target_is_gguf and audio_preflight is not None:
+            target_requires_image = bool(audio_preflight.get("has_image"))
+        if (
+            (require_vision or require_audio_input)
+            and resolved is not None
+            and not await asyncio.to_thread(
+                _target_accepts_request_input,
+                target_id,
+                target_is_gguf,
+                require_vision,
+                require_audio_input,
+                variant,
+                target_requires_image,
+                require_video,
+                gguf_companion_roots,
+            )
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    f"The requested model does not support the {modality_label} input in this request.",
+                    status = 400,
+                    code = "invalid_value",
+                    param = "model",
+                ),
+            )
+        speech_type = None
+        if require_speech and resolved is not None:
+            speech_type = await asyncio.to_thread(
+                _target_speech_audio_type, target_id, target_is_gguf, variant
+            )
+            if speech_type is None:
                 raise HTTPException(
                     status_code = 400,
                     detail = openai_error_body(
-                        f"The requested model does not support the {modality_label} input in this request.",
+                        "The requested model is not a text-to-speech model.",
                         status = 400,
                         code = "invalid_value",
                         param = "model",
                     ),
                 )
-            # resolver branch only, like the probe above: a reload-stash restore changes no format.
-            if audio_preflight is not None and resolved is not None:
-                await _preflight_audio_for_switch(audio_preflight, target_is_gguf)
-            if (
-                image_preflight is not None
-                and resolved is not None
-                and (target_is_gguf or not require_audio_input)
-            ):
-                await _preflight_image_for_switch(image_preflight, target_is_gguf)
-            key = _switch_key(override_id, variant)
-            _note_switch_waiter(key, 1)
-            waiter_noted = True
-            try:
-                async with _auto_switch_lock():
-                    # The asyncio lock is per loop; add a process-wide gate so a swap on
-                    # another loop in this process can't race the single slot.
-                    await _acquire_swap_gate()
-                    try:
-                        # Hold the keep-warm gate across the swap so no new inference can
-                        # start on the model while it is being torn down and replaced.
-                        async with inference_lifecycle_gate():
-                            if _already_serving():
-                                if claim_resident:
-                                    _set_preview_resident(None)
-                                _record_serving_alias()
-                                return
-                            require_no_foreign_generations(path = switch_path)
-                            # Apply the saved launch config so an API swap loads as the picker
-                            # would. Order: variant-qualified keys before bare ids, and the
-                            # load path before the advertised id, since the settings UI keys
-                            # local rows by that path while override_id is a derived alias, so
-                            # reading the alias first let an older entry shadow a fresh save. A
-                            # cached repo has no path entry and resolves on the second try; an
-                            # early build keyed a loose .gguf by its filename label, so
-                            # "<path>:LABEL" is read too, after the bare path used today.
-                            from utils.openai_auto_switch_settings import (
-                                resolve_override_for_load,
-                                stored_gpu_index_kind,
-                            )
+            from core.inference.native_audio import PYTHON310_AUDIO_TYPES
 
-                            # The candidate order above, kept in one place so the panel
-                            # showing a user what a load will apply reads the same row.
-                            _override_key, override = resolve_override_for_load(
-                                target_id, override_id, variant
-                            )
-                            load_kwargs = {"model_path": target_id, "gguf_variant": variant}
-                            load_kwargs.update(
-                                model_override_load_kwargs(override, is_gguf = target_is_gguf)
-                            )
-                            saved_gpu_ids = load_kwargs.get("gpu_ids")
-                            if saved_gpu_ids and not await _override_gpu_ids_still_resolve(
-                                saved_gpu_ids, stored_gpu_index_kind(override)
-                            ):
-                                # Stale pin (GPU removed, another host, or a backend change
-                                # renumbering these ids): drop it rather than 400 the load.
-                                load_kwargs.pop("gpu_ids", None)
-                                logger.warning(
-                                    "Dropping saved gpu_ids %s for %s: not available here.",
-                                    saved_gpu_ids,
-                                    override_id,
-                                )
-                            # Reuse the load impl so its dedup, tensor fallback, and threading
-                            # apply. Call the impl directly: we already hold the lifecycle gate
-                            # the /load route would otherwise take, so the route would deadlock.
-                            # Deferred claim (claim_resident=False): _load_model_impl clears the
-                            # preview marker mid-load and can make the new model resident and then
-                            # raise while building the load response, so base ownership on what is
-                            # actually resident, in a finally that runs on that post-load failure
-                            # too. If the new target is resident, mark it preview-owned (a later
-                            # route 4xx leaves it evictable; a 2xx turn clears it via the claim,
-                            # and the in-flight busy guard blocks a concurrent preview swap);
-                            # otherwise restore the prior owner. claim_resident=True adopts the
-                            # model outright, so _load_model_impl's own marker clear stands.
-                            _switch_prior_marker = _get_preview_resident()
-                            _switch_loaded_ok = False
-                            try:
-                                durable_cancel_kw = (
-                                    {"load_cancel_event": generation_cancel_event}
-                                    if generation_cancel_event is not None
-                                    else {}
-                                )
-                                try:
-                                    await _load_model_impl(
-                                        LoadRequest(**load_kwargs),
-                                        fastapi_request,
-                                        current_subject,
-                                        current_request_counted = True,
-                                        **durable_cancel_kw,
-                                    )
-                                except HTTPException as exc:
-                                    # The pre-flight check cannot mirror every loader gpu_ids rule,
-                                    # and a stale pin must never block a request, so retry without it.
-                                    if not (
-                                        exc.status_code == 400
-                                        and load_kwargs.get("gpu_ids")
-                                        and "gpu" in str(exc.detail).lower()
-                                    ):
-                                        raise
-                                    logger.warning(
-                                        "Retrying %s without saved gpu_ids %s: %s",
-                                        override_id,
-                                        load_kwargs.get("gpu_ids"),
-                                        exc.detail,
-                                    )
-                                    load_kwargs.pop("gpu_ids", None)
-                                    await _load_model_impl(
-                                        LoadRequest(**load_kwargs),
-                                        fastapi_request,
-                                        current_subject,
-                                        current_request_counted = True,
-                                        **durable_cancel_kw,
-                                    )
-                                _switch_loaded_ok = True
-                                # publish the completed load before a late cancellation is observed.
-                                target_backend._openai_advertised_id = override_id
-                                target_backend._loaded_by_user_action = False
-                                _raise_if_generation_cancelled()
-                            finally:
-                                if not claim_resident:
-                                    if _switch_loaded_ok or _loaded_slot_ident() == target_id:
-                                        _set_preview_resident(_loaded_slot_ident())
-                                    else:
-                                        _set_preview_resident(_switch_prior_marker)
-                    finally:
-                        # Deregister before releasing the gate: otherwise a swap on another
-                        # loop counts this finished request as queued and unloads its model.
-                        _note_switch_waiter(key, -1)
-                        waiter_noted = False
-                        _auto_switch_process_lock.release()
-            finally:
-                if waiter_noted:
-                    _note_switch_waiter(key, -1)
-
-        try:
-            await _resolve_and_switch()
-        except HTTPException as exc:
-            # A foreign generation can register after the early guard, so keep this
-            # endpoint's envelope for the arbiter's final refusal too.
-            path = getattr(getattr(fastapi_request, "url", None), "path", None)
+            if speech_type in PYTHON310_AUDIO_TYPES and sys.version_info < (3, 10):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = openai_error_body(
+                        "The requested text-to-speech model requires Python 3.10 or newer in Studio.",
+                        status = 400,
+                        code = "unsupported_runtime",
+                        param = "model",
+                    ),
+                )
+            if speech_budget is not None:
+                target_context = await asyncio.to_thread(
+                    _target_effective_context_length,
+                    target_id,
+                    target_is_gguf,
+                    variant,
+                    override_id,
+                    speech_type,
+                )
+                prompt_tokens = _byte_fallback_prompt_tokens(
+                    _speech_prompt_for_budget(speech_type, speech_budget)
+                )
+                if target_context and _speech_budget_exhausted(target_context, prompt_tokens):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = openai_error_body(
+                            f"Input is too long for the requested model's "
+                            f"{target_context}-token context. Shorten it, or pick a model "
+                            "with a larger context.",
+                            status = 400,
+                            code = "invalid_value",
+                            param = "input",
+                        ),
+                    )
             if (
-                path
-                and path.startswith("/v1/")
-                and isinstance(exc.detail, dict)
-                and exc.detail.get("error") == "gpu_busy"
+                speech_type == "minimax_music3"
+                and not str((speech_budget or {}).get("instructions") or "").strip()
             ):
                 raise HTTPException(
-                    status_code = 409,
-                    detail = error_body_for_path(
-                        path, exc.detail["message"], status = 409, code = "gpu_busy", param = "model"
+                    status_code = 400,
+                    detail = openai_error_body(
+                        _MINIMAX_NEEDS_DESCRIPTION,
+                        status = 400,
+                        code = "invalid_value",
+                        param = "instructions",
                     ),
-                    headers = exc.headers,
-                ) from exc
-            raise
-        # The switch may have missed, so refuse rather than answer as whatever is resident.
-        await _reject_unservable_model(requested_model, fastapi_request)
+                )
+        # resolver branch only, like the probe above: a reload-stash restore changes no format.
+        if audio_preflight is not None and resolved is not None:
+            await _preflight_audio_for_switch(audio_preflight, target_is_gguf)
+        if (
+            image_preflight is not None
+            and resolved is not None
+            and (target_is_gguf or not require_audio_input)
+        ):
+            await _preflight_image_for_switch(image_preflight, target_is_gguf)
+        speech_cache_environment = None
+        speech_codec_path = None
+        if speech_type is not None:
+            try:
+                speech_preflight_result = await asyncio.to_thread(
+                    _preflight_speech_codec_for_switch,
+                    speech_type,
+                    target_id,
+                    target_is_gguf,
+                    caller_hf_token,
+                )
+                if isinstance(speech_preflight_result, _SpeechCodecPreflightResult):
+                    speech_cache_environment = speech_preflight_result.cache_environment
+                    speech_codec_path = speech_preflight_result.codec_path
+                elif isinstance(speech_preflight_result, dict):
+                    speech_cache_environment = speech_preflight_result
+            except Exception:
+                raise HTTPException(
+                    status_code = 503,
+                    detail = openai_error_body(
+                        "The requested model's codec assets are unavailable. Connect this "
+                        "server to the network once to download them, or install them in the "
+                        "active cache before retrying.",
+                        status = 503,
+                        code = "codec_unavailable",
+                        param = "model",
+                    ),
+                ) from None
+        key = _switch_key(override_id, variant)
+        _note_switch_waiter(key, 1)
+        waiter_noted = True
+        try:
+            async with _auto_switch_lock():
+                # The asyncio lock is per loop; add a process-wide gate so a swap on
+                # another loop in this process can't race the single slot.
+                await _acquire_swap_gate()
+                try:
+                    # Hold the keep-warm gate across the swap so no new inference can
+                    # start on the model while it is being torn down and replaced.
+                    async with inference_lifecycle_gate():
+                        if _already_serving():
+                            if claim_resident:
+                                _set_preview_resident(None)
+                            _record_serving_alias()
+                            return
+                        require_no_foreign_generations(path = switch_path)
+                        # Apply the saved launch config so an API swap loads as the picker
+                        # would. Order: variant-qualified keys before bare ids, and the
+                        # load path before the advertised id, since the settings UI keys
+                        # local rows by that path while override_id is a derived alias, so
+                        # reading the alias first let an older entry shadow a fresh save. A
+                        # cached repo has no path entry and resolves on the second try; an
+                        # early build keyed a loose .gguf by its filename label, so
+                        # "<path>:LABEL" is read too, after the bare path used today.
+                        from utils.openai_auto_switch_settings import (
+                            resolve_override_for_load,
+                            stored_gpu_index_kind,
+                        )
 
-    await _switch()
-    # When no switch happened the code above falls through to the resident model, which
-    # for a managed caller could be another account's hidden one. So a managed caller that
-    # named a model is served only if the resident model is its own or matches that name.
-    if not isinstance(named_model, str) or not named_model:
-        return
-    if not account_access.managed_account():
-        return
-    if not account_access.resident_hidden("chat", _loaded_slot_ident()):
-        return
-    if await asyncio.to_thread(_loaded_identity_satisfies, named_model):
-        return
-    raise HTTPException(status_code = 404, detail = "Model not found")
+                        # The candidate order above, kept in one place so the panel
+                        # showing a user what a load will apply reads the same row.
+                        _override_key, override = resolve_override_for_load(
+                            target_id, override_id, variant
+                        )
+                        if require_speech and resolved is not None and speech_budget is not None:
+                            target_context = await asyncio.to_thread(
+                                _target_effective_context_length,
+                                target_id,
+                                target_is_gguf,
+                                variant,
+                                override_id,
+                                speech_type,
+                                override,
+                                True,
+                            )
+                            prompt_tokens = _byte_fallback_prompt_tokens(
+                                _speech_prompt_for_budget(speech_type, speech_budget)
+                            )
+                            if target_context and _speech_budget_exhausted(
+                                target_context, prompt_tokens
+                            ):
+                                raise HTTPException(
+                                    status_code = 400,
+                                    detail = openai_error_body(
+                                        f"Input is too long for the requested model's "
+                                        f"{target_context}-token context. Shorten it, or pick a model "
+                                        "with a larger context.",
+                                        status = 400,
+                                        code = "invalid_value",
+                                        param = "input",
+                                    ),
+                                )
+                        load_kwargs = {"model_path": target_id, "gguf_variant": variant}
+                        load_kwargs.update(
+                            model_override_load_kwargs(override, is_gguf = target_is_gguf)
+                        )
+                        if caller_hf_token:
+                            load_kwargs["hf_token"] = caller_hf_token
+                        saved_gpu_ids = load_kwargs.get("gpu_ids")
+                        if saved_gpu_ids and not await _override_gpu_ids_still_resolve(
+                            saved_gpu_ids, stored_gpu_index_kind(override)
+                        ):
+                            # Stale pin (GPU removed, another host, or a backend change
+                            # renumbering these ids): drop it rather than 400 the load.
+                            load_kwargs.pop("gpu_ids", None)
+                            logger.warning(
+                                "Dropping saved gpu_ids %s for %s: not available here.",
+                                saved_gpu_ids,
+                                override_id,
+                            )
+                        # Reuse the load impl so its dedup, tensor fallback, and threading
+                        # apply. Call the impl directly: we already hold the lifecycle gate
+                        # the /load route would otherwise take, so the route would deadlock.
+                        # Deferred claim (claim_resident=False): _load_model_impl clears the
+                        # preview marker mid-load and can make the new model resident and then
+                        # raise while building the load response, so base ownership on what is
+                        # actually resident, in a finally that runs on that post-load failure
+                        # too. If the new target is resident, mark it preview-owned (a later
+                        # route 4xx leaves it evictable; a 2xx turn clears it via the claim,
+                        # and the in-flight busy guard blocks a concurrent preview swap);
+                        # otherwise restore the prior owner. claim_resident=True adopts the
+                        # model outright, so _load_model_impl's own marker clear stands.
+                        _switch_prior_marker = _get_preview_resident()
+                        _switch_loaded_ok = False
+                        try:
+                            durable_cancel_kw = (
+                                {"load_cancel_event": generation_cancel_event}
+                                if generation_cancel_event is not None
+                                else {}
+                            )
+                            load_internal_kw = dict(durable_cancel_kw)
+                            if speech_cache_environment is not None:
+                                load_internal_kw["cache_environment"] = speech_cache_environment
+                            if speech_codec_path is not None:
+                                load_internal_kw["speech_codec_path"] = speech_codec_path
+                            if speech_type is not None and caller_hf_token is None:
+                                load_internal_kw["anonymous_hf_access"] = True
+                            try:
+                                load_request = LoadRequest(**load_kwargs)
+                                load_request._gguf_companion_roots = gguf_companion_roots
+                                await _load_model_impl(
+                                    load_request,
+                                    fastapi_request,
+                                    current_subject,
+                                    current_request_counted = True,
+                                    **load_internal_kw,
+                                )
+                            except HTTPException as exc:
+                                # The pre-flight check cannot mirror every loader gpu_ids rule,
+                                # and a stale pin must never block a request, so retry without it.
+                                if not (
+                                    exc.status_code == 400
+                                    and load_kwargs.get("gpu_ids")
+                                    and "gpu" in str(exc.detail).lower()
+                                ):
+                                    raise
+                                logger.warning(
+                                    "Retrying %s without saved gpu_ids %s: %s",
+                                    override_id,
+                                    load_kwargs.get("gpu_ids"),
+                                    exc.detail,
+                                )
+                                load_kwargs.pop("gpu_ids", None)
+                                load_request = LoadRequest(**load_kwargs)
+                                load_request._gguf_companion_roots = gguf_companion_roots
+                                await _load_model_impl(
+                                    load_request,
+                                    fastapi_request,
+                                    current_subject,
+                                    current_request_counted = True,
+                                    **load_internal_kw,
+                                )
+                            _switch_loaded_ok = True
+                            # publish the completed load before a late cancellation is observed.
+                            target_backend._openai_advertised_id = override_id
+                            target_backend._loaded_by_user_action = False
+                            _raise_if_generation_cancelled()
+                        finally:
+                            if not claim_resident:
+                                if _switch_loaded_ok or _loaded_slot_ident() == target_id:
+                                    _set_preview_resident(_loaded_slot_ident())
+                                else:
+                                    _set_preview_resident(_switch_prior_marker)
+                finally:
+                    # Deregister before releasing the gate: otherwise a swap on another
+                    # loop counts this finished request as queued and unloads its model.
+                    _note_switch_waiter(key, -1)
+                    waiter_noted = False
+                    _auto_switch_process_lock.release()
+        finally:
+            if waiter_noted:
+                _note_switch_waiter(key, -1)
+
+    try:
+        await _resolve_and_switch()
+    except HTTPException as exc:
+        # A foreign generation can register after the early guard, so keep this
+        # endpoint's envelope for the arbiter's final refusal too.
+        path = getattr(getattr(fastapi_request, "url", None), "path", None)
+        if (
+            path
+            and path.startswith("/v1/")
+            and isinstance(exc.detail, dict)
+            and exc.detail.get("error") == "gpu_busy"
+        ):
+            raise HTTPException(
+                status_code = 409,
+                detail = error_body_for_path(
+                    path, exc.detail["message"], status = 409, code = "gpu_busy", param = "model"
+                ),
+                headers = exc.headers,
+            ) from exc
+        raise
+    # The switch may have missed, so refuse rather than answer as whatever is resident.
+    await _reject_unservable_model(requested_model, fastapi_request)
+    await _refuse_foreign_resident()
 
 
 async def _auto_switch_from_request_body(
@@ -13452,6 +13912,9 @@ async def _load_model_impl(
     on_reload_confirmed = None,
     allow_gpu_owner_eviction: bool = True,
     load_cancel_event: Optional[threading.Event] = None,
+    cache_environment: Optional[dict[str, str]] = None,
+    anonymous_hf_access: bool = False,
+    speech_codec_path: Optional[str] = None,
 ):
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_model_access, request.model_path)
@@ -13581,6 +14044,16 @@ async def _load_model_impl(
 
         # Resolve once so dedupe, admission and launch use the same slot count.
         _n_parallel = _resolve_parallel_slots(request, fastapi_request)
+        from core.inference.local_model_resolver import local_gguf_companion_state
+
+        # Capture before metadata resolution; a download completing during launch must be noticed next time.
+        gguf_companion_state = (
+            await asyncio.to_thread(
+                local_gguf_companion_state, tuple(request._gguf_companion_roots)
+            )
+            if request._gguf_companion_roots
+            else ()
+        )
 
         def _reuse_loaded_gguf(
             intent: GgufLoadIntent, *, display_name: Optional[str] = None
@@ -13591,6 +14064,10 @@ async def _load_model_impl(
                 # (the intent match lowercases the identifier). Checked before the adopt so
                 # a mismatch never adopts the caller's placement.
                 _same_loaded_identifier(llama_backend.model_identifier, model_identifier)
+                and tuple(getattr(llama_backend, "_openai_gguf_companion_roots", ()) or ())
+                == tuple(request._gguf_companion_roots)
+                and getattr(llama_backend, "_openai_gguf_companion_state", ())
+                == gguf_companion_state
                 and llama_backend.adopt_load_intent_if_matched(intent)
                 and getattr(llama_backend, "_audio_probed", True)
             ):
@@ -13721,6 +14198,7 @@ async def _load_model_impl(
                     # pass that touches a drafter candidate, so the boundary has
                     # to travel with it rather than being applied afterwards.
                     drafter_accept = _native_drafter_accept if native_grant_backed else None,
+                    gguf_companion_roots = request._gguf_companion_roots or None,
                 )
 
         # Guard and call go to the worker together: from_identifier can import transformers
@@ -13797,6 +14275,8 @@ async def _load_model_impl(
                 placement = placement,
                 n_parallel = _n_parallel,
             )
+            if speech_codec_path is not None:
+                gguf_intent = replace(gguf_intent, audio_codec_path = speech_codec_path)
             same_loaded_model = llama_backend.matches_load_source(gguf_intent)
             if same_loaded_model and config.gguf_hf_repo and llama_backend.gguf_path:
                 gguf_intent = replace(
@@ -14211,6 +14691,8 @@ async def _load_model_impl(
             # Clear any idle-unload reload stash now, not only on the next poll.
             from core.inference.llama_keepwarm import note_model_loaded
 
+            llama_backend._openai_gguf_companion_roots = tuple(request._gguf_companion_roots)
+            llama_backend._openai_gguf_companion_state = gguf_companion_state
             await asyncio.to_thread(note_model_loaded, llama_backend)
             # A plain load advertises its own identifier; auto-switch overwrites
             # this with the repo id right after _load_model_impl returns.
@@ -14304,6 +14786,10 @@ async def _load_model_impl(
         # claim is all that stops a second pipeline allocating over a resident model).
         # load_model fires it in between; the post-load release covers a re-taken claim.
         _release_chat_after_teardown = (lambda: release(CHAT)) if not chat_load_needs_gpu else None
+        anonymous_hf_kw = {"anonymous_hf_access": True} if anonymous_hf_access else {}
+        speech_codec_kw = (
+            {"audio_codec_path": speech_codec_path} if speech_codec_path is not None else {}
+        )
         try:
             success = await asyncio.to_thread(
                 backend.load_model,
@@ -14325,6 +14811,9 @@ async def _load_model_impl(
                 on_prior_worker_released = _release_chat_after_teardown,
                 post_handoff_expected_free_gb = post_chat_handoff_expected_free_gb,
                 audio_device = request.audio_device,
+                cache_environment = cache_environment,
+                **anonymous_hf_kw,
+                **speech_codec_kw,
             )
         except Exception:
             _restore_marker_if_prior_preview_still_resident()
@@ -16711,7 +17200,11 @@ _TRANSFORMERS_TTS_AUDIO_TYPES = frozenset(
         "minimax_music3",
     )
 )
-_GGUF_TTS_AUDIO_TYPES = frozenset(("snac", "bicodec", "dac"))
+# NativeAudioBackend._context_length ignores the requested window for these.
+_CONTEXT_OVERRIDE_IGNORED_AUDIO_TYPES = frozenset(("moss_tts_local", "moss_tts_nano"))
+# inference.py: load_model raises max_seq_length <= 0 to this before loading.
+_STANDARD_LOAD_DEFAULT_CONTEXT = 2048
+_MINIMAX_NEEDS_DESCRIPTION = "MiniMax Music 3 requires a music description in addition to lyrics."
 
 
 async def _generate_tts_wav(
@@ -16721,23 +17214,28 @@ async def _generate_tts_wav(
     current_subject: str,
     *,
     speech_api_default_max_tokens: bool = False,
+    requested_model: str = _RELOAD_ONLY_MODEL,
 ) -> tuple[bytes, int, str, Optional[str]]:
     """Shared core of /audio/generate and /audio/speech. Returns
     (wav_bytes, sample_rate, model_name, audio_type)."""
-    _raise_if_prompt_leaves_no_speech_budget(text)
-    # Restore an idle-evicted GGUF before selecting a backend: this path is
-    # keep-warm-tracked but had no reload hook, so a standalone idle TTL could
-    # unload an audio GGUF the next request then failed to restore. Validation
-    # above ran first, so an invalid request never triggers a reload.
-    #
-    # Reload-only on purpose: a local GGUF's audio-input capability is not a cheap
-    # pre-load probe (the companion mmproj signal can't tell an audio projector
-    # from a vision one, and codec-based TTS ships no projector at all), so passing
-    # the client model through the resolver could load a text- or vision-only target
-    # and evict the working audio model before the audio backend check fails. Only
-    # the idle-stash restore runs here; switching TTS models is an explicit /load.
+    # A named target must be budgeted against its own context after preflight.
+    if requested_model == _RELOAD_ONLY_MODEL:
+        _raise_if_prompt_leaves_no_speech_budget(text)
     await _maybe_auto_switch_model(
-        _RELOAD_ONLY_MODEL, request, current_subject, claim_resident = False
+        requested_model,
+        request,
+        current_subject,
+        claim_resident = False,
+        require_speech = True,
+        speech_budget = (
+            None
+            if requested_model == _RELOAD_ONLY_MODEL
+            else {
+                "text": text,
+                "instructions": payload.audio_instructions,
+                "language": payload.audio_language,
+            }
+        ),
     )
     # Again, now that a context exists to measure against. The check above runs before the
     # restore so an invalid request never triggers a reload, but with nothing loaded it has
@@ -16815,11 +17313,8 @@ async def _generate_tts_wav(
             detail = f"Active model does not support text-to-speech (audio_type={audio_type or 'unknown'}).",
         )
     if audio_type == "minimax_music3" and not str(payload.audio_instructions or "").strip():
-        raise HTTPException(
-            status_code = 400,
-            detail = "MiniMax Music 3 requires a music description in addition to lyrics.",
-        )
-    if audio_type in ("higgs_tts2", "moss_tts_local"):
+        raise HTTPException(status_code = 400, detail = _MINIMAX_NEEDS_DESCRIPTION)
+    if audio_type in _EXTRA_PROMPT_FIELD_AUDIO_TYPES:
         prompt_for_budget = _native_tts_prompt_for_budget(
             text,
             audio_type,
@@ -16954,6 +17449,17 @@ async def generate_audio(
     Works with both GGUF (llama-server) and Unsloth/transformers backends."""
     import base64
 
+    # _extract_content_parts keeps only text, so a part this cannot voice would be spoken past
+    # in silence. Refuse it the way the completion does rather than voicing the text alone.
+    _reject_unsupported_content_parts(payload)
+    # Also the field: /chat/completions routes a TTS model here after the lift has already
+    # replaced the part with audio_base64, so a parts-only guard would not see the attachment.
+    if _messages_have_input_audio(payload.messages) or getattr(payload, "audio_base64", None):
+        _raise_unsupported_openai_parameter(
+            "messages",
+            "Audio input is not supported here; this route speaks the message text.",
+        )
+
     # Extract text from the last user message
     _, chat_messages, _ = _extract_content_parts(payload.messages)
     if not chat_messages:
@@ -16964,7 +17470,14 @@ async def generate_audio(
     text = last_user_msg["content"]
 
     wav_bytes, sample_rate, model_name, audio_type = await _generate_tts_wav(
-        text, payload, request, current_subject
+        text,
+        payload,
+        request,
+        current_subject,
+        # ``or`` like /v1/audio/speech: an explicitly empty model is accepted by the
+        # request model, and without this it stops the hook at its falsey check before
+        # the idle-stash restore, failing a request the sibling route serves.
+        requested_model = _switch_model_for_payload(payload) or _RELOAD_ONLY_MODEL,
     )
     persisted_clip = await asyncio.to_thread(
         _persist_tts_clip, wav_bytes, sample_rate, text, model_name, audio_type
@@ -17105,10 +17618,10 @@ async def openai_audio_speech(
 ) -> Response:
     """OpenAI-compatible text-to-speech (POST /v1/audio/speech).
 
-    With ``provider_id`` the request is proxied to that connection, forwarding
-    model/voice/speed/instructions. Otherwise the loaded model is used: ``model`` is informational,
-    ``voice``/``speed`` ignored, and only WAV exists, so another ``response_format`` is
-    a 400 rather than a silent container mismatch."""
+    With ``provider_id`` the request is proxied. Otherwise an omitted ``model`` serves the
+    resident model. A named downloaded local model is loaded when auto-switch is on; when
+    it is off, the shared switch guard rejects a different recognized local model.
+    Local ``voice``/``speed`` are ignored and only WAV is supported."""
     if body.provider_id:
         fmt = (body.response_format or "wav").strip().lower()
         if fmt != "wav":
@@ -17172,6 +17685,7 @@ async def openai_audio_speech(
             request,
             current_subject,
             speech_api_default_max_tokens = body.max_new_tokens is None,
+            requested_model = body.model or _RELOAD_ONLY_MODEL,
         )
         api_monitor.relabel(monitor_id, model_name)
         await asyncio.to_thread(
@@ -18924,6 +19438,103 @@ def _inject_video_part(messages: list[dict], video_b64: str) -> None:
             else:
                 msg["content"] = [{"type": "text", "text": content or ""}, part]
             return
+
+
+def _reject_unsupported_content_parts(payload) -> None:
+    """Refuse content parts no route can serve, before local or external routing.
+
+    The external proxy rebuilds messages from an allowlist, so a part left standing here is
+    dropped silently and the provider answers a prompt the caller did not send.
+    """
+    for msg in payload.messages:
+        if not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            if isinstance(part, UnknownContentPart):
+                _raise_unsupported_openai_parameter(
+                    "messages",
+                    f"Message content parts of type '{part.type}' are not supported.",
+                )
+    _reject_misplaced_audio_parts(payload)
+
+
+def _reject_misplaced_audio_parts(payload) -> None:
+    """Refuse a recording the single ``audio_base64`` field cannot carry faithfully.
+
+    Placement is decided here rather than in the lift because the lift runs behind routing --
+    the preview route reaches it only after taking the preview lock and loading a checkpoint,
+    so a request that was always going to 400 would evict the resident model first.
+    """
+    last_user = None
+    for index, msg in enumerate(payload.messages):
+        if msg.role == "user":
+            last_user = index
+    # Only a user turn can carry a recording into the model, and the lift clears the part from
+    # every role. Say so rather than deleting an assistant-history clip in silence.
+    for msg in payload.messages:
+        if msg.role == "user" or not isinstance(msg.content, list):
+            continue
+        if any(isinstance(part, InputAudioContentPart) for part in msg.content):
+            _raise_unsupported_openai_parameter(
+                "messages",
+                f"Audio input is supported on a user message, not on a '{msg.role}' one.",
+            )
+    parts = [
+        (index, part)
+        for index, msg in enumerate(payload.messages)
+        if isinstance(msg.content, list) and msg.role == "user"
+        for part in msg.content
+        if isinstance(part, InputAudioContentPart)
+    ]
+    if len(parts) > 1:
+        _raise_unsupported_openai_parameter(
+            "messages",
+            "Only one audio recording per request is supported, and this one carries "
+            f"{len(parts)}.",
+        )
+    if parts and parts[0][0] != last_user:
+        _raise_unsupported_openai_parameter(
+            "messages",
+            "Audio input is supported on the latest user message, and this one carries it on an "
+            "earlier turn. Re-send the recording on the current turn.",
+        )
+
+
+def _messages_have_input_audio(messages) -> bool:
+    return any(
+        isinstance(getattr(msg, "content", None), list)
+        and any(isinstance(part, InputAudioContentPart) for part in msg.content)
+        for msg in messages
+    )
+
+
+def _normalise_chat_content_parts(payload) -> None:
+    """Lift the request's ``input_audio`` part onto ``audio_base64``, in place.
+
+    Everything that makes audio safe to serve reads that field: the capability check that keeps
+    a text-only target from being loaded for it, the size bound, the decoder, the duration limit,
+    and /chat/count_tokens' refusal. So the part is lifted rather than left standing -- a part the
+    field never sees is a recording none of those checks can act on.
+
+    ``_reject_misplaced_audio_parts`` has already refused every shape the single field cannot
+    carry faithfully, so what reaches here is one recording on the latest user turn. An explicit
+    ``audio_base64`` still wins over a part.
+    """
+    lifted = None
+    for msg in payload.messages:
+        if not isinstance(msg.content, list):
+            continue
+        kept = []
+        for part in msg.content:
+            if isinstance(part, InputAudioContentPart):
+                if msg.role == "user" and part.input_audio.data:
+                    lifted = part.input_audio.data
+                continue
+            kept.append(part)
+        if len(kept) != len(msg.content):
+            msg.content = kept
+    if lifted and not getattr(payload, "audio_base64", None):
+        payload.audio_base64 = lifted
 
 
 def _inject_audio_part(messages: list[dict], audio_b64: str, audio_format: str) -> None:
@@ -20744,6 +21355,11 @@ async def produce_openai_chat_completions(
             "top_logprobs", "top_logprobs is not supported for chat completions."
         )
 
+    # Before routing splits: the external proxy rebuilds messages from an allowlist and the
+    # local path flattens them, so a part neither can serve has to be refused while both are
+    # still reachable. Otherwise it is dropped in silence and the answer looks legitimate.
+    _reject_unsupported_content_parts(payload)
+
     # ── External provider routing ────────────────────────────────
     # encrypted_api_key is optional -- local providers (llama.cpp / vLLM / Ollama) may run without auth.
     if payload.provider_id or payload.provider_type:
@@ -20770,7 +21386,18 @@ async def produce_openai_chat_completions(
                 status_code = 400,
                 detail = "Video input is only supported on a local GGUF model with video support.",
             )
+        # _build_external_messages carries no input_audio case, so the recording would be
+        # stripped and the provider would answer the text alone -- a plausible reply to a
+        # question about audio nobody heard. Refuse it the way video is refused.
+        if _messages_have_input_audio(payload.messages):
+            raise HTTPException(
+                status_code = 400,
+                detail = "Audio input is only supported on a local model with audio support.",
+            )
         return await _proxy_to_external_provider(payload, request, current_subject)
+
+    # Local path only: the lift targets audio_base64, which the proxy never reads.
+    _normalise_chat_content_parts(payload)
 
     # Reject a malformed function tool here: it would otherwise reach
     # llama-server and surface as an opaque 500 "Failed to parse tools".
@@ -21137,6 +21764,17 @@ async def produce_openai_chat_completions(
                 context_length = _monitor_context_length(),
                 subject = current_subject,
             )
+
+        # A recording the resident checkpoint cannot read. The capability check that would
+        # have caught this runs only when an automatic load could have fixed it, so with
+        # auto-switch off the branch below is simply skipped and the turn is answered from
+        # its text -- a plausible reply about audio nobody listened to.
+        if payload.audio_base64 and not model_info.get("has_audio_input"):
+            _audio_unsupported_detail = (
+                "The loaded model cannot read audio input. Load a model with audio support."
+            )
+            api_monitor.fail(monitor_id, _audio_unsupported_detail)
+            raise HTTPException(status_code = 400, detail = _audio_unsupported_detail)
 
         # ── Audio INPUT path: decode WAV and route to audio input generation ──
         if payload.audio_base64 and model_info.get("has_audio_input"):
@@ -24091,7 +24729,10 @@ async def produce_openai_chat_completions(
         # message (templates reject "developer") and clear prompt to avoid a dup.
         gen_kwargs["messages"] = _set_or_prepend_system_message(
             _structured_tool_history_for_local_template(
-                _flatten_content_parts_for_local_template(_openai_messages_for_passthrough(payload))
+                _flatten_content_parts_for_local_template(
+                    # Not a llama-server body: the flatten below drops image parts.
+                    _openai_messages_for_passthrough(payload, normalize_images = False)
+                )
             ),
             system_prompt,
         )
@@ -28914,25 +29555,38 @@ def _image_bytes_to_png_b64(raw: bytes) -> str:
     input; callers wrap the call in ``try`` -> HTTPException(400)."""
     from PIL import Image
 
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img = Image.open(io.BytesIO(raw))
+    # A 16-bit source carries 0..65535, but convert("RGB") reads those as 8-bit
+    # and clips everything above 255, which turns the picture nearly all white.
+    # Scale to 8 bits first, the way stb_image does when llama-server reads the
+    # same file itself. I;16B / I;16L reject point(), so normalise them to "I".
+    #
+    # Only the I;16 family: plain "I" and "F" declare no range, and a 32-bit or
+    # float TIFF whose samples already sit in 0..255 (or 0..1) would be scaled
+    # to black. Those keep the straight convert("RGB"). A 16-bit PNG -- the
+    # reachable case here, since this decodes pasted images -- opens as I;16 on
+    # every Pillow this repo pins.
+    if img.mode.startswith("I;16"):
+        if img.mode != "I;16":
+            img = img.convert("I")
+        img = img.point(lambda v: v * (1.0 / 257), mode = "L")
+    img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format = "PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _normalize_anthropic_openai_images(openai_messages: list[dict], is_vision: bool) -> bool:
-    """Enforce the vision guard on translated Anthropic messages and normalize
-    any base64-data-URL ``image_url`` parts to PNG.
+def _normalize_openai_image_parts_to_png(openai_messages: list[dict], on_image = None) -> bool:
+    """Re-encode every base64-data-URL ``image_url`` part to PNG, in place.
 
-    llama-server's stb_image only handles a few formats (JPEG/PNG/BMP/…);
-    Anthropic clients commonly send JPEG or WebP, and Claude Code sends WebP.
-    Re-encoding everything to PNG mirrors `_openai_messages_for_passthrough` /
-    the GGUF branch of `/v1/chat/completions` so the two endpoints agree.
+    llama-server's stb_image only handles a few formats (JPEG/PNG/BMP/…), while
+    macOS and most browsers paste WebP and Claude Code sends WebP. Remote
+    (non-``data:``) URLs are forwarded as-is; llama-server will fetch (or fail)
+    per its own support matrix.
 
-    Mutates ``openai_messages`` in place. Returns ``True`` when any image part
-    was seen (so the caller can skip a second scan). Raises HTTPException(400)
-    when images are present but the active model isn't a vision model, or when
-    an image cannot be decoded.
+    ``on_image`` runs once per image part before conversion, so a caller can
+    apply its own guard. Returns ``True`` when any image part was seen. Raises
+    HTTPException(400) when an image cannot be decoded.
     """
     has_image = False
     for msg in openai_messages:
@@ -28940,20 +29594,16 @@ def _normalize_anthropic_openai_images(openai_messages: list[dict], is_vision: b
         if not isinstance(content, list):
             continue
         for part in content:
-            if part.get("type") != "image_url":
+            if not isinstance(part, dict) or part.get("type") != "image_url":
                 continue
 
             has_image = True
-            if not is_vision:
-                raise HTTPException(
-                    status_code = 400,
-                    detail = "Image provided but current GGUF model does not support vision.",
-                )
+            if on_image is not None:
+                on_image()
 
-            url = (part.get("image_url") or {}).get("url", "")
+            image_url = part.get("image_url") or {}
+            url = image_url.get("url", "")
             if not url.startswith("data:"):
-                # Remote URLs are forwarded as-is; llama-server will
-                # fetch (or fail) per its own support matrix.
                 continue
 
             try:
@@ -28965,9 +29615,22 @@ def _normalize_anthropic_openai_images(openai_messages: list[dict], is_vision: b
                     status_code = 400,
                     detail = "Failed to process image.",
                 )
-            part["image_url"] = {"url": f"data:image/png;base64,{png_b64}"}
+            # Only the url is re-encoded; `detail` is the client's request, not
+            # part of the encoding, and replacing the object would drop it.
+            image_url["url"] = f"data:image/png;base64,{png_b64}"
 
     return has_image
+
+
+def _normalize_anthropic_openai_images(openai_messages: list[dict], is_vision: bool) -> bool:
+    def _guard():
+        if not is_vision:
+            raise HTTPException(
+                status_code = 400,
+                detail = "Image provided but current GGUF model does not support vision.",
+            )
+
+    return _normalize_openai_image_parts_to_png(openai_messages, on_image = _guard)
 
 
 def _validate_anthropic_client_tools(tools) -> None:
@@ -29328,6 +29991,10 @@ async def chat_count_tokens(
     for _m in payload.messages:
         if _m.role == "developer":
             _m.role = "system"
+    # And the same refusal and lift, so a part this cannot price is refused the way the
+    # completion refuses it, and the audio guard below sees a part the way it sees the field.
+    _reject_unsupported_content_parts(payload)
+    _normalise_chat_content_parts(payload)
     # And the same default it applies to a function tool that omits the discriminator: a
     # template serializing the whole entry renders it, so the count has to carry it too.
     for _tool in payload.tools or []:
@@ -32294,15 +32961,24 @@ def _splice_image_into_last_user(messages: list[dict], image_part: dict) -> None
         messages.append({"role": "user", "content": [image_part]})
 
 
-def _openai_messages_for_passthrough(payload) -> list[dict]:
+def _openai_messages_for_passthrough(payload, normalize_images: bool = True) -> list[dict]:
     """Build OpenAI-format message dicts for the /v1/chat/completions
     passthrough path.
 
     ``payload.messages`` are dumped through Pydantic (dropping unset optional
     fields), so they're already standard OpenAI format -- including
     ``role="tool"`` tool-result messages and assistant messages carrying
-    structured ``tool_calls``. Content-parts images already in the list are
-    left untouched.
+    structured ``tool_calls``. Base64-data-URL images already in the list are
+    re-encoded to PNG exactly as ``_openai_messages_for_gguf_chat`` does, so
+    turning tools on does not change which formats llama-server can decode;
+    remote URLs are forwarded as-is. The vision guard lives in the callers,
+    which reject a non-vision model before the body is built.
+
+    ``normalize_images=False`` is for callers that are not building a
+    llama-server body: the local-template path flattens image parts away, and
+    only reaches this helper when the turn has no decodable image at all, so
+    re-encoding there can only turn an image it was already ignoring -- a
+    payloadless ``data:`` URL -- into a 400.
 
     When a client uses Unsloth's legacy ``image_base64`` top-level field, the
     image is re-encoded to PNG (llama-server's stb_image has limited format
@@ -32318,6 +32994,9 @@ def _openai_messages_for_passthrough(payload) -> list[dict]:
     messages = _strip_provider_synthetic_tool_history(
         _drop_empty_assistant_sentinels([m.model_dump(exclude_none = True) for m in payload.messages])
     )
+
+    if normalize_images:
+        _normalize_openai_image_parts_to_png(messages)
 
     if not _legacy_image_is_distinct(payload):
         return messages
