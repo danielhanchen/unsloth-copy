@@ -50,7 +50,7 @@ const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function mountForm(
   client: typeof LoginClient,
-  session: { access: string | null; change: boolean },
+  session: { access: string | null; change: boolean; owner?: boolean },
   switched = false,
   failTransitionOnce = false,
 ) {
@@ -110,7 +110,10 @@ function mountForm(
     },
     "../account-session": {
       useLoginMode: client.getLoginMode,
-      sessionAccount: () => (session.access ? { username: "alice" } : null),
+      sessionAccount: () =>
+        session.access
+          ? { username: "alice", isOwner: session.owner ?? false }
+          : null,
     },
     "../login-client": client,
     "@/components/ui/button": { Button: "Button" },
@@ -289,23 +292,32 @@ test("other login failures preserve the server error and only single-mode 401 pr
   }
 });
 
-test("managed setup follows the token requirement despite public owner status", async (t) => {
-  environment(t);
-  globalThis.fetch = async () =>
-    Response.json({
-      initialized: true,
-      requires_password_change: false,
-      login_mode: "multi",
-    });
-  const session = { access: "setup-session", change: true };
-  const form = mountForm(client(), session);
-  const tree = await form.initialize("change-password");
-  assert.ok(
-    elements(tree).find((element) => element.props.id === "new-password"),
-  );
-  assert.equal(session.change, true);
-  assert.deepEqual(form.routes, []);
-});
+for (const owner of [false, true]) {
+  test(`managed setup follows the token requirement despite public owner status, owner ${owner}`, async (t) => {
+    environment(t);
+    globalThis.fetch = async () =>
+      Response.json({
+        initialized: true,
+        requires_password_change: false,
+        login_mode: "multi",
+      });
+    const session = { access: "setup-session", change: true, owner };
+    const form = mountForm(client(), session);
+    const tree = await form.initialize("change-password");
+    assert.ok(
+      elements(tree).find((element) => element.props.id === "new-password"),
+    );
+    // The setup code is the current password, and nothing else says so here.
+    assert.equal(/setup code/i.test(textContent(tree)), !owner);
+    assert.equal(
+      elements(tree).find((element) => element.props.id === "current-password")
+        ?.props["aria-describedby"],
+      owner ? undefined : "current-setup-code-hint",
+    );
+    assert.equal(session.change, true);
+    assert.deepEqual(form.routes, []);
+  });
+}
 
 test("owner bootstrap still redirects single-mode login to password setup", async (t) => {
   environment(t);

@@ -201,6 +201,10 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
   // reuse that password; the Current password input is only rendered for the
   // admin-forced must_change_password path where no bootstrap is available.
   const hasBootstrapPassword = Boolean(window.__UNSLOTH_BOOTSTRAP__?.password);
+  // A managed account only reaches the forced change through a setup-code login,
+  // and that same code is the current password it must re-enter here.
+  const changingFromSetupCode =
+    !isLoginMode && sessionAccount(getAuthToken())?.isOwner === false;
   const invalidChangePasswordForm =
     !isLoginMode &&
     (currentPassword.length < 8 ||
@@ -435,6 +439,9 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                 <div className="relative">
                   <Input
                     id="current-password"
+                    aria-describedby={
+                      changingFromSetupCode ? "current-setup-code-hint" : undefined
+                    }
                     type={showPassword ? "text" : "password"}
                     className="pr-10"
                     autoComplete="current-password"
@@ -457,6 +464,14 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                     )}
                   </Button>
                 </div>
+                {changingFromSetupCode && (
+                  <p
+                    id="current-setup-code-hint"
+                    className="text-sm text-muted-foreground"
+                  >
+                    Paste the setup code you just signed in with as the current password.
+                  </p>
+                )}
               </div>
             )}
             <div className="space-y-2">
