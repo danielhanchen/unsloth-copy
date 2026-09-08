@@ -328,14 +328,22 @@ def test_event_wait_executor_retains_account_context(client, monkeypatch):
     ]
 
 
-def test_clear_history_cannot_reap_global_images_or_foreign_runs(client, monkeypatch):
+def test_clear_history_reaps_only_its_own_images_and_leaves_foreign_runs(client, monkeypatch):
+    """The registry and the thumbnail cache are account-scoped, so the reap runs bound to
+    the clearing account rather than being skipped whenever a second account exists."""
     from core.inference import search_images
 
     calls = []
     monkeypatch.setattr(
-        search_images, "snapshot_and_fence_registrations", lambda: calls.append("snapshot")
+        search_images,
+        "snapshot_and_fence_registrations",
+        lambda: calls.append(("snapshot", current_account_id())) or set(),
     )
-    monkeypatch.setattr(search_images, "clear_cache", lambda *args: calls.append("clear"))
+    monkeypatch.setattr(
+        search_images,
+        "clear_cache",
+        lambda *args: calls.append(("clear", current_account_id())),
+    )
     for account in (ALICE, BOB):
         seed_chat(account)
         seed_run(account)
@@ -349,7 +357,7 @@ def test_clear_history_cannot_reap_global_images_or_foreign_runs(client, monkeyp
             )
             assert response.status_code == 200, response.text
         assert not bob_event.is_set()
-    assert calls == []
+    assert calls == [("snapshot", ALICE.account_id), ("clear", ALICE.account_id)]
     assert run_as(BOB, studio_db.get_chat_thread, "private") is not None
 
 

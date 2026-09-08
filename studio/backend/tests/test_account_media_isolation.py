@@ -170,3 +170,21 @@ def test_openai_video_jobs_are_private_in_memory_and_after_rehydration():
         assert client.get(f"/v1/videos/{job.id}").status_code == 404
         assert client.get(f"/v1/videos/{job.id}/content").status_code == 404
         assert client.delete(f"/v1/videos/{job.id}").status_code == 404
+
+
+def test_clearing_a_managed_chat_history_reaps_only_its_own_thumbnails(monkeypatch):
+    """The clear used to skip the reap entirely once a second account existed, leaving every
+    managed account's private thumbnails on disk."""
+    from routes import chat_history
+
+    monkeypatch.setattr(search_images, "_fetch_thumbnail_bytes", lambda *args: b"thumbnail")
+    raw = [{"thumbnail": "https://example.com/i.jpg", "url": "https://example.com/p"}]
+    ids = {
+        account: run_as(account, search_images.register_images, raw)[0]["id"]
+        for account in (ALICE, BOB)
+    }
+    snapshot = run_as(ALICE, chat_history._snapshot_chat_images)
+    assert snapshot == {ids[ALICE]}
+    run_as(ALICE, search_images.clear_cache, snapshot)
+    assert run_as(ALICE, search_images.thumbnail_bytes, ids[ALICE]) is None
+    assert run_as(BOB, search_images.thumbnail_bytes, ids[BOB]) == b"thumbnail"

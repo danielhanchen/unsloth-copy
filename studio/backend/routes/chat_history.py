@@ -1449,12 +1449,8 @@ def record_import_ledger(
 
 
 def _snapshot_chat_images() -> Optional[set[str]]:
-    """The legacy image registry cannot authorize an account-scoped reap.
-
-    Until it carries ownership, retain thumbnails when multiple accounts exist.
-    """
-    if policy.installation_is_multi_user():
-        return set()
+    """The registry and the thumbnail cache are both account-scoped, so the snapshot, and
+    the reap it bounds, only ever reach the acting account's images."""
     from core.inference.search_images import snapshot_and_fence_registrations
 
     return snapshot_and_fence_registrations()
@@ -1559,7 +1555,7 @@ async def clear_history(
     # Search thumbnails are keyed by id, not thread.
     # reapable_image_ids is the original clear's own snapshot off the ledger, so a replay's reap cannot reach a newer
     # chat's images.
-    if (not replayed or reapable_image_ids) and not policy.installation_is_multi_user():
+    if not replayed or reapable_image_ids:
         from core.inference.search_images import clear_cache
         await run_in_threadpool(clear_cache, reapable_image_ids)
         if payload is not None:
