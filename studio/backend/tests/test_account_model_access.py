@@ -10,6 +10,8 @@ import io
 import json
 import logging
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -186,6 +188,49 @@ def test_shared_catalog_is_filtered_after_each_account_reads_it(monkeypatch, kin
     assert asyncio.run(arun_as(BOB, fn()))["cached"] == [rows[1]]
     assert len(asyncio.run(arun_as(OWNER, fn()))["cached"]) == 2
     assert len(rows) == 2
+
+
+def test_concurrent_misses_ask_the_hub_once_per_repo(monkeypatch):
+    """Eight simultaneous listings of the same uncached repos are one probe each, not eight."""
+    calls = []
+    barrier = threading.Barrier(8)
+
+    def answer(repo_id, repo_type):
+        calls.append(repo_id)
+        barrier.wait(timeout = 30)
+        time.sleep(0.02)
+        return True
+
+    monkeypatch.setattr(access, "_hub_public_answer", answer)
+    rows = [{"repo_id": f"org/repo-{index}"} for index in range(8)]
+    with ThreadPoolExecutor(max_workers = 8) as pool:
+        listings = [
+            pool.submit(run_as, ALICE, access.filter_model_rows, list(rows)) for _ in range(8)
+        ]
+        results = [listing.result(timeout = 60) for listing in listings]
+    assert all(len(result) == 8 for result in results)
+    assert sorted(calls) == sorted(row["repo_id"] for row in rows)
+
+
+def test_a_listing_probes_its_unknown_repos_together(monkeypatch):
+    """Eight unknown repos at 100 ms each must not cost 800 ms of serial waiting."""
+    monkeypatch.setattr(access, "_hub_public_answer", lambda *a: time.sleep(0.1) or True)
+    rows = [{"repo_id": f"org/slow-{index}"} for index in range(8)]
+    start = time.perf_counter()
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 8
+    assert time.perf_counter() - start < 0.4
+
+
+def test_a_warm_listing_asks_the_hub_nothing(monkeypatch):
+    rows = [{"repo_id": f"org/warm-{index}"} for index in range(4)]
+    monkeypatch.setattr(access, "_hub_public_answer", lambda *a: True)
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 4
+
+    def unexpected(*args):
+        raise AssertionError("a cached verdict must not be probed again")
+
+    monkeypatch.setattr(access, "_hub_public_answer", unexpected)
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 4
 
 
 def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
