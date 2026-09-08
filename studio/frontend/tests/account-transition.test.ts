@@ -398,16 +398,35 @@ test("multi-user policy resets full while preserving other permission modes", ()
   }
 });
 
-test("username normalization matches full Unicode case folding", () => {
+test("username normalization matches the ASCII names the backend can store", () => {
+  // auth/storage.py casefolds and then requires [a-z0-9_-]{3,32}, so a stored name is
+  // always ASCII. Anything else cannot name an account and only has to stay comparable.
   for (const [input, expected] of [
     [" UNSLOTH ", "unsloth"],
-    [" Straße ", "strasse"],
-    ["ΟΣ", "οσ"],
-    ["ς", "σ"],
-    ["İ", "i\u0307"],
-    ["ı", "ı"],
-    ["ﬃ", "ffi"],
-    ["ꭰ", "Ꭰ"],
+    ["Alice_01", "alice_01"],
+    ["BOB-2", "bob-2"],
+    [" Straße ", "straße"],
   ])
     assert.equal(normalizeAccountUsername(input), expected);
+});
+
+test("a legacy marker still compares on the name when neither side has an id", async () => {
+  const same = browserWith({
+    [BROWSER_ACCOUNT_KEY]: "alice",
+    "unsloth-private": "alice",
+  });
+  assert.equal(
+    await transitionBrowserAccount(" ALICE ", "/chat", () => {}, same.browser),
+    false,
+  );
+  assert.equal(same.data.get("unsloth-private"), "alice");
+  const other = browserWith({
+    [BROWSER_ACCOUNT_KEY]: "alice",
+    "unsloth-private": "alice",
+  });
+  assert.equal(
+    await transitionBrowserAccount("bob", "/chat", () => {}, other.browser),
+    true,
+  );
+  assert.equal(other.data.has("unsloth-private"), false);
 });

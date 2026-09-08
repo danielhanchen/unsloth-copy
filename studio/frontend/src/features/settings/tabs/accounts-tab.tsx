@@ -40,6 +40,7 @@ function OwnerAccountsTab() {
   const [username, setUsername] = useState("");
   const [setup, setSetup] = useState<AccountSetupCode | null>(null);
   const [copied, setCopied] = useState(false);
+  const [resetting, setResetting] = useState<StudioAccount | null>(null);
   const [retiring, setRetiring] = useState<StudioAccount | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -97,6 +98,10 @@ function OwnerAccountsTab() {
       setUsername("");
     });
   }
+
+  // Regenerating a setup code is as destructive as deleting: it replaces the
+  // password, ends the sessions and drops the API keys. Both confirm here.
+  const confirming = resetting ?? retiring;
 
   return (
     <div className="space-y-6">
@@ -207,13 +212,7 @@ function OwnerAccountsTab() {
                     variant="outline"
                     size="sm"
                     disabled={busy}
-                    onClick={() =>
-                      void perform(async () =>
-                        showSetup(
-                          await regenerateSetupCode(account.account_id),
-                        ),
-                      )
-                    }
+                    onClick={() => setResetting(account)}
                   >
                     {t("settings.accounts.regenerate")}
                   </Button>
@@ -260,22 +259,30 @@ function OwnerAccountsTab() {
         </Button>
       )}
       <AlertDialog
-        open={retiring !== null}
+        open={confirming !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) setRetiring(null);
+          if (open || busy) return;
+          setRetiring(null);
+          setResetting(null);
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {t("settings.accounts.deleteTitle", {
-                username: retiring?.username ?? "",
-              })}
+              {t(
+                resetting
+                  ? "settings.accounts.resetTitle"
+                  : "settings.accounts.deleteTitle",
+                { username: confirming?.username ?? "" },
+              )}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {t("settings.accounts.deleteDescription", {
-                username: retiring?.username ?? "",
-              })}
+              {t(
+                resetting
+                  ? "settings.accounts.resetDescription"
+                  : "settings.accounts.deleteDescription",
+                { username: confirming?.username ?? "" },
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -287,7 +294,15 @@ function OwnerAccountsTab() {
               disabled={busy}
               onClick={(event) => {
                 event.preventDefault();
-                if (!retiring || busy) return;
+                if (busy) return;
+                if (resetting) {
+                  void perform(async () => {
+                    showSetup(await regenerateSetupCode(resetting.account_id));
+                    setResetting(null);
+                  });
+                  return;
+                }
+                if (!retiring) return;
                 void perform(async () => {
                   await deleteAccount(retiring.account_id);
                   if (setup?.account_id === retiring.account_id) setSetup(null);
@@ -295,7 +310,11 @@ function OwnerAccountsTab() {
                 });
               }}
             >
-              {t("settings.accounts.delete")}
+              {t(
+                resetting
+                  ? "settings.accounts.regenerate"
+                  : "settings.accounts.delete",
+              )}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

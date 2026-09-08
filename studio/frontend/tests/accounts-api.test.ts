@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadWithStubs } from "./helpers/module-stubs.ts";
 import { normalizeAccountUsername } from "../src/lib/account-transition.ts";
+import * as formatFastApiError from "../src/lib/format-fastapi-error.ts";
 import type * as AccountsApi from "../src/features/settings/api/accounts.ts";
 
 function client(response: () => Response) {
@@ -25,6 +26,7 @@ function client(response: () => Response) {
         },
       },
       "@/lib/account-transition": { normalizeAccountUsername },
+      "@/lib/format-fastapi-error": formatFastApiError,
     },
   );
   return { api, requests, refreshed: () => refreshed };
@@ -122,5 +124,25 @@ test("authorization, conflict and validation failures are shown without reportin
     assert.equal(c.refreshed(), 0);
   }
   const c = client(() => new Response("bad gateway", { status: 502 }));
-  await assert.rejects(c.api.fetchAccounts(), /Account request failed/);
+  await assert.rejects(c.api.fetchAccounts(), /Account request failed \(502\)/);
+});
+
+test("a rejected username reports the field error FastAPI sends as an array", async () => {
+  const c = client(() =>
+    Response.json(
+      {
+        detail: [
+          {
+            loc: ["body", "username"],
+            msg: "Value error, Username must contain 3 to 32 letters, digits, - or _.",
+          },
+        ],
+      },
+      { status: 422 },
+    ),
+  );
+  await assert.rejects(
+    c.api.createAccount("bad.name"),
+    /username: Value error, Username must contain 3 to 32 letters/,
+  );
 });

@@ -23,18 +23,21 @@ export type TokenResponse = {
   account_id?: string | null;
 };
 
-// Hides Full access on multi-account documents before React mounts, with no extra
-// startup request for owner-only browsers.
+// Hides Full access before React mounts, with no extra startup request for owner-only
+// browsers. "multi" also picks the login form; "restricted" is a single-account form on
+// an install that still holds a deactivated account.
 export const LOGIN_MODE_HINT_KEY = "unsloth.auth-login-mode.v1";
-function initialLoginMode(): LoginMode {
+function authHint(): string | null {
   try {
-    return typeof window !== "undefined" &&
-      window.localStorage.getItem(LOGIN_MODE_HINT_KEY) === "multi"
-      ? "multi"
-      : "single";
+    return typeof window !== "undefined"
+      ? window.localStorage.getItem(LOGIN_MODE_HINT_KEY)
+      : null;
   } catch {
-    return "single";
+    return null;
   }
+}
+function initialLoginMode(): LoginMode {
+  return authHint() === "multi" ? "multi" : "single";
 }
 let loginMode: LoginMode = initialLoginMode();
 let statusKnown = false;
@@ -57,15 +60,16 @@ function onLoginModeStorage(event: StorageEvent): void {
   // Tighten policy in peer tabs immediately. A removed hint can also be account
   // cleanup, so relaxing policy always waits for a fresh server status instead.
   if (
-    event.key === LOGIN_MODE_HINT_KEY &&
-    event.newValue === "multi" &&
-    (!event.storageArea || event.storageArea === window.localStorage)
+    event.key !== LOGIN_MODE_HINT_KEY ||
+    (event.storageArea && event.storageArea !== window.localStorage)
   )
-    setLoginMode("multi");
+    return;
+  if (event.newValue === "multi") setLoginMode("multi");
+  else if (event.newValue === "restricted") setLoginMode(loginMode, false);
 }
 // The server refuses Full access whenever another account exists, active or not, so
-// a deactivated one keeps it hidden. Before a status arrives, the hint is all we have.
-let fullAccessAllowed: boolean = initialLoginMode() !== "multi";
+// either hint withholds it. Before a status arrives, the hint is all we have.
+let fullAccessAllowed: boolean = authHint() === null;
 export const getFullAccessAllowed = (): boolean => fullAccessAllowed;
 export function setLoginMode(mode: LoginMode, fullAccess?: boolean): void {
   statusKnown = true;
@@ -75,10 +79,12 @@ export function setLoginMode(mode: LoginMode, fullAccess?: boolean): void {
     if (mode === "multi" || !allowed) {
       resetFullAccessForMultiUser(window.localStorage);
     }
-    if (mode === "multi") {
-      window.localStorage.setItem(LOGIN_MODE_HINT_KEY, "multi");
-    } else if (window.localStorage.getItem(LOGIN_MODE_HINT_KEY) !== null) {
-      window.localStorage.removeItem(LOGIN_MODE_HINT_KEY);
+    const hint = mode === "multi" ? "multi" : allowed ? null : "restricted";
+    const stored = window.localStorage.getItem(LOGIN_MODE_HINT_KEY);
+    if (hint === null) {
+      if (stored !== null) window.localStorage.removeItem(LOGIN_MODE_HINT_KEY);
+    } else if (stored !== hint) {
+      window.localStorage.setItem(LOGIN_MODE_HINT_KEY, hint);
     }
   }
   const changed = loginMode !== mode || fullAccessAllowed !== allowed;
@@ -102,7 +108,8 @@ export async function fetchAuthStatus(): Promise<AuthStatusResponse> {
   }
 }
 export function ensureLoginMode(): void {
-  if (!statusKnown && loginMode === "multi")
+  // Only a server status can relax what a persisted hint withheld.
+  if (!statusKnown && (loginMode === "multi" || !fullAccessAllowed))
     void fetchAuthStatus().catch(() => undefined);
 }
 

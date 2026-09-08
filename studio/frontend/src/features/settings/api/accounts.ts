@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { readFastApiError } from "@/lib/format-fastapi-error";
 import { authFetch } from "@/features/auth";
 import { fetchAuthStatus } from "@/features/auth/login-client";
 import { normalizeAccountUsername } from "@/lib/account-transition";
@@ -39,14 +40,7 @@ async function accountsRequest(
 ): Promise<Response> {
   const response = await authFetch(`/api/accounts${path}`, init);
   if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as {
-      detail?: unknown;
-    } | null;
-    throw new Error(
-      typeof payload?.detail === "string"
-        ? payload.detail
-        : "Account request failed.",
-    );
+    throw new Error(await readFastApiError(response, "Account request failed"));
   }
   return response;
 }

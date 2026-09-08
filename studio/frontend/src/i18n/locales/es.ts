@@ -202,6 +202,8 @@ export const es = {
       active: "Activa",
       inactive: "Inactiva",
       regenerate: "Regenerar código de configuración",
+      resetTitle: "¿Restablecer la contraseña de {username}?",
+      resetDescription: "Regenerar el código de configuración sustituye la contraseña de {username}, cierra sus sesiones y revoca sus claves de API. Dale el código nuevo para que elija otra contraseña.",
       deactivate: "Desactivar",
       reactivate: "Reactivar",
       delete: "Eliminar cuenta",

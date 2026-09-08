@@ -50,7 +50,7 @@ const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function mountForm(
   client: typeof LoginClient,
-  session: { access: string | null; change: boolean },
+  session: { access: string | null; change: boolean; owner?: boolean },
   switched = false,
   failTransitionOnce = false,
 ) {
@@ -110,7 +110,10 @@ function mountForm(
     },
     "../account-session": {
       useLoginMode: client.getLoginMode,
-      sessionAccount: () => (session.access ? { username: "alice" } : null),
+      sessionAccount: () =>
+        session.access
+          ? { username: "alice", isOwner: session.owner ?? false }
+          : null,
     },
     "../login-client": client,
     "@/components/ui/button": { Button: "Button" },
@@ -178,6 +181,9 @@ function environment(t: TestContext) {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => {
         values.set(key, value);
+      },
+      removeItem: (key: string) => {
+        values.delete(key);
       },
     },
   } as unknown as Window & typeof globalThis;
@@ -286,23 +292,32 @@ test("other login failures preserve the server error and only single-mode 401 pr
   }
 });
 
-test("managed setup follows the token requirement despite public owner status", async (t) => {
-  environment(t);
-  globalThis.fetch = async () =>
-    Response.json({
-      initialized: true,
-      requires_password_change: false,
-      login_mode: "multi",
-    });
-  const session = { access: "setup-session", change: true };
-  const form = mountForm(client(), session);
-  const tree = await form.initialize("change-password");
-  assert.ok(
-    elements(tree).find((element) => element.props.id === "new-password"),
-  );
-  assert.equal(session.change, true);
-  assert.deepEqual(form.routes, []);
-});
+for (const owner of [false, true]) {
+  test(`managed setup follows the token requirement despite public owner status, owner ${owner}`, async (t) => {
+    environment(t);
+    globalThis.fetch = async () =>
+      Response.json({
+        initialized: true,
+        requires_password_change: false,
+        login_mode: "multi",
+      });
+    const session = { access: "setup-session", change: true, owner };
+    const form = mountForm(client(), session);
+    const tree = await form.initialize("change-password");
+    assert.ok(
+      elements(tree).find((element) => element.props.id === "new-password"),
+    );
+    // The setup code is the current password, and nothing else says so here.
+    assert.equal(/setup code/i.test(textContent(tree)), !owner);
+    assert.equal(
+      elements(tree).find((element) => element.props.id === "current-password")
+        ?.props["aria-describedby"],
+      owner ? undefined : "current-setup-code-hint",
+    );
+    assert.equal(session.change, true);
+    assert.deepEqual(form.routes, []);
+  });
+}
 
 test("owner bootstrap still redirects single-mode login to password setup", async (t) => {
   environment(t);
@@ -495,7 +510,11 @@ test("a deactivated account keeps full access hidden while the form is back in s
     window.localStorage.getItem("unsloth_chat_permission_mode"),
     "auto",
   );
-  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), null);
+  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), "restricted");
+  // The hint outlives the document, so a reload cannot offer Full access back.
+  const reloaded = client();
+  assert.equal(reloaded.getLoginMode(), "single");
+  assert.equal(reloaded.getFullAccessAllowed(), false);
   // A status without the flag keeps what is known; the next explicit answer wins.
   api.setLoginMode("single");
   assert.equal(api.getFullAccessAllowed(), false);
@@ -506,8 +525,46 @@ test("a deactivated account keeps full access hidden while the form is back in s
       login_mode: "single",
       full_access: true,
     });
+  // Only a status can relax the hint, so the reloaded document has to ask for one.
+  reloaded.ensureLoginMode();
+  await tick();
+  assert.equal(reloaded.getFullAccessAllowed(), true);
   await api.fetchAuthStatus();
   assert.equal(api.getFullAccessAllowed(), true);
+  assert.equal(window.localStorage.getItem(api.LOGIN_MODE_HINT_KEY), null);
   api.setLoginMode("multi");
   assert.equal(api.getFullAccessAllowed(), false);
+});
+
+test("a deactivated account hides full access in peer tabs without changing the login form", (t) => {
+  environment(t);
+  const handlers = new Set<(event: Partial<StorageEvent>) => void>();
+  window.addEventListener = ((
+    _name: string,
+    handler: (event: Partial<StorageEvent>) => void,
+  ) => {
+    handlers.add(handler);
+  }) as typeof window.addEventListener;
+  window.removeEventListener = ((
+    _name: string,
+    handler: (event: Partial<StorageEvent>) => void,
+  ) => {
+    handlers.delete(handler);
+  }) as typeof window.removeEventListener;
+  const api = client();
+  let notified = 0;
+  const unsubscribe = api.subscribeLoginMode(() => {
+    notified++;
+  });
+  for (const handler of handlers)
+    handler({
+      key: api.LOGIN_MODE_HINT_KEY,
+      oldValue: null,
+      newValue: "restricted",
+    });
+  assert.equal(api.getLoginMode(), "single");
+  assert.equal(api.getFullAccessAllowed(), false);
+  assert.equal(notified, 1);
+  unsubscribe();
+  assert.equal(handlers.size, 0);
 });

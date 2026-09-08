@@ -203,6 +203,8 @@ export const de = {
       active: "Aktiv",
       inactive: "Inaktiv",
       regenerate: "Einrichtungscode neu erstellen",
+      resetTitle: "Passwort von {username} zurücksetzen?",
+      resetDescription: "Ein neu erstellter Einrichtungscode ersetzt das Passwort von {username}, meldet die Person ab und widerruft ihre API-Schlüssel. Geben Sie ihr den neuen Code, damit sie wieder ein Passwort wählen kann.",
       deactivate: "Deaktivieren",
       reactivate: "Reaktivieren",
       delete: "Konto löschen",

@@ -526,6 +526,26 @@ def test_cli_single_account_default_output_and_desktop_cleanup_unchanged(auth_en
         assert not (auth_dir / filename).exists()
 
 
+def test_login_failure_hint_prints_a_command_that_runs_in_this_mode(auth_env, reset_cli):
+    client, _, _ = auth_env
+    detail = login(client, "unsloth", "wrong").json()["detail"]
+    assert "--username" not in detail
+    assert reset_cli.invoke(studio_cli.studio_app, ["reset-password"]).exit_code == 0
+
+
+def test_multi_account_login_failure_hint_names_the_account_flag(matrix, reset_cli):
+    client, _, _ = matrix
+    for username in ("alice", "nobody"):
+        detail = login(client, username, "wrong").json()["detail"]
+        assert "--username <name>" in detail
+        assert username not in detail
+    assert reset_cli.invoke(studio_cli.studio_app, ["reset-password"]).exit_code == 1
+    assert (
+        reset_cli.invoke(studio_cli.studio_app, ["reset-password", "--username", "alice"]).exit_code
+        == 0
+    )
+
+
 def test_cli_multi_requires_username_without_listing_or_changing_accounts(matrix, reset_cli):
     seed_credentials()
     before = {table: db_rows(table) for table in ("auth_user", "refresh_tokens", "api_keys")}

@@ -201,6 +201,8 @@ export const ptBR = {
       active: "Ativa",
       inactive: "Inativa",
       regenerate: "Gerar novo código de configuração",
+      resetTitle: "Redefinir a senha de {username}?",
+      resetDescription: "Gerar um novo código de configuração substitui a senha de {username}, encerra as sessões dela e revoga suas chaves de API. Entregue o novo código para que ela escolha outra senha.",
       deactivate: "Desativar",
       reactivate: "Reativar",
       delete: "Excluir conta",
