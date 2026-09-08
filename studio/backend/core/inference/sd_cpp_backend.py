@@ -88,6 +88,7 @@ from core.inference.sd_cpp_engine import (
 )
 from core.inference.sd_cpp_server import SdCppServer
 from loggers import get_logger
+from utils.account_context import account_thread
 from utils.subprocess_compat import windows_hidden_subprocess_kwargs
 
 logger = get_logger(__name__)
@@ -1311,7 +1312,8 @@ class SdCppDiffusionBackend:
                 ),
             )
 
-        threading.Thread(
+        # Pinned to the requesting account: the load reads and writes its private paths.
+        account_thread(
             target = self._run_load,
             kwargs = dict(
                 repo_id = repo_id,

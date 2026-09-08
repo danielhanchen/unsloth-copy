@@ -36,6 +36,7 @@ from core._torchao_stub import (
     install_xformers_windows_rocm_stub,
 )
 from loggers import get_logger
+from utils.account_context import account_thread
 from utils.hardware import clear_gpu_cache
 
 from .diffusion_families import (
@@ -2044,7 +2045,8 @@ class DiffusionBackend:
             # Seed with the family fallback; the worker resolves the real base and updates this.
             self._loading = _LoadingState(repo_id = repo_id, base_repo = fam.base_repo)
 
-        threading.Thread(
+        # Pinned to the requesting account: the load reads and writes its private paths.
+        account_thread(
             target = self._run_load,
             kwargs = dict(
                 repo_id = repo_id,

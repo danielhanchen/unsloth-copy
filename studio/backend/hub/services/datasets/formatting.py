@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+from core.training.account_jobs import (
+    account_hf_token,
+    account_path,
+    visible_cached_path,
+)
 import base64
 import errno
 import io
@@ -342,6 +347,9 @@ def check_format_response(
     its previous implementation used, preserving source column order when the
     only data filename has no split label.
     """
+    hf_token = account_hf_token(hf_token)
+    account_path(request.dataset_name, reference = True)
+    visible_cached_path(getattr(request, "local_path", None), "dataset")
     try:
         from itertools import islice
 
@@ -561,6 +569,9 @@ def ai_assist_mapping_response(
     a conversion strategy, then validate it. Falls back to simple column
     classification if the advisor fails.
     """
+    hf_token = account_hf_token(hf_token)
+    account_path(request.dataset_name, reference = True)
+    visible_cached_path(getattr(request, "local_path", None), "dataset")
     try:
         from hub.utils.llm_assist import llm_conversion_advisor
 

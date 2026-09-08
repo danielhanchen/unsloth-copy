@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from utils.paths.storage_roots import own_entry, within_account
 from utils.paths import (
     normalize_path,
     is_local_path,
@@ -1361,7 +1362,7 @@ def _local_audio_metadata_fingerprint(model_name: str) -> tuple:
             identities.append((relative, identity))
         return tuple(identities)
     except Exception:
-        # Keep cache-key construction from turning an unreadable path into a request failure.
+        # An unreadable path must not turn cache-key construction into a request failure.
         return (("unreadable", None),)
 
 
@@ -1955,8 +1956,7 @@ def detect_mmproj_file(
     ``path``: directory or a .gguf file. ``search_root``: optional ancestor
     to also walk (snapshot layouts where the weight is in ``snapshot/BF16/``
     but the projector sits at ``snapshot/``). A trusted cache resolver may set
-    ``allow_disjoint_search_root`` for another revision of the same repository.
-    Returns the projector path or ``None``."""
+    ``allow_disjoint_search_root`` for another revision of the same repository."""
     p = Path(path)
     start_dir = p.parent if p.is_file() else p
     if not start_dir.is_dir():
@@ -3448,13 +3448,15 @@ def _looks_like_lora_adapter(model_dir: Path) -> bool:
     )
 
 
-def scan_trained_models(outputs_dir: str = str(outputs_root())) -> List[Tuple[str, str, str]]:
+def scan_trained_models(outputs_dir: Optional[str] = None) -> List[Tuple[str, str, str]]:
     """Scan outputs folder for trained Unsloth models.
 
     Returns:
         List of (display_name, model_path, model_type), where model_type is
         "lora" for adapter runs or "merged" for full finetunes.
     """
+    if outputs_dir is None:
+        outputs_dir = str(outputs_root())
     trained_models = []
     outputs_path = resolve_output_dir(outputs_dir)
 
@@ -3464,7 +3466,7 @@ def scan_trained_models(outputs_dir: str = str(outputs_root())) -> List[Tuple[st
 
     try:
         for item in outputs_path.iterdir():
-            if item.is_dir():
+            if item.is_dir() and within_account(item):
                 model_type = _detect_training_output_type(item)
                 if model_type is None:
                     continue
@@ -3489,7 +3491,7 @@ def scan_trained_models(outputs_dir: str = str(outputs_root())) -> List[Tuple[st
 
 
 def scan_exported_models(
-    exports_dir: str = str(exports_root()),
+    exports_dir: Optional[str] = None,
 ) -> List[Tuple[str, str, str, Optional[str]]]:
     """Scan exports folder for exported models (merged, LoRA, GGUF).
 
@@ -3500,6 +3502,8 @@ def scan_exported_models(
         List of (display_name, model_path, export_type, base_model), where
         export_type is "lora" | "merged" | "gguf".
     """
+    if exports_dir is None:
+        exports_dir = str(exports_root())
 
     results = []
     exports_path = resolve_export_dir(exports_dir)
@@ -3509,7 +3513,7 @@ def scan_exported_models(
 
     try:
         for run_dir in exports_path.iterdir():
-            if not run_dir.is_dir():
+            if not run_dir.is_dir() or not within_account(run_dir):
                 continue
 
             # Flat GGUF export (exports/...-gguf/); neither mmproj files nor the imatrix an
@@ -3537,7 +3541,7 @@ def scan_exported_models(
 
             # Two-level: {run}/{checkpoint}/
             for checkpoint_dir in run_dir.iterdir():
-                if not checkpoint_dir.is_dir():
+                if not checkpoint_dir.is_dir() or not within_account(checkpoint_dir):
                     continue
 
                 adapter_config = checkpoint_dir / "adapter_config.json"
@@ -3551,18 +3555,18 @@ def scan_exported_models(
                 base_model = None
                 export_type = None
 
-                if adapter_config.exists():
+                if own_entry(adapter_config):
                     export_type = "lora"
                     try:
                         cfg = json.loads(adapter_config.read_text(encoding = "utf-8-sig"))
                         base_model = cfg.get("base_model_name_or_path")
                     except Exception:
                         pass
-                elif config_file.exists() and has_weights:
+                elif own_entry(config_file) and has_weights:
                     export_type = "merged"
                     export_meta = checkpoint_dir / "export_metadata.json"
                     try:
-                        if export_meta.exists():
+                        if own_entry(export_meta):
                             meta = json.loads(export_meta.read_text(encoding = "utf-8-sig"))
                             base_model = meta.get("base_model")
                     except Exception:
@@ -3574,7 +3578,7 @@ def scan_exported_models(
                     for meta_dir in (checkpoint_dir, run_dir):
                         export_meta = meta_dir / "export_metadata.json"
                         try:
-                            if export_meta.exists():
+                            if own_entry(export_meta):
                                 meta = json.loads(export_meta.read_text(encoding = "utf-8-sig"))
                                 base_model = meta.get("base_model")
                                 if base_model:
@@ -3594,7 +3598,7 @@ def scan_exported_models(
                 if not base_model:
                     outputs_adapter_cfg = resolve_output_dir(run_dir.name) / "adapter_config.json"
                     try:
-                        if outputs_adapter_cfg.exists():
+                        if own_entry(outputs_adapter_cfg):
                             cfg = json.loads(outputs_adapter_cfg.read_text(encoding = "utf-8-sig"))
                             base_model = cfg.get("base_model_name_or_path")
                     except Exception:
@@ -4118,7 +4122,6 @@ class ModelConfig:
                         None,
                     )
 
-                # Separate speculative-decoding companions, mirroring mmproj.
                 mtp_file = _find_drafter(detect_mtp_file, "mtp")
                 if mtp_file:
                     logger.info(f"Detected MTP drafter: {mtp_file}")

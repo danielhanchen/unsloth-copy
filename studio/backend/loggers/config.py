@@ -10,6 +10,7 @@ context-var integration, log-level filtering, and logger caching.
 import logging
 import os
 import sys
+import threading
 from typing import Optional
 
 import structlog
@@ -477,6 +478,37 @@ def quiet_third_party_progress_bars() -> None:
     _silence_datasets_bar_output()
 
 
+_STDOUT_LOCK = threading.Lock()
+
+
+class _CurrentStdoutLogger:
+    """A structlog logger that resolves ``sys.stdout`` per record.
+
+    ``cache_logger_on_first_use`` plus ``PrintLogger``'s build-time stream binding
+    would pin a module's output forever to whatever stdout was on its first line,
+    losing later records once a tee, redirect or test capture replaces it. One lock
+    and one write per record keeps a record adjacent to its echoed traceback.
+    """
+
+    def msg(self, message: str) -> None:
+        stream = sys.stdout
+        if stream is None:
+            return
+        with _STDOUT_LOCK:
+            stream.write(message + "\n")
+            stream.flush()
+
+    log = debug = info = warn = warning = msg
+    fatal = failure = err = error = critical = exception = msg
+
+    def __repr__(self) -> str:
+        return "<CurrentStdoutLogger>"
+
+
+def _current_stdout_logger_factory(*args) -> _CurrentStdoutLogger:
+    return _CurrentStdoutLogger()
+
+
 class LogConfig:
     """Structured logging configuration for the application."""
 
@@ -540,7 +572,7 @@ class LogConfig:
                 ),
             ],
             wrapper_class = structlog.make_filtering_bound_logger(log_level),
-            logger_factory = structlog.PrintLoggerFactory(file = sys.stdout),
+            logger_factory = _current_stdout_logger_factory,
             cache_logger_on_first_use = True,
         )
 

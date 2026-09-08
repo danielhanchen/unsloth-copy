@@ -20,6 +20,9 @@ frees the host RAM the same weights occupy there, which is just as much the user
 
 from __future__ import annotations
 
+# Resident media models are shared: every account refreshes the same global activity
+# clock, so the last active account keeps the model warm.
+
 import asyncio
 import contextlib
 import os

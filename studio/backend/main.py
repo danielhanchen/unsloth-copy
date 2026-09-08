@@ -335,7 +335,7 @@ from hub.utils.download_registry import (
 from routes.settings import router as settings_router
 from routes.prompts import router as prompts_router
 from routes.profile_stats import router as profile_stats_router
-from auth import storage
+from auth import policy as auth_policy, storage
 from auth.authentication import get_current_subject
 from utils.hardware import (
     start_background_detection,
@@ -682,23 +682,32 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _lifespan_log.warning("studio.db WAL keeper failed at startup: %s", exc)
 
-    # Reap workers/runs orphaned by a previous crash before new work starts.
+    # Reap workers/runs orphaned by a previous crash, once per account database.
+    from utils.account_context import OWNER as _owner_account, run_as as _run_as
     try:
-        from storage.studio_db import cleanup_orphaned_runs
-        cleanup_orphaned_runs()
+        from core.training.account_jobs import startup_reconciliation_accounts
+        _reconcile_accounts = startup_reconciliation_accounts()
     except Exception as exc:
-        _lifespan_log.warning("cleanup_orphaned_runs failed at startup: %s", exc)
+        _lifespan_log.warning("could not enumerate accounts to reconcile: %s", exc)
+        _reconcile_accounts = [_owner_account]
 
-    try:
-        from storage.chat_generation_runs_db import reconcile_orphaned_runs
-        reconciled_chat_runs = reconcile_orphaned_runs()
-        if reconciled_chat_runs:
-            _lifespan_log.warning(
-                "Marked %s interrupted chat generation run(s) failed after restart.",
-                reconciled_chat_runs,
-            )
-    except Exception as exc:
-        _lifespan_log.warning("chat generation orphan reconciliation failed: %s", exc)
+    for _account in _reconcile_accounts:
+        try:
+            from storage.studio_db import cleanup_orphaned_runs
+            _run_as(_account, cleanup_orphaned_runs)
+        except Exception as exc:
+            _lifespan_log.warning("cleanup_orphaned_runs failed at startup: %s", exc)
+
+        try:
+            from storage.chat_generation_runs_db import reconcile_orphaned_runs
+            reconciled_chat_runs = _run_as(_account, reconcile_orphaned_runs)
+            if reconciled_chat_runs:
+                _lifespan_log.warning(
+                    "Marked %s interrupted chat generation run(s) failed after restart.",
+                    reconciled_chat_runs,
+                )
+        except Exception as exc:
+            _lifespan_log.warning("chat generation orphan reconciliation failed: %s", exc)
 
     try:
         # The boot pass above only settles runs orphaned by the previous process. A run
@@ -1463,6 +1472,11 @@ app.add_middleware(RemoteAccessStopResponseMiddleware)
 # ============ Register API Routes ============
 
 app.include_router(auth_router, prefix = "/api/auth", tags = ["auth"])
+app.include_router(
+    __import__("routes.accounts", fromlist = ["router"]).router,
+    prefix = "/api/accounts",
+    tags = ["accounts"],
+)
 app.include_router(training_router, prefix = "/api/train", tags = ["training"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
 app.include_router(chat_history_router, prefix = "/api/chat", tags = ["chat"])
@@ -1956,7 +1970,10 @@ def studio_download_transport_capabilities(
     return asdict(get_download_transport_capabilities(probe = probe))
 
 
-@app.post("/api/shutdown")
+@app.post(
+    "/api/shutdown",
+    dependencies = [Depends(get_current_subject), Depends(auth_policy.require_owner)],
+)
 async def shutdown_server(request: Request, current_subject: str = Depends(get_current_subject)):
     """Gracefully shut down the Unsloth Studio server.
 
@@ -2284,6 +2301,12 @@ def _inject_bootstrap(html_bytes: bytes, app: FastAPI):
     import secrets as _secrets
 
     if not storage.requires_password_change(storage.DEFAULT_ADMIN_USERNAME):
+        return html_bytes, None
+
+    from auth.policy import installation_is_multi_user
+
+    # A local browser may belong to any account on a shared installation.
+    if installation_is_multi_user():
         return html_bytes, None
 
     bootstrap_pw = getattr(app.state, "bootstrap_password", None)

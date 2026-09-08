@@ -25,6 +25,9 @@ VIDEO = "video"
 _lock = threading.Lock()
 _owner: Optional[str] = None
 _owner_epoch = 0
+# The account whose load put the current owner on the GPU, so routes can refuse to evict
+# another account's in-use model and hide a private model's identity from everyone else.
+_owner_account: Optional[str] = None
 
 
 class OwnerChangedError(RuntimeError):
@@ -86,43 +89,138 @@ class GpuOwnerBusyError(RuntimeError):
         super().__init__(f"GPU is owned by {owner}")
 
 
+class GpuBusyForAnotherAccountError(GpuOwnerBusyError):
+    """Another account is generating on the resident model, so routes answer 409
+    ``gpu_busy`` rather than cancelling its stream."""
+
+    def __init__(self, owner: str, active: int):
+        self.active = active
+        super().__init__(owner)
+
+    @property
+    def retry_after(self) -> int:
+        from core.inference.llama_admission import estimate_gpu_retry_after
+        return estimate_gpu_retry_after()
+
+    def as_http_exception(self, path: Optional[str] = None):
+        """A retryable refusal without another account's model or conversation ids."""
+        from fastapi import HTTPException
+        from utils.api_errors import error_body_for_path
+
+        retry_after = self.retry_after
+        message = "Another account is generating on the resident model. Retry after it finishes."
+        detail = (
+            error_body_for_path(path, message, status = 409, code = "gpu_busy", param = "model")
+            if path and path.startswith("/v1/")
+            else {"error": "gpu_busy", "message": message, "retry_after": retry_after}
+        )
+        return HTTPException(
+            status_code = 409,
+            detail = detail,
+            headers = {"Retry-After": str(retry_after)},
+        )
+
+
+def other_accounts_active(account_id: str) -> int:
+    """Generations in flight that do not belong to ``account_id``."""
+    from state import active_generations
+    return active_generations.foreign_count(account_id)
+
+
+def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:
+    """Guard a destructive reload or teardown in a multi-account install.
+
+    Call under the lifecycle gate before touching any backend, including replacements
+    within CHAT or DIFFUSION where the modality owner does not change.
+    """
+    from utils.account_context import current_account_id
+
+    busy = other_accounts_active(account_id or current_account_id())
+    if busy:
+        raise GpuBusyForAnotherAccountError(_owner or CHAT, busy)
+
+
+def require_no_foreign_generations(
+    account_id: Optional[str] = None, *, path: Optional[str] = None
+) -> None:
+    """HTTP boundary for the shared pre-teardown guard."""
+    try:
+        raise_if_other_accounts_active(account_id)
+    except GpuBusyForAnotherAccountError as exc:
+        raise exc.as_http_exception(path) from exc
+
+
+def acquire_for_request(
+    owner: str,
+    register = None,
+    **kwargs,
+) -> Any:
+    """The request boundary for an arbiter acquisition, including media loads."""
+    try:
+        return acquire_for(owner, register, **kwargs)
+    except GpuBusyForAnotherAccountError as exc:
+        raise exc.as_http_exception() from exc
+
+
 def acquire_for(
     owner: str,
     register: Optional[Callable[[], Any]] = None,
     *,
     expected_current: Optional[tuple[Optional[str], int]] = None,
     allow_evict: bool = True,
+    account_id: Optional[str] = None,
+    replacing: bool = False,
 ) -> Any:
     """Make ``owner`` the sole GPU owner, evicting the other if it holds it.
 
-    ``register``, if given, runs under the arbiter lock right after ownership transfers and its
-    return value is returned. Marking the in-flight load HERE (not after ``acquire_for`` returns)
-    closes the window where a competing acquire could evict this owner before its load is in-flight,
-    letting both loaders allocate VRAM at once. It must be quick and not re-enter the arbiter; if it
-    raises, ownership stays with ``owner``.
+    ``register`` runs under the arbiter lock right after ownership transfers and its return
+    value is returned; marking the in-flight load here rather than after this call closes the
+    window where a competing acquire evicts this owner and both loaders allocate VRAM at once.
+    It must be quick and not re-enter the arbiter; if it raises, ownership stays with ``owner``.
+    ``register`` or ``replacing`` marks a real load; a plain ownership reassertion sets neither,
+    so accounts share the llama slots.
     """
-    global _owner, _owner_epoch
+    global _owner, _owner_epoch, _owner_account
     if owner not in _EVICTORS:
         raise ValueError(f"unknown GPU owner: {owner!r}")
+    from utils.account_context import current_account_id
+
+    acting = account_id or current_account_id()
     with _lock:
         if expected_current is not None and (_owner, _owner_epoch) != expected_current:
             raise OwnerChangedError("The resident GPU model changed; retry the load.")
+        if register is not None or replacing:
+            raise_if_other_accounts_active(acting)
         if _owner is not None and _owner != owner:
             if not allow_evict:
                 raise GpuOwnerBusyError(_owner)
+            # Never evict an account mid-generation; the caller retries after its stream ends.
+            busy = other_accounts_active(acting)
+            if busy:
+                raise GpuBusyForAnotherAccountError(_owner, busy)
             logger.info("gpu_arbiter: evicting %s for %s", _owner, owner)
             _EVICTORS[_owner]()
+        # ``_owner_account`` records who LOADED the resident model, so a plain reassertion
+        # must not rewrite it: the already-loaded fast paths in routes/inference.py re-assert
+        # CHAT without register/``replacing``, and overwriting handed the model to whoever
+        # asked last, hiding it from the account that loaded it.
+        claims = _owner != owner or register is not None or replacing
         _owner = owner
         _owner_epoch += 1
-        return register() if register is not None else None
+        result = register() if register is not None else None
+        # After ``register``: a raising registration loaded nothing and must not take residency.
+        if claims:
+            _owner_account = acting
+        return result
 
 
 def release(owner: str) -> None:
     """Drop ``owner``'s claim (no-op if it isn't the current owner)."""
-    global _owner, _owner_epoch
+    global _owner, _owner_epoch, _owner_account
     with _lock:
         if _owner == owner:
             _owner = None
+            _owner_account = None
             _owner_epoch += 1
 
 
@@ -133,17 +231,23 @@ def release_if(owner: str, predicate: Callable[[], bool]) -> bool:
     whose ``acquire_for(register=...)`` re-registers ownership under this lock; evaluating the
     predicate under the lock keeps them atomic so ``release`` never clears the newer claim.
     ``predicate`` must be quick and not re-enter the arbiter. Returns True iff ownership was dropped."""
-    global _owner, _owner_epoch
+    global _owner, _owner_epoch, _owner_account
     with _lock:
         if _owner != owner or not predicate():
             return False
         _owner = None
+        _owner_account = None
         _owner_epoch += 1
         return True
 
 
 def current_owner() -> Optional[str]:
     return _owner
+
+
+def owner_account() -> Optional[str]:
+    """The account that loaded the current owner, or None when the GPU is free."""
+    return _owner_account
 
 
 def owner_snapshot() -> tuple[Optional[str], int]:
