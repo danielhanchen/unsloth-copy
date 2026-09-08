@@ -27755,6 +27755,116 @@ def _responses_reasoning_output_item(
     return ResponsesOutputReasoning(**kwargs).model_dump()
 
 
+def _reject_unserviceable_responses_attachment(part, *, role = "user") -> None:
+    """Refuse an attachment the local adapter cannot serve, instead of dropping it.
+
+    Same four rules and same wording as ``_responses_tool_output_content``, which already
+    answers these shapes as a tool result; two vocabularies for one question is the bug.
+    A part reaches here only after failing its typed variant, so an ``input_image`` here has
+    no ``image_url``, or a ``detail`` outside the documented set, or both. One with both
+    ``image_url`` and ``file_id`` never arrives: ``file_id`` means instead of a URL, not
+    as well as, so it validates and is served from the URL on this path and on that one.
+    """
+    part_type = getattr(part, "type", None)
+    if part_type in ("input_text", "output_text") and not isinstance(
+        part, (ResponsesInputTextPart, ResponsesOutputTextPart)
+    ):
+        # A text part that lost its `text` field is a ResponsesUnknownContentPart wearing a
+        # known type name, so it passes a name-only allowlist and is then dropped by both the
+        # flatten and the parts loop. Say what is wrong with it, the way the tool-result path
+        # does, rather than "parts of type 'input_text' are not supported", which is untrue.
+        _raise_unsupported_openai_parameter(
+            "input",
+            f"Responses {part_type} message parts require a text field.",
+        )
+    if part_type == "input_file":
+        _raise_unsupported_openai_parameter(
+            "input",
+            "Responses input_file message parts are not supported by the local adapter.",
+        )
+    if part_type == "input_image":
+        image_url = getattr(part, "image_url", None)
+        if not isinstance(image_url, str) or not image_url:
+            if getattr(part, "file_id", None):
+                _raise_unsupported_openai_parameter(
+                    "input",
+                    "Responses input_image message parts with file_id are not supported by the "
+                    "local adapter. Use image_url instead.",
+                )
+            _raise_unsupported_openai_parameter(
+                "input",
+                "Responses input_image message parts require an image_url string.",
+            )
+        detail = getattr(part, "detail", "auto")
+        if detail is None:
+            detail = "auto"
+        if detail not in ("auto", "low", "high", "original"):
+            _raise_unsupported_openai_parameter(
+                "input",
+                "Responses input_image message detail must be auto, low, high, or original.",
+            )
+        if role != "user":
+            _raise_unsupported_openai_parameter(
+                "input",
+                f"Responses input_image message parts are only supported on user messages; "
+                f"{role} content is flattened to text by the local adapter.",
+            )
+
+
+# The only part types a flatten may discard without losing something the caller sent, per
+# role. Text survives the flatten as text anywhere. ``refusal`` and ``summary_text`` are the
+# model's own output metadata that clients round-trip, so they are free to drop on a replay
+# turn -- but only there: on system or developer they are caller content like any other, and
+# a metadata-only turn would vanish whole.
+# An allowlist, not an ``input_`` prefix test: OpenAI's enumeration is input_text,
+# input_image, output_text, refusal, input_file, computer_screenshot, summary_text, so a
+# prefix test would wave ``computer_screenshot`` through.
+_RESPONSES_TEXT_PART_TYPES = frozenset({"input_text", "output_text"})
+_RESPONSES_ASSISTANT_METADATA_PART_TYPES = frozenset({"refusal", "summary_text"})
+
+
+def _responses_part_survives_flatten(part_type, role) -> bool:
+    if part_type in _RESPONSES_TEXT_PART_TYPES:
+        return True
+    return role == "assistant" and part_type in _RESPONSES_ASSISTANT_METADATA_PART_TYPES
+
+
+def _reject_unserviceable_responses_attachments(item) -> None:
+    """Run the attachment refusal over one input message's content parts.
+
+    Role matters: only a user turn keeps its parts. Every other role is flattened by
+    ``_responses_message_text``, which keeps text and silently dropped everything else,
+    because Chat Completions wants a plain string on system and assistant and strict
+    templates reject an array there. Nothing can be forwarded there, only refused.
+    """
+    if isinstance(item.content, str):
+        return
+    for part in item.content or []:
+        _reject_unserviceable_responses_attachment(part, role = item.role)
+        part_type = getattr(part, "type", None)
+        if item.role != "user" and not _responses_part_survives_flatten(part_type, item.role):
+            _raise_unsupported_openai_parameter(
+                "input",
+                f"Responses message content parts of type '{part_type}' are not supported on "
+                f"{item.role} messages; {item.role} content is flattened to text by the local "
+                "adapter.",
+            )
+
+
+def _reject_unknown_responses_message_part(part) -> None:
+    """Refuse a content part no local route can serve, naming the type.
+
+    Mirrors ``_reject_unsupported_content_parts`` on the Chat Completions side. User turns
+    only: clients round-trip prior assistant output verbatim, so hoisting this one too would
+    fail a replay turn over a part that carries no attachment.
+    """
+    _raise_unsupported_openai_parameter(
+        "input",
+        f"Responses message content parts of type '{getattr(part, 'type', None)}' "
+        "are not supported.",
+    )
+
+
 def _normalise_responses_input(payload: ResponsesRequest) -> list[ChatMessage]:
     """Convert a ResponsesRequest's ``input`` into a Chat-format ``ChatMessage`` list.
 
@@ -27877,7 +27987,11 @@ def _normalise_responses_input(payload: ResponsesRequest) -> list[ChatMessage]:
             # don't 422.
             continue
 
-        # ResponsesInputMessage -- hoist system/developer to the top, merge.
+        # ResponsesInputMessage. Before the role branches: each returns via `continue`, so a
+        # refusal placed after them loses a system, developer or assistant attachment.
+        _reject_unserviceable_responses_attachments(item)
+
+        # Hoist system/developer to the top, merge.
         if item.role in ("system", "developer"):
             hoisted = _responses_message_text(item.content)
             if hoisted:
@@ -27898,8 +28012,8 @@ def _normalise_responses_input(payload: ResponsesRequest) -> list[ChatMessage]:
                 messages.append(ChatMessage(role = "assistant", content = text))
             continue
 
-        # User (and any other remaining roles) -- keep multimodal when present,
-        # drop unknown content parts silently.
+        # User (and any other remaining roles). Attachments were refused above, so a part
+        # still standing is one no local route can serve.
         parts: list = []
         for part in item.content:
             if isinstance(part, (ResponsesInputTextPart, ResponsesOutputTextPart)):
@@ -27911,7 +28025,8 @@ def _normalise_responses_input(payload: ResponsesRequest) -> list[ChatMessage]:
                         image_url = ImageUrl(url = part.image_url, detail = part.detail),
                     )
                 )
-            # ResponsesUnknownContentPart and anything else: drop.
+            else:
+                _reject_unknown_responses_message_part(part)
         if parts:
             # Collapse single-text-part content to a plain string so roles that
             # reject multimodal arrays (e.g. legacy templates) still accept it.
