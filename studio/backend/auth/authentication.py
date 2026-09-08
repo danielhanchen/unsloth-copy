@@ -539,27 +539,27 @@ async def _get_current_credential(
 
     jwt_secret = record["jwt_secret"]
     must_change_password = bool(record["must_change_password"])
-    # Bind from this same query, no second read; every storage lookup below the
-    # route resolves through that binding.
-    bind_account(AccountContext(record["account_id"], record["username"], record["role"]))
     try:
         payload = jwt.decode(token, jwt_secret, algorithms = [ALGORITHM])
-        if payload.get("sub") != subject:
-            raise HTTPException(
-                status_code = status.HTTP_401_UNAUTHORIZED,
-                detail = "Invalid token payload",
-            )
-        # The desktop shell signs in as the owner; a managed token carrying the
-        # marker is not entitled to the owner's password-change bypass.
-        is_desktop = payload.get("desktop") is True and record.get("role") == "owner"
-        if must_change_password and not allow_password_change and not is_desktop:
-            raise HTTPException(
-                status_code = status.HTTP_403_FORBIDDEN,
-                detail = "Password change required",
-            )
-        return subject, credential_generation(jwt_secret)
     except jwt.InvalidTokenError:
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = "Invalid or expired token",
         )
+    if payload.get("sub") != subject:
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = "Invalid token payload",
+        )
+    # Bind from this same query, no second read; every storage lookup below the route
+    # resolves through that binding. After the decode, so a rejected token binds nothing.
+    bind_account(AccountContext(record["account_id"], record["username"], record["role"]))
+    # The desktop shell signs in as the owner; a managed token carrying the
+    # marker is not entitled to the owner's password-change bypass.
+    is_desktop = payload.get("desktop") is True and record.get("role") == "owner"
+    if must_change_password and not allow_password_change and not is_desktop:
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = "Password change required",
+        )
+    return subject, credential_generation(jwt_secret)

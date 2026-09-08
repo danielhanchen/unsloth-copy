@@ -204,11 +204,15 @@ def acquire_for(
         # must not rewrite it: the already-loaded fast paths in routes/inference.py re-assert
         # CHAT without register/``replacing``, and overwriting handed the model to whoever
         # asked last, hiding it from the account that loaded it.
-        if _owner != owner or register is not None or replacing:
-            _owner_account = acting
+        claims = _owner != owner or register is not None or replacing
         _owner = owner
         _owner_epoch += 1
-        return register() if register is not None else None
+        result = register() if register is not None else None
+        # After ``register``: a registration that raised loaded nothing, so it must not take
+        # residency visibility from the account that did.
+        if claims:
+            _owner_account = acting
+        return result
 
 
 def release(owner: str) -> None:

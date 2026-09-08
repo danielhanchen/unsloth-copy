@@ -126,6 +126,22 @@ def sim(monkeypatch):
     return Simulator(monkeypatch)
 
 
+def test_a_failed_registration_does_not_take_residency(monkeypatch):
+    """``_owner_account`` says who LOADED the resident model. A registration that raised
+    loaded nothing, so it must not take that from the account that did."""
+    monkeypatch.setitem(arb._EVICTORS, arb.CHAT, lambda: None)
+    run_as(ALICE, arb.acquire_for, arb.CHAT, lambda: None)
+    assert arb.owner_account() == ALICE.account_id
+    with pytest.raises(RuntimeError, match = "out of memory"):
+        run_as(
+            BOB,
+            arb.acquire_for,
+            arb.CHAT,
+            lambda: (_ for _ in ()).throw(RuntimeError("out of memory")),
+        )
+    assert arb.owner_account() == ALICE.account_id
+
+
 def test_a_lone_owner_acquires_without_reading_policy_or_a_database(monkeypatch):
     """The guard is a count over the in-memory generation registry, which holds nothing
     but the owner's own runs on a one-account install, so it needs no policy lookup."""

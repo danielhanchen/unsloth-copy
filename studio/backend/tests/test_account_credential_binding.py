@@ -7,6 +7,7 @@ account keeps the host closed until it is deleted."""
 import asyncio
 import secrets
 
+import jwt
 import pytest
 from fastapi import HTTPException
 
@@ -160,6 +161,25 @@ def test_the_owner_login_id_needs_no_account_lookup(auth_db, monkeypatch):
     assert auth_routes._account_id_of(storage.DEFAULT_ADMIN_USERNAME) == "owner"
     monkeypatch.setattr(storage, "get_account", get_account)
     assert auth_routes._account_id_of("alice") == alice["account_id"]
+
+
+def test_a_token_that_fails_to_verify_binds_nothing(auth_db):
+    """The identity came from an unverified ``sub`` claim, so publishing it into the request
+    ContextVar before the signature check bound an account the caller never proved. Read
+    inside the dependency's own context, which is where the binding would be visible."""
+    alice = _managed("alice")
+    forged = jwt.encode({"sub": alice["username"]}, secrets.token_urlsafe(48), algorithm = "HS256")
+
+    async def go():
+        try:
+            await authentication._get_current_credential(
+                _credentials(forged), allow_password_change = False
+            )
+        except HTTPException as refused:
+            return refused.status_code, current_account()
+        raise AssertionError("a forged token must be refused")
+
+    assert asyncio.run(go()) == (401, OWNER)
 
 
 def test_unreadable_auth_db_keeps_the_host_closed(auth_db, monkeypatch):
