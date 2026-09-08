@@ -10,6 +10,7 @@ signed target itself, and re-check that the account is still there.
 """
 
 import secrets
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -17,8 +18,12 @@ from PIL import Image
 
 from auth import policy, storage
 from core.inference import image_gallery, video_gallery
+from core.rag import store
 from hub.services.models import account_access as access
+from routes import rag as rag_routes
+from storage import rag_db
 from utils.account_context import OWNER, run_as
+from utils.paths import ensure_dir, rag_uploads_root
 
 ALICE_NAME = "alice"
 
@@ -29,12 +34,66 @@ def accounts(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "DB_PATH", tmp_path / "auth.db")
     monkeypatch.setattr(storage, "_BOOTSTRAP_PW_PATH", tmp_path / ".bootstrap_password")
     monkeypatch.setattr(storage, "_bootstrap_password", None)
+    rag_db.reset_schema_state_for_tests()
     # Bumps the account generation, which is what every per-account link cache is keyed on.
     policy.invalidate_account_cache()
     storage.create_initial_user("unsloth", "owner-password", secrets.token_urlsafe(32))
     alice = storage.issue_account_setup_code(username = ALICE_NAME)["account"]
     yield storage.get_account(ALICE_NAME), alice["account_id"]
     policy.invalidate_account_cache()
+
+
+def _seed_document(account, document_id: str, text: bytes) -> None:
+    """One RAG document with its file on disk, in ``account``'s own store."""
+
+    def write():
+        path = ensure_dir(rag_uploads_root()) / f"{document_id}.txt"
+        path.write_bytes(text)
+        conn = rag_db.get_connection()
+        try:
+            store.create_document(
+                conn,
+                scope = "kb:none",
+                filename = f"{document_id}.txt",
+                sha256 = document_id,
+                status = "ready",
+                stored_path = str(path),
+                document_id = document_id,
+            )
+        finally:
+            conn.close()
+
+    run_as(account, write)
+
+
+def test_a_signed_rag_link_serves_its_own_accounts_document(accounts):
+    """The route has no auth dependency, so nothing bound an account and every read ran
+    against the owner's uploads root."""
+    alice, _account_id = accounts
+    _seed_document(OWNER, "shared-id", b"owner secret")
+    _seed_document(alice, "shared-id", b"alice secret")
+
+    token = run_as(alice, rag_routes._sign_document, "shared-id")
+    # No bearer and no bound account: the capability itself has to say whose file this is.
+    response = rag_routes.document_file_signed("shared-id", token = token)
+    assert Path(response.path).read_bytes() == b"alice secret"
+
+    owner_token = rag_routes._sign_document("shared-id")
+    owner_response = rag_routes.document_file_signed("shared-id", token = owner_token)
+    assert Path(owner_response.path).read_bytes() == b"owner secret"
+
+
+def test_a_signed_rag_link_dies_with_its_account(accounts):
+    alice, account_id = accounts
+    _seed_document(alice, "doc-1", b"alice secret")
+    token = run_as(alice, rag_routes._sign_document, "doc-1")
+    served = rag_routes.document_file_signed("doc-1", token = token)
+    assert Path(served.path).read_bytes() == b"alice secret"
+
+    storage.set_account_active(account_id, False)
+    with pytest.raises(HTTPException) as refused:
+        rag_routes.document_file_signed("doc-1", token = token)
+    assert refused.value.status_code == 401
 
 
 def test_a_signed_media_link_dies_with_its_account(accounts):
