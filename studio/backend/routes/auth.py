@@ -453,6 +453,23 @@ def auth_status() -> AuthStatusResponse:
     )
 
 
+def _login_failure_detail() -> str:
+    """Recovery hint for a rejected login.
+
+    ``reset-password`` refuses without a target once more than one account is active, so the
+    single-user wording would print a command that exits 1 on exactly the installs that need it.
+    The name is a placeholder, never the submitted one: that text is attacker-controlled and ends
+    up in a command the reader is invited to run.
+    """
+    if policy.installation_is_multi_user():
+        return (
+            "Incorrect username, password or setup code. Ask the installation owner to reset "
+            f"the account, by running this on the Studio host: {_reset_password_command()} "
+            "--username <name>"
+        )
+    return f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}"
+
+
 @router.post("/login", response_model = Token)
 async def login(payload: AuthLoginRequest, request: Request) -> Token:
     """Login with username/password. Per-account + per-IP rate-limited."""
@@ -477,7 +494,7 @@ async def login(payload: AuthLoginRequest, request: Request) -> Token:
         _record_login_failure(unknown_key)
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}",
+            detail = _login_failure_detail(),
         )
 
     if username == storage.DEFAULT_ADMIN_USERNAME:
@@ -492,7 +509,7 @@ async def login(payload: AuthLoginRequest, request: Request) -> Token:
         _record_login_failure(key)
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}",
+            detail = _login_failure_detail(),
         )
 
     _clear_login_bucket(key)
