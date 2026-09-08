@@ -12,7 +12,14 @@ from auth import policy
 from storage import studio_db
 from utils.account_context import run_as
 
-from .factories import FACTORIES, initialize_workspaces, seed_resource, snapshot_resource
+from .factories import (
+    FACTORIES,
+    SKIPPED,
+    format_path,
+    initialize_workspaces,
+    seed_resource,
+    snapshot_resource,
+)
 from .inventory import (
     OBJECT_ROUTES,
     ROUTES,
@@ -33,8 +40,33 @@ def matrix_parameters():
                 yield pytest.param(case, actor, id = f"{case.key}[{actor}]")
 
 
-def test_object_route_factory_completeness():
-    assert not [case.key for case in OBJECT_ROUTES if case.key not in FACTORIES]
+def test_object_route_factory_completeness(capsys):
+    uncovered = [
+        case.key for case in OBJECT_ROUTES if case.key not in FACTORIES and case.key not in SKIPPED
+    ]
+    covered = [case.key for case in OBJECT_ROUTES if case.key in FACTORIES]
+    skipped = [case.key for case in OBJECT_ROUTES if case.key in SKIPPED]
+    with capsys.disabled():
+        print(
+            f"\nroute isolation matrix: {len(OBJECT_ROUTES)} object routes, "
+            f"{len(covered)} covered by factory, {len(skipped)} skipped with reason, "
+            f"{len(covered) * len(ACTORS)} actor cases"
+        )
+    assert not uncovered, uncovered
+
+
+def test_skipped_routes_are_real_object_routes_with_a_reason():
+    keys = {case.key for case in OBJECT_ROUTES}
+    assert set(SKIPPED) <= keys, sorted(set(SKIPPED) - keys)
+    assert all(reason.strip() for reason in SKIPPED.values())
+    assert not set(SKIPPED) & set(FACTORIES)
+
+
+def test_factories_that_leave_the_default_contract_state_a_reason():
+    unexplained = [
+        key for key, factory in FACTORIES.items() if factory.deviates and not factory.reason.strip()
+    ]
+    assert not unexplained, unexplained
 
 
 @pytest.mark.parametrize("case,actor", list(matrix_parameters()))
@@ -59,16 +91,13 @@ def test_object_route_account_matrix(case, actor, request):
     app.include_router(case.router, prefix = "/matrix")
     with TestClient(app, raise_server_exceptions = False) as client:
         response = client.request(
-            case.method, "/matrix" + case.path.format(**params), headers = headers, json = factory.body
+            case.method,
+            "/matrix" + format_path(case.path, params),
+            headers = headers,
+            params = factory.query,
+            json = factory.body,
         )
-    expected = {
-        "owner": {404},
-        "right": {factory.success},
-        "wrong": {404},
-        "unauthenticated": {401, 403},
-        "deactivated": {401},
-    }
-    assert response.status_code in expected[actor], (
+    assert response.status_code in factory.expected(actor), (
         case.key,
         actor,
         response.status_code,
@@ -95,11 +124,12 @@ def test_owner_can_still_use_own_resource(case, accounts):
     with TestClient(app, raise_server_exceptions = False) as client:
         response = client.request(
             case.method,
-            "/matrix" + case.path.format(**params),
+            "/matrix" + format_path(case.path, params),
             headers = bearer("unsloth"),
+            params = factory.query,
             json = factory.body,
         )
-    assert response.status_code == factory.success, response.text
+    assert response.status_code in (factory.self_expected or (factory.success,)), response.text
 
 
 def test_first_database_use_in_each_account_initializes_its_schema(accounts):

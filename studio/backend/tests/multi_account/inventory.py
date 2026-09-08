@@ -90,9 +90,10 @@ OBJECT_ROUTES = tuple(case for case in ROUTES if case.object_parameters)
 
 
 def render_inventory() -> str:
-    from .factories import FACTORIES
+    from .factories import FACTORIES, SKIPPED
 
     covered = sum(case.key in FACTORIES for case in OBJECT_ROUTES)
+    skipped = sum(case.key in SKIPPED for case in OBJECT_ROUTES)
     lines = [
         "# Studio route isolation inventory",
         "",
@@ -100,7 +101,8 @@ def render_inventory() -> str:
         "mount aliases outside routes (main.py, hub, picker, MCP mounts) are outside this inventory.",
         "",
         f"{len(ROUTES)} route/method pairs; {len(OBJECT_ROUTES)} have object-like parameters; "
-        f"{covered} have factories; {len(OBJECT_ROUTES) - covered} are uncovered.",
+        f"{covered} have factories; {skipped} are skipped with a stated reason; "
+        f"{len(OBJECT_ROUTES) - covered - skipped} are uncovered.",
         "",
         "Each object route produces five cases: owner reading Alice's resource, Alice, Bob, "
         "unauthenticated, and a deactivated Alice with a previously issued JWT. "
@@ -114,7 +116,8 @@ def render_inventory() -> str:
         coverage = (
             FACTORIES[case.key].name
             if case.key in FACTORIES
-            else ("**uncovered**" if case.object_parameters else "no object-like path parameter")
+            else SKIPPED.get(case.key)
+            or ("**uncovered**" if case.object_parameters else "no object-like path parameter")
         )
         lines.append(
             f"| {case.module} | {case.method} | `{case.path}` | "
