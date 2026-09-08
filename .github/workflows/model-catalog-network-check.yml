@@ -23,10 +23,7 @@
 name: Model catalog network check
 
 on:
-  schedule:
-    - cron: '19 6 * * *'   # 06:19 UTC daily, off the cron rush
   workflow_dispatch:
-
 concurrency:
   # The event is part of the group so a manual dispatch and the nightly cannot
   # coalesce; both resolve to refs/heads/main.

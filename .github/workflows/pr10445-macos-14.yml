@@ -1,0 +1,40 @@
+name: "PR-10445 macos-14"
+on:
+  push:
+    branches: [pr10445-cross-os]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: macos-14
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci --no-fund --no-audit
+      - name: Unit tests
+        run: npm test
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+  pytests:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install pytest
+      - name: Studio prompt-queue source contracts
+        run: python -m pytest tests/studio/test_prompt_queue_user_stop.py tests/studio/test_prompt_queue_pause_side_effects.py tests/studio/test_multi_chat_prompt_queue_contract.py tests/studio/test_stop_running_chats_prompt_contract.py -q
