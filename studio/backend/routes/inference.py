@@ -35203,37 +35203,38 @@ async def generate_diffusion_image(
         await asyncio.to_thread(account_access.require_media_adapters, request)
         await asyncio.to_thread(account_access.require_media_generation_access, backend.status())
     try:
-        result = await asyncio.to_thread(
-            backend.generate,
-            prompt = request.prompt,
-            negative_prompt = request.negative_prompt,
-            width = request.width,
-            height = request.height,
-            steps = request.steps,
-            guidance = request.guidance,
-            seed = request.seed,
-            batch_size = request.batch_size,
-            prompts = request.prompts,
-            seeds = request.seeds,
-            init_image = request.init_image,
-            mask_image = request.mask_image,
-            strength = request.strength,
-            upscale = request.upscale,
-            reference_images = request.reference_images,
-            loras = [(l.id, l.weight) for l in request.loras] if request.loras else None,
-            controlnet = (
-                (
-                    request.controlnet.id,
-                    request.controlnet.image,
-                    request.controlnet.control_type,
-                    request.controlnet.strength,
-                    request.controlnet.guidance_start,
-                    request.controlnet.guidance_end,
-                )
-                if request.controlnet
-                else None
-            ),
-        )
+        with account_access.media_generation("diffusion"):
+            result = await asyncio.to_thread(
+                backend.generate,
+                prompt = request.prompt,
+                negative_prompt = request.negative_prompt,
+                width = request.width,
+                height = request.height,
+                steps = request.steps,
+                guidance = request.guidance,
+                seed = request.seed,
+                batch_size = request.batch_size,
+                prompts = request.prompts,
+                seeds = request.seeds,
+                init_image = request.init_image,
+                mask_image = request.mask_image,
+                strength = request.strength,
+                upscale = request.upscale,
+                reference_images = request.reference_images,
+                loras = [(l.id, l.weight) for l in request.loras] if request.loras else None,
+                controlnet = (
+                    (
+                        request.controlnet.id,
+                        request.controlnet.image,
+                        request.controlnet.control_type,
+                        request.controlnet.strength,
+                        request.controlnet.guidance_start,
+                        request.controlnet.guidance_end,
+                    )
+                    if request.controlnet
+                    else None
+                ),
+            )
     except ValueError as exc:
         # Bad client input (undecodable image/mask, or an unsupported workflow): a 400 with the reason, not a generic 500.
         raise HTTPException(status_code = 400, detail = str(exc))
@@ -35659,12 +35660,21 @@ async def diffusion_load_progress(current_subject: str = Depends(get_current_sub
 
 @studio_router.get("/images/generate-progress", response_model = DiffusionGenerateProgressResponse)
 async def diffusion_generate_progress(current_subject: str = Depends(get_current_subject)):
-    if account_access.resident_hidden("diffusion"):
+    # The steps and preview belong to whoever started the generation, not to whoever loaded the
+    # model: an authorized second account may generate on a shared resident.
+    if account_access.managed_account() and account_access.generation_is_foreign("diffusion"):
+        return account_access.hidden_resident_response()
+    mine = account_access.generation_is_mine("diffusion")
+    if not mine and account_access.resident_hidden("diffusion"):
         return account_access.hidden_resident_response()
     from core.inference.diffusion_engine_router import get_active_diffusion_engine
 
-    if account_access.managed_account() and account_access.resident_hidden(
-        "diffusion", get_active_diffusion_engine().status().get("repo_id")
+    if (
+        not mine
+        and account_access.managed_account()
+        and account_access.resident_hidden(
+            "diffusion", get_active_diffusion_engine().status().get("repo_id")
+        )
     ):
         return account_access.hidden_resident_response()
 
@@ -35685,12 +35695,23 @@ async def cancel_diffusion_generation(current_subject: str = Depends(get_current
     sentinel, which this module already maps to a 409. ``cancelled`` is False when nothing was
     running, so the page can settle its button back to Generate rather than wait for a
     generation that already finished."""
-    if account_access.foreign_work_active() or account_access.resident_hidden("diffusion"):
+    # Cancellation follows the generation's own account: the loader must not stop another
+    # account's run, and that account must be able to stop its own.
+    if account_access.generation_is_foreign("diffusion"):
+        return {"cancelled": False}
+    mine = account_access.generation_is_mine("diffusion")
+    if not mine and (
+        account_access.foreign_work_active() or account_access.resident_hidden("diffusion")
+    ):
         return {"cancelled": False}
     from core.inference.diffusion_engine_router import get_active_diffusion_engine
 
-    if account_access.managed_account() and account_access.resident_hidden(
-        "diffusion", get_active_diffusion_engine().status().get("repo_id")
+    if (
+        not mine
+        and account_access.managed_account()
+        and account_access.resident_hidden(
+            "diffusion", get_active_diffusion_engine().status().get("repo_id")
+        )
     ):
         return {"cancelled": False}
 

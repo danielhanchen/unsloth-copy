@@ -14,7 +14,7 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from datetime import datetime, timezone
-from contextlib import closing
+from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -101,6 +101,56 @@ def account_scope() -> str | None:
 
 
 _resident_accounts: dict[str, tuple[str, frozenset[str]]] = {}
+
+# Residency belongs to the account that loaded the model; an in-flight generation belongs to the
+# account that started it, and an authorized second account can run one on a shared resident.
+_generation_accounts: dict[str, dict[str, int]] = {}
+_generation_lock = threading.Lock()
+
+
+@contextmanager
+def media_generation(modality: str):
+    """Hold this account's claim on a media generation for as long as it runs."""
+    if not policy.installation_is_multi_user():
+        yield
+        return
+    account_id = current_account_id()
+    with _generation_lock:
+        counts = _generation_accounts.setdefault(modality, {})
+        counts[account_id] = counts.get(account_id, 0) + 1
+    try:
+        yield
+    finally:
+        with _generation_lock:
+            counts = _generation_accounts.get(modality) or {}
+            remaining = counts.get(account_id, 0) - 1
+            if remaining > 0:
+                counts[account_id] = remaining
+            else:
+                counts.pop(account_id, None)
+            if not counts:
+                _generation_accounts.pop(modality, None)
+
+
+def generation_is_mine(modality: str) -> bool:
+    """True while this account has a generation of its own in flight on this modality."""
+    if not policy.installation_is_multi_user():
+        return False
+    account_id = current_account_id()
+    with _generation_lock:
+        return bool(_generation_accounts.get(modality, {}).get(account_id))
+
+
+def generation_is_foreign(modality: str) -> bool:
+    """True while another account's generation is in flight, whoever loaded the model."""
+    if not policy.installation_is_multi_user():
+        return False
+    account_id = current_account_id()
+    with _generation_lock:
+        return any(
+            account != account_id and count
+            for account, count in _generation_accounts.get(modality, {}).items()
+        )
 
 
 def note_resident_account(modality: str, *references: str) -> None:
