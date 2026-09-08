@@ -2959,6 +2959,36 @@ def trailing_assistant_text(messages: list) -> Optional[str]:
     return None
 
 
+def trailing_assistant_reasoning(messages: list) -> str:
+    """Reasoning text of a trailing assistant turn that showed no prose yet.
+
+    A reasoning model preempted inside its thought block has real work and no visible
+    characters, so ``trailing_assistant_text`` reports "" and every truthiness gate built
+    on it drops the continuation.
+
+    Separate from ``trailing_assistant_text`` on purpose: that one feeds the manual prompt
+    splice, which appends its result as VISIBLE text, so handing it reasoning would paste
+    the thought into the answer.
+    """
+    if not messages:
+        return ""
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return ""
+    if last.get("tool_calls"):
+        return ""
+    for field in ("reasoning_content", "reasoning", "thinking"):
+        value = last.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def trailing_assistant_resumable(messages: list) -> bool:
+    """Whether a trailing assistant turn can be continued at all, prose or thought."""
+    return bool(trailing_assistant_text(messages) or trailing_assistant_reasoning(messages))
+
+
 def last_user_text(messages: list) -> str:
     """Text of the newest user turn, with any ``<img>`` markup stripped.
 
