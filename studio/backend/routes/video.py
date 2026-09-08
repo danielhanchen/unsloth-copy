@@ -403,6 +403,34 @@ async def video_load_progress(current_subject: str = Depends(get_current_subject
     return VideoLoadProgressResponse(**get_video_backend().load_progress())
 
 
+# Who started the clip in flight: residency names the loader, which may be another account.
+_generation_account: Optional[str] = None
+_generation_lock = threading.Lock()
+
+
+def _note_generation_account() -> None:
+    global _generation_account
+    from utils.account_context import current_account
+
+    with _generation_lock:
+        _generation_account = current_account().account_id
+
+
+def _generation_hidden(backend) -> bool:
+    """Whether this caller may not see or stop the clip the backend is holding."""
+    with _generation_lock:
+        started_by = _generation_account
+    if started_by is not None:
+        from utils.account_context import current_account
+
+        return account_access.managed_account() and started_by != current_account().account_id
+    # Nothing tracked (no generation since this process started): fall back to residency.
+    return account_access.resident_hidden("video") or (
+        account_access.managed_account()
+        and account_access.resident_hidden("video", backend.status().get("repo_id"))
+    )
+
+
 @router.post("/video/generate", response_model = VideoGenerateResponse)
 @account_access.gpu_busy_route
 async def generate_video(
@@ -529,33 +557,30 @@ async def generate_video(
         logger.error("video.generate_failed: %s", exc, exc_info = True)
         raise HTTPException(status_code = 500, detail = "Video generation failed.")
 
+    _note_generation_account()
     return VideoGenerateResponse()
 
 
 @router.get("/video/generate-progress", response_model = VideoGenerateProgressResponse)
 async def video_generate_progress(current_subject: str = Depends(get_current_subject)):
-    if account_access.resident_hidden("video"):
-        return account_access.hidden_resident_response()
     from core.inference.video import get_video_backend
 
-    if account_access.managed_account() and account_access.resident_hidden(
-        "video", get_video_backend().status().get("repo_id")
-    ):
+    backend = get_video_backend()
+    if _generation_hidden(backend):
         return account_access.hidden_resident_response()
-    return VideoGenerateProgressResponse(**get_video_backend().generate_progress())
+    return VideoGenerateProgressResponse(**backend.generate_progress())
 
 
 @router.post("/video/generate/cancel")
 async def cancel_video_generation(current_subject: str = Depends(get_current_subject)):
-    if account_access.foreign_work_active() or account_access.resident_hidden("video"):
-        return {"cancelled": False}
     from core.inference.video import get_video_backend
 
-    if account_access.managed_account() and account_access.resident_hidden(
-        "video", get_video_backend().status().get("repo_id")
-    ):
+    backend = get_video_backend()
+    if _generation_hidden(backend):
         return {"cancelled": False}
-    cancelled = await asyncio.to_thread(get_video_backend().cancel_generate)
+    if _generation_account is None and account_access.foreign_work_active():
+        return {"cancelled": False}
+    cancelled = await asyncio.to_thread(backend.cancel_generate)
     return {"cancelled": cancelled}
 
 
