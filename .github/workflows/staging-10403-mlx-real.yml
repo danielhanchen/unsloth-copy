@@ -1,0 +1,145 @@
+name: "staging-10403 real MLX (Apple Silicon)"
+on:
+  push:
+    branches: ["pr-10403-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  # The installer's gate, read off a genuine host rather than a monkeypatched one.
+  # macos-15 is arm64 and macos-13 is Intel, so the pair covers both sides of
+  # IS_MAC_ARM without anything in the test asserting what platform it is on.
+  gate-on-real-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            expect_mlx: "1"
+          - os: macos-13
+            expect_mlx: "0"
+          - os: ubuntu-latest
+            expect_mlx: "0"
+          - os: windows-latest
+            expect_mlx: "0"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging
+      - name: Gate fires exactly where it should
+        env:
+          EXPECT_MLX: ${{ matrix.expect_mlx }}
+        run: python .github/scripts/pr10403_gate_probe.py
+
+  # The pins are macosx_14_0 / cp310 only. A runner older than that must skip the
+  # step rather than fail the install, so assert the skip is what happens.
+  gate-on-unsupported-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            python: '3.9'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install packaging
+      - name: Python 3.9 on Apple Silicon skips the step and still installs
+        env:
+          EXPECT_MLX: "0"
+        run: python .github/scripts/pr10403_gate_probe.py
+
+  # Does the pinned stack the PR installs actually import and run on Apple Silicon,
+  # and does Studio's own health check then call it usable?
+  real-mlx-stack:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - name: Install the exact pins the installer uses
+        run: |
+          set -euxo pipefail
+          uv venv .mlxenv --python 3.12
+          export UV_OVERRIDE="$PWD/studio/backend/requirements/single-env/overrides-darwin-arm64.txt"
+          uv pip install --python .mlxenv/bin/python --no-cache-dir --upgrade \
+            'mlx==0.32.1' 'mlx-metal==0.32.1' 'mlx-lm==0.31.3' 'mlx-vlm>=0.4.4,<0.7.0'
+          uv pip list --python .mlxenv/bin/python | grep -i mlx
+      - name: Imports, Metal compute, and Studio's own verdict
+        run: .mlxenv/bin/python .github/scripts/pr10403_mlx_probe.py
+
+  # The pins must be unsatisfiable exactly where the floor says they are, read off
+  # the live index rather than from the constants in the source.
+  pins-match-the-published-wheels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv .probe --python 3.12
+      - name: macOS 13 arm64 and Python 3.9 have no wheel; macOS 14 does
+        run: |
+          set -uxo pipefail
+          fail=0
+          if uv pip install --dry-run --python .probe/bin/python \
+               --python-platform aarch64-apple-darwin 'mlx==0.32.1' 'mlx-metal==0.32.1'; then
+            echo "EXPECTED FAILURE: pins resolved on the macOS 13 arm64 target"; fail=1
+          fi
+          if uv pip install --dry-run --python .probe/bin/python \
+               --python-platform aarch64-apple-darwin --python-version 3.9 'mlx==0.32.1'; then
+            echo "EXPECTED FAILURE: pins resolved on Python 3.9"; fail=1
+          fi
+          if uv pip install --dry-run --python .probe/bin/python \
+               --python-platform aarch64-apple-darwin 'mlx-lm>=0.31.2' 'mlx-vlm>=0.4.4'; then
+            echo "EXPECTED FAILURE: Studio's own MLX floors resolved on macOS 13 arm64"; fail=1
+          fi
+          python -m pip download --no-deps -d /tmp/w --platform macosx_14_0_arm64 \
+            --python-version 3.12 --only-binary=:all: 'mlx==0.32.1' 'mlx-metal==0.32.1' \
+            || { echo "macOS 14 should have wheels for the pins"; fail=1; }
+          exit "$fail"
+
+  # The GGUF-only promise, on the real thing: nothing in the installer's MLX
+  # arguments may reach a --no-torch venv.
+  no-torch-stays-clean:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging
+      - name: No MLX under NO_TORCH, fresh or update
+        env:
+          EXPECT_MLX: "0"
+          FORCE_NO_TORCH: "1"
+        run: python .github/scripts/pr10403_gate_probe.py
