@@ -1,0 +1,43 @@
+name: labext-arm64
+on:
+  push:
+    branches: [labext-check]
+  workflow_dispatch:
+jobs:
+  labext:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64-main-baseline
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick the extension source (fixed branch vs main baseline)
+        run: |
+          set -eux
+          if [ "${{ matrix.arch }}" = "arm64-main-baseline" ]; then
+            git fetch --depth 1 https://github.com/unslothai/unsloth.git main
+            git checkout FETCH_HEAD -- docker/jupyter/unsloth_labext/package.json
+          fi
+          grep -nE '"@jupyter(lab)?/builder"' docker/jupyter/unsloth_labext/package.json
+      - name: Build the labext-builder stage, no cache
+        run: |
+          set -eux
+          cd docker
+          docker build --progress=plain --no-cache --target labext-builder \
+            -f Dockerfile.studio --build-arg BASE_IMAGE=unsloth/unsloth:latest \
+            -t labext:test . 2>&1 | tee /tmp/build.log
+          echo "== core-meta / github mentions:"; grep -cE 'core-meta|github.com' /tmp/build.log || true
+          grep -E 'legacy|rate limit|Could not resolve' /tmp/build.log || echo "no legacy/fallback lines"
+      - name: Extension is enabled in the image
+        run: |
+          docker run --rm --entrypoint /bin/bash labext:test -c '
+            cp -r /opt/labext-src/unsloth-jupyterlab/labextension /opt/unsloth-venv/share/jupyter/labextensions/unsloth-jupyterlab-test
+            /opt/unsloth-venv/bin/jupyter labextension list 2>&1 | grep -E "unsloth-jupyterlab"'
