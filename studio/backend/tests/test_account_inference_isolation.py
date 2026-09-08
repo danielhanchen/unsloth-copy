@@ -368,6 +368,46 @@ def test_openai_catalog_and_advertised_paths_are_account_scoped(monkeypatch):
         assert run_as(account, inference._advertised_local_path, "same/name") == account.account_id
 
 
+def test_the_local_id_v1_models_publishes_is_usable_by_its_own_account(monkeypatch):
+    """An account's own local model is advertised path-free, so the id it round-trips
+    is authorized by the path behind it, and only within the account that owns it."""
+    from utils.paths.storage_roots import workspace_root
+
+    def _row(account):
+        path = str(run_as(account, workspace_root) / "models" / "my-model")
+        return SimpleNamespace(model_id = None, id = path, path = path)
+
+    rows = [_row(OWNER), _row(ALICE), _row(BOB)]
+    monkeypatch.setattr(inference, "_classified_catalog", lambda listed: listed)
+    monkeypatch.setattr(models, "collect_local_models", lambda path: rows)
+
+    request = SimpleNamespace(
+        scope = {},
+        state = SimpleNamespace(),
+        url = SimpleNamespace(path = "/v1/chat/completions"),
+    )
+
+    async def resolve(account):
+        return await arun_as(
+            account,
+            inference._maybe_auto_switch_model("my-model", request, account.username),
+        )
+
+    for account in (ALICE, BOB):
+        asyncio.run(resolve(account))
+        assert run_as(account, inference._own_local_model_for_alias, "my-model") == _row(
+            account
+        ).path
+        assert run_as(account, inference._own_local_model_for_alias, "other-model") is None
+
+    monkeypatch.setattr(inference, "_managed_catalogs", {})
+    monkeypatch.setattr(models, "collect_local_models", lambda path: [_row(OWNER)])
+    for account in (ALICE, BOB):
+        with pytest.raises(HTTPException) as refused:
+            asyncio.run(resolve(account))
+        assert refused.value.status_code == 404
+
+
 def test_private_media_index_rows_cannot_bypass_filtered_openai_catalog(monkeypatch):
     picks = {
         "text-to-image": [

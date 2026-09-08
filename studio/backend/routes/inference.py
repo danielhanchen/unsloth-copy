@@ -8239,6 +8239,36 @@ async def _reject_unservable_model(
     )
 
 
+async def _require_named_model_access(named_model: str) -> None:
+    """Authorize a named model; a path-free local id from /v1/models resolves through the account catalog."""
+    try:
+        await asyncio.to_thread(account_access.require_model_access, named_model)
+        return
+    except HTTPException as refusal:
+        if refusal.status_code != 404:
+            raise
+    from core.inference.openai_auto_download import split_model_ref
+
+    alias = (split_model_ref(named_model)[0] or "").strip().lower()
+    if alias:
+        await _cached_local_catalog()
+        if await asyncio.to_thread(_own_local_model_for_alias, alias) is not None:
+            return
+    raise HTTPException(status_code = 404, detail = "Model not found")
+
+
+def _own_local_model_for_alias(alias: str) -> Optional[str]:
+    """Path of the local model this account's catalog advertises as *alias*, or None."""
+    for info in _account_catalog_cache()["models"] or ():
+        cid = getattr(info, "model_id", None) or public_model_id(getattr(info, "id", None))
+        path = getattr(info, "path", None)
+        if not cid or not path or cid.strip().lower() != alias:
+            continue
+        if account_access.model_visible(path):
+            return path
+    return None
+
+
 async def _maybe_auto_switch_model(
     requested_model: Optional[str],
     fastapi_request: Request,
@@ -8287,7 +8317,7 @@ async def _maybe_auto_switch_model(
     named_model = requested_model if requested_model != _RELOAD_ONLY_MODEL else None
     if account_access.managed_account():
         if named_model:
-            await asyncio.to_thread(account_access.require_model_access, named_model)
+            await _require_named_model_access(named_model)
         elif account_access.resident_hidden("chat", _loaded_slot_ident()):
             raise HTTPException(status_code = 404, detail = "Model not found")
 
