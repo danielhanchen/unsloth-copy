@@ -40,7 +40,7 @@ SENTINEL = "Owner's saved conversation: café / 日本語"
 def seed_studio_db(path: Path, *, populated: bool = True) -> None:
     path.parent.mkdir(parents = True, exist_ok = True)
     with closing(sqlite3.connect(path)) as conn:
-        conn.executescript(Path(__file__).with_name("legacy_studio_schema.sql").read_text())
+        conn.executescript(Path(__file__).with_name("legacy_studio_schema.sql").read_text(encoding = "utf-8"))
         if populated:
             conn.execute(
                 "INSERT INTO chat_threads (id,title,model_type,model_id,created_at,updated_at) "

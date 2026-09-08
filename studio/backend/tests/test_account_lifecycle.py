@@ -508,7 +508,7 @@ def test_cli_single_account_default_output_and_desktop_cleanup_unchanged(auth_en
     desktop = storage.create_desktop_secret()
     auth_dir = storage.DB_PATH.parent
     for filename in (studio_cli.BOOTSTRAP_PASSWORD_FILE, studio_cli.DESKTOP_SECRET_FILE):
-        (auth_dir / filename).write_text("old-secret")
+        (auth_dir / filename).write_text("old-secret", encoding = "utf-8")
     token = authentication.create_refresh_token("unsloth")
     key = storage.create_api_key("unsloth", "test")[0]
     result = reset_cli.invoke(studio_cli.studio_app, ["reset-password"])
@@ -563,7 +563,7 @@ def test_cli_reset_only_target_and_owner_only_desktop_rotation(matrix, reset_cli
     desktop = storage.create_desktop_secret()
     auth_dir = storage.DB_PATH.parent
     for filename in (studio_cli.BOOTSTRAP_PASSWORD_FILE, studio_cli.DESKTOP_SECRET_FILE):
-        (auth_dir / filename).write_text("owner-only")
+        (auth_dir / filename).write_text("owner-only", encoding = "utf-8")
     before = {name: storage.get_user_record(name) for name in credentials}
     result = reset_cli.invoke(
         studio_cli.studio_app, ["reset-password", "--username", target.upper()]

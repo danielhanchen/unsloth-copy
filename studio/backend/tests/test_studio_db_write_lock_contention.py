@@ -856,7 +856,7 @@ def test_the_lifespan_holds_the_keeper_across_every_writer():
 
     source = inspect.getsource(main.lifespan)
     served = source.index("yield")
-    assert source.index("open_wal_keeper()") < source.index("cleanup_orphaned_runs()") < served
+    assert source.index("open_wal_keeper()") < source.index("cleanup_orphaned_runs)") < served
     assert (
         served < source.index("await run_lifespan_shutdown(") < source.index("close_wal_keeper()")
     )

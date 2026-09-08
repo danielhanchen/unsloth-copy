@@ -3,6 +3,8 @@
 
 """Local Git-only baseline materialization; no network or other worker checkout is read."""
 
+from __future__ import annotations
+
 import io
 import json
 import os

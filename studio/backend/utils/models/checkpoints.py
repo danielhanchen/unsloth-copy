@@ -3,6 +3,8 @@
 
 """Checkpoint scanning utilities for discovering training runs and checkpoints."""
 
+from __future__ import annotations
+
 import json
 import re
 import structlog

@@ -380,7 +380,7 @@ def test_install_under_a_granted_root_stays_hidden(tmp_path, monkeypatch):
         files = _seed(home.parent)  # seeds studio under home
         auth = home / "auth" / "auth.db"
         auth.parent.mkdir(parents = True, exist_ok = True)
-        auth.write_text("OWNER_AUTH_DB")
+        auth.write_text("OWNER_AUTH_DB", encoding = "utf-8")
         out = run_as(
             BOB,
             tools._bash_exec,

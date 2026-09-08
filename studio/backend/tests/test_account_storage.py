@@ -369,7 +369,7 @@ def test_legacy_root_names_resolve_at_use(account_home, filename, names):
     import ast
 
     source = Path(__file__).resolve().parents[1] / filename
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(source.read_text(encoding = "utf-8"))
     assignments = [
         node
         for node in tree.body

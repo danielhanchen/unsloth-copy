@@ -10,6 +10,8 @@ unauthenticated caller gets 401/403 and a deactivated account gets 401. Any rout
 contract differs states the deviation together with a one-line reason.
 """
 
+from __future__ import annotations
+
 import inspect
 import re
 from dataclasses import dataclass, field
