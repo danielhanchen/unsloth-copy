@@ -15,6 +15,9 @@ def hf_error_status(exc: Exception) -> Optional[int]:
         "RepositoryNotFoundError",
         "RevisionNotFoundError",
         "EntryNotFoundError",
+        # "Hub unreachable and the cache cannot answer" is a missing resource, not a fault.
+        "LocalEntryNotFoundError",
+        "OfflineModeIsEnabled",
     ):
         return 404
     if name == "GatedRepoError":

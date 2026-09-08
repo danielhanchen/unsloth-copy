@@ -18,8 +18,10 @@ from utils.paths import (
 )
 from hub.utils.hf_tokens import (
     ANONYMOUS_CACHE_IDENTITY,
+    qualify_cache_identity,
     HfTokenArg,
     apply_token_to_child_env,
+    cache_reads_authorized,
     is_anonymous,
     normalize_token,
 )
@@ -574,6 +576,20 @@ def load_model_config(
             **revision_kwargs,
         )
 
+    # Only a repo whose config.json is already on disk can be served without authorizing.
+    # An uncached repo has nothing to leak, and AutoConfig's own authenticated request is
+    # then the thing the Hub checks, so refusing it here would break a mirror that serves
+    # /resolve but not the undocumented /auth-check, and every transient probe failure,
+    # while protecting nothing.
+    if (
+        isinstance(token, str)
+        and token
+        and not is_local_path(model_name)
+        and _config_json_already_cached(model_name, revision)
+        and not cache_reads_authorized(token, repo_id = model_name)
+    ):
+        raise OSError(f"config.json for {model_name} is not available to an unauthorized caller")
+
     if token:
         return AutoConfig.from_pretrained(
             model_name,
@@ -807,6 +823,15 @@ def _raw_config_has_vision_config(
             }
             if revision is not None:
                 download_kwargs["revision"] = revision
+            # hf_hub_download serves the cached file whenever the Hub is unreachable, even with
+            # local_files_only=False, and never consults the credential to do it. Measured: a
+            # planted cache entry plus a dead endpoint returns a private repo's config.json to a
+            # token that cannot read it. Only a repo already on disk can leak, so authorize just
+            # that case; anything not cached goes to the wire, where the Hub enforces access.
+            if _config_json_already_cached(model_name, revision) and not cache_reads_authorized(
+                hf_token, repo_id = model_name
+            ):
+                return None
             config_path = Path(hf_hub_download(**download_kwargs))
         config = json.loads(config_path.read_text(encoding = "utf-8-sig"))
         architectures = config.get("architectures") or []
@@ -834,6 +859,24 @@ def _raw_config_has_vision_config(
 
 # why: inline _is_vlm and constants are prepended so the subprocess stays self-contained
 # and doesn't import the parent module graph. Built on demand to defer the registry read.
+def _config_json_already_cached(model_name: str, revision: Optional[str] = None) -> bool:
+    """True if this repo's config.json is on disk, so an unauthorized read could be served it."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(
+            repo_id = model_name,
+            filename = "config.json",
+            revision = revision,
+            cache_dir = active_hf_hub_cache(),
+        )
+        # Also returns a sentinel object recording a known-absent file; only a str is a real hit.
+        return isinstance(hit, str)
+    except Exception as exc:
+        # Never let the guard's own failure open the path it guards.
+        logger.debug("Could not check cached config.json for '%s': %s", model_name, exc)
+        return True
+
+
 def _build_vision_check_inline_helpers() -> str:
     vlm_types, vlm_classes, audio_types = _detection_sets()
     return (
@@ -1061,7 +1104,7 @@ def _token_fingerprint(token: HfTokenArg) -> Optional[str]:
         return ANONYMOUS_CACHE_IDENTITY
     if token is None:
         return None
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return qualify_cache_identity(token, hashlib.sha256(token.encode("utf-8")).hexdigest())
 
 
 # Scoped to a request, not cached: a repo gated or deleted between requests is seen on the next.
@@ -1199,7 +1242,15 @@ def is_vision_model(
     effective_offline = bool(local_files_only or _env_offline())
     # Offline the probe reads the cache and never authorizes, so local_files_only=False
     # does not put an anonymous caller back on the wire. It gets the default instead.
-    if effective_offline and is_anonymous(hf_token) and not is_local_path(model_name):
+    # The online cache fallback is guarded inside _raw_config_has_vision_config, at the point
+    # where a cached file can actually be served, rather than here: gating the whole call
+    # would deny a legitimate token its answer on any Hub hiccup, for a repo that is not on
+    # disk and so has nothing to leak.
+    if (
+        effective_offline
+        and not is_local_path(model_name)
+        and not cache_reads_authorized(hf_token, repo_id = resolved_name)
+    ):
         return False
     cache_key: _CapabilityCacheKey = (
         resolved_name,
@@ -1422,7 +1473,11 @@ def detect_audio_type_checked(
     effective_offline = bool(local_files_only or _env_offline())
     # Offline the probe reads the cache and never authorizes, so local_files_only=False
     # does not put an anonymous caller back on the wire. Inconclusive for it instead.
-    if effective_offline and is_anonymous(hf_token) and not is_local_path(model_name):
+    if (
+        effective_offline
+        and not is_local_path(model_name)
+        and not cache_reads_authorized(hf_token, repo_id = model_name)
+    ):
         return None, False
     local_fingerprint = (
         _local_audio_metadata_fingerprint(model_name) if is_local_path(model_name) else None
@@ -1556,7 +1611,11 @@ def _detect_audio_from_tokenizer(
         else:
             # Read before any network branch and never authorizes, so it would serve a
             # cached private repo's audio tokens online as well as offline.
-            repo_dir = None if is_anonymous(hf_token) else get_cache_path(model_name)
+            repo_dir = (
+                get_cache_path(model_name)
+                if cache_reads_authorized(hf_token, repo_id = model_name)
+                else None
+            )
             if repo_dir is not None and repo_dir.is_dir():
                 snapshots_dir = repo_dir / "snapshots"
                 if snapshots_dir.is_dir() and revision is None:
@@ -3351,13 +3410,15 @@ def is_embedding_model(model_name: str, hf_token: Optional[str] = None) -> bool:
     # online lookup can memoize True from tags with no weights cached, and a cached negative can
     # be invalidated by later materialization. The cache probe is local-only, so it's cheap.
     if not is_local_path(model_name) and hf_env_offline():
-        # The marker is read off the HF cache and never authorizes. Offline this caller
-        # cannot establish access, so it reports the default rather than the cache.
-        if is_anonymous(hf_token):
+        # The marker never authorizes, so offline an unverified token reports the default.
+        if not cache_reads_authorized(hf_token, repo_id = model_name):
             return False
         return _embedding_marker_in_hf_cache(model_name)
 
-    cache_key = (model_name, hf_token)
+    # Fingerprinted, not the raw token: the ambient marker is a str subclass that hashes and
+    # compares equal to a plain API token of the same value, so a UI-computed classification
+    # was served straight out of this memo to an API caller, above the guard below.
+    cache_key = (model_name, _token_fingerprint(hf_token))
     if cache_key in _embedding_detection_cache:
         return _embedding_detection_cache[cache_key]
 
@@ -3392,7 +3453,7 @@ def is_embedding_model(model_name: str, hf_token: Optional[str] = None) -> bool:
     except Exception as e:
         # Timeout or transient network error: fall back to the local cache marker, don't hard-fail.
         logger.warning(f"Could not determine if {model_name} is embedding model: {e}")
-        if is_anonymous(hf_token):
+        if not cache_reads_authorized(hf_token, repo_id = model_name):
             # The anonymous 404 lands here too, and the marker read never authorizes.
             return False
         is_emb = _embedding_marker_in_hf_cache(model_name)
