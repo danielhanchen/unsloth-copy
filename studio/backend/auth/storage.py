@@ -397,9 +397,44 @@ _ACCOUNT_COLUMNS = (
 )
 
 
+_owner_id_repaired: set[str] = set()
+
+
+def _repair_owner_account_id(conn: sqlite3.Connection) -> None:
+    """Give the owner back an identity when the columns exist but its row has none.
+
+    Reachable by a crash inside this build's first bootstrap followed by an older build
+    seeding the owner, which writes no ``account_id``. The backfill below no longer runs
+    for that database, and every authenticated request fails without an id. Once per
+    process per database, so a warm connection issues nothing.
+    """
+    db_key = str(DB_PATH)
+    if db_key in _owner_id_repaired:
+        return
+    from utils.account_context import OWNER_ACCOUNT_ID, ROLE_OWNER
+
+    repaired = conn.execute(
+        "UPDATE auth_user SET account_id = ?, role = ?, created_at = COALESCE(created_at, ?) "
+        "WHERE username = ? AND account_id IS NULL",
+        (
+            OWNER_ACCOUNT_ID,
+            ROLE_OWNER,
+            datetime.now(timezone.utc).isoformat(),
+            DEFAULT_ADMIN_USERNAME,
+        ),
+    ).rowcount
+    if repaired:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS auth_user_account_id ON auth_user(account_id)"
+        )
+    conn.commit()
+    _owner_id_repaired.add(db_key)
+
+
 def _ensure_account_columns(conn: sqlite3.Connection, existing: set) -> None:
     """Add and backfill the identity columns; additive, so older builds ignore them."""
     if all(name in existing for name, _decl in _ACCOUNT_COLUMNS):
+        _repair_owner_account_id(conn)
         return
     # Two connections can both see the columns missing, so take the write lock and
     # re-read; an ALTER that still loses is the other side's, not an error.
@@ -590,10 +625,6 @@ def get_account_by_id(account_id: str):
 
 def count_active_accounts() -> int:
     return account_counts()[0]
-
-
-def count_managed_accounts() -> int:
-    return account_counts()[1]
 
 
 def account_counts() -> tuple[int, int]:
@@ -1803,7 +1834,9 @@ def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tu
 
     The record is read in the statement that matched the key, so the request binds to
     that identity rather than a second lookup by a username that may be recreated
-    meanwhile. A deactivated account does not validate.
+    meanwhile. The join carries the id too, so a key row that outlived its account is
+    not resolved by a namesake; only the owner's rows are allowed to carry no id. A
+    deactivated account does not validate.
 
     The key check and the credential read share one write transaction, so a reset
     committing right after cannot hand its new generation to this request.
@@ -1824,6 +1857,7 @@ def validate_api_key_account(raw_key: str, *, touch: bool = True) -> Optional[Tu
                    u.account_id, u.role, u.is_active AS account_active,
                    COALESCE(u.account_jwt_secret, u.jwt_secret) AS jwt_secret
             FROM api_keys k JOIN auth_user u ON u.username = k.username
+              AND (k.account_id = u.account_id OR (k.account_id IS NULL AND u.role = 'owner'))
             WHERE k.key_hash {_FENCED_HASH_SQL}
             """,
             _hash_candidates(key_hash),

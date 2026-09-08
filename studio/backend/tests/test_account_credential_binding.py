@@ -7,6 +7,7 @@ account keeps the host closed until it is deleted."""
 import asyncio
 import secrets
 
+import jwt
 import pytest
 from fastapi import HTTPException
 
@@ -145,6 +146,42 @@ def test_status_reports_full_access_with_a_deactivated_account(auth_db):
     assert "alice" not in client.get("/api/auth/status").text
 
 
+def test_the_owner_login_id_needs_no_account_lookup(auth_db, monkeypatch):
+    """The owner's username is reserved and cannot be renamed, so its id is a constant;
+    a managed name still has to be resolved because it can be reused."""
+    from routes import auth as auth_routes
+
+    alice = _managed("alice")
+    get_account = storage.get_account
+
+    def unexpected(username):
+        raise AssertionError("the owner's account id is fixed")
+
+    monkeypatch.setattr(storage, "get_account", unexpected)
+    assert auth_routes._account_id_of(storage.DEFAULT_ADMIN_USERNAME) == "owner"
+    monkeypatch.setattr(storage, "get_account", get_account)
+    assert auth_routes._account_id_of("alice") == alice["account_id"]
+
+
+def test_a_token_that_fails_to_verify_binds_nothing(auth_db):
+    """The identity came from an unverified ``sub`` claim, so publishing it into the request
+    ContextVar before the signature check bound an account the caller never proved. Read
+    inside the dependency's own context, which is where the binding would be visible."""
+    alice = _managed("alice")
+    forged = jwt.encode({"sub": alice["username"]}, secrets.token_urlsafe(48), algorithm = "HS256")
+
+    async def go():
+        try:
+            await authentication._get_current_credential(
+                _credentials(forged), allow_password_change = False
+            )
+        except HTTPException as refused:
+            return refused.status_code, current_account()
+        raise AssertionError("a forged token must be refused")
+
+    assert asyncio.run(go()) == (401, OWNER)
+
+
 def test_unreadable_auth_db_keeps_the_host_closed(auth_db, monkeypatch):
     def boom():
         raise OSError("auth.db unreadable")
@@ -153,3 +190,18 @@ def test_unreadable_auth_db_keeps_the_host_closed(auth_db, monkeypatch):
     policy.invalidate_account_cache()
     assert policy.login_mode() == "single"
     assert policy.full_access_permitted() is False
+
+
+def test_a_transient_auth_db_failure_is_not_cached(auth_db, monkeypatch):
+    """Nothing invalidates the policy cache on a settled one-owner install, so caching the
+    fallback would hold full access off for the life of the process."""
+    counts = storage.account_counts
+
+    def boom():
+        raise OSError("auth.db unreadable")
+
+    monkeypatch.setattr(storage, "account_counts", boom)
+    policy.invalidate_account_cache()
+    assert policy.full_access_permitted() is False
+    monkeypatch.setattr(storage, "account_counts", counts)
+    assert policy.full_access_permitted() is True

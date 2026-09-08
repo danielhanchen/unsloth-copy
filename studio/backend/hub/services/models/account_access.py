@@ -11,6 +11,8 @@ import os
 import sqlite3
 import threading
 import time
+from collections import deque
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from contextlib import closing
 from functools import wraps
@@ -27,6 +29,7 @@ from utils.paths.storage_roots import studio_db_path, workspace_root
 from utils.account_context import (
     OWNER,
     AccountContext,
+    account_thread,
     current_account,
     current_account_id,
     is_owner_context,
@@ -42,8 +45,36 @@ def media_link_target(media_id: str) -> str:
     return f"{current_account().account_id}:{media_id}"
 
 
+_link_accounts: dict[str, tuple[int, AccountContext | None]] = {}
+_link_accounts_lock = threading.Lock()
+
+
+def _signed_link_account(account_id: str) -> AccountContext | None:
+    """The account a signed link names, or None once it is deactivated or deleted.
+
+    Cached against the policy generation, which every account lifecycle change bumps, so a
+    deactivation revokes the outstanding links on the next request rather than at the TTL.
+    """
+    generation = policy.account_generation()
+    with _link_accounts_lock:
+        cached = _link_accounts.get(account_id)
+        if cached is not None and cached[0] == generation:
+            return cached[1]
+    from auth.storage import get_account_by_id
+
+    account = get_account_by_id(account_id)
+    with _link_accounts_lock:
+        if len(_link_accounts) >= 256:
+            _link_accounts.clear()
+        _link_accounts[account_id] = (generation, account)
+    return account
+
+
 def media_link_account(target: str | None, media_id: str) -> AccountContext | None:
-    """Resolve an already signature-verified target, never an unsigned account selector."""
+    """Resolve an already signature-verified target, never an unsigned account selector.
+
+    A valid signature is not enough: the link must not outlive the account that minted it.
+    """
     if target == media_id:
         return OWNER
     if not target:
@@ -53,7 +84,8 @@ def media_link_account(target: str | None, media_id: str) -> AccountContext | No
         return None
     if account_id == OWNER.account_id:
         return OWNER
-    return AccountContext(account_id, "", "user")
+    account = _signed_link_account(account_id)
+    return None if account is None or account.is_owner else account
 
 
 def managed_account() -> bool:
@@ -143,8 +175,12 @@ def ambient_hf_token():
 
 
 def account_hf_token(token):
-    """False is Hugging Face's explicit anonymous sentinel; None lends the ambient token."""
-    if managed_account() and not token:
+    """False is Hugging Face's explicit anonymous sentinel; None lends the ambient token.
+
+    A blank string is no credential either, so a managed caller goes anonymous rather than
+    falling back to the installation's token. The value itself is passed through as given.
+    """
+    if managed_account() and (not token or (isinstance(token, str) and not token.strip())):
         return False
     return token
 
@@ -158,6 +194,9 @@ _PUBLIC_TTL = 300.0
 _PRIVATE_TTL = 30.0
 _public_repos: dict[tuple[str, str], tuple[float, bool]] = {}
 _public_lock = threading.Lock()
+# One in-progress probe per repo, so concurrent misses cost one Hub call between them.
+_public_flights: dict[tuple[str, str], Future] = {}
+_PROBE_FANOUT = 8
 
 
 _UNKNOWN_TTL = 30.0
@@ -215,6 +254,14 @@ def _hub_public_answer(repo_id: str, repo_type: str) -> bool | None:
     return getattr(info, "private", None) is False and not getattr(info, "gated", False)
 
 
+def _public_verdict(repo_id: str, repo_type: str) -> bool | None:
+    """The live cached answer, or None when the Hub still has to be asked."""
+    key = (repo_type, repo_id.lower())
+    with _public_lock:
+        cached = _public_repos.get(key)
+    return cached[1] if cached is not None and cached[0] > time.monotonic() else None
+
+
 def repo_is_public(repo_id: str, repo_type: str = "model") -> bool:
     """Only an anonymous Hub answer proves that a shared-cache repo is public.
 
@@ -224,24 +271,108 @@ def repo_is_public(repo_id: str, repo_type: str = "model") -> bool:
     """
     key = (repo_type, repo_id.lower())
     name = f"{repo_type}:{repo_id.lower()}"
-    now = time.monotonic()
     with _public_lock:
         cached = _public_repos.get(key)
-        if cached is not None and cached[0] > now:
+        if cached is not None and cached[0] > time.monotonic():
             return cached[1]
-    answer = _hub_public_answer(repo_id, repo_type)
+        flight = _public_flights.get(key)
+        leading = flight is None
+        if leading:
+            flight = _public_flights[key] = Future()
+    if not leading:
+        # Someone is already asking about this repo; take their answer rather than a second call.
+        return flight.result()
+    try:
+        answer = _hub_public_answer(repo_id, repo_type)
+        with _public_lock:
+            if answer is None:
+                public = name in _load_public_verdicts()
+                ttl = _UNKNOWN_TTL
+            else:
+                public = answer
+                _remember_public_verdict(name, public)
+                ttl = _PUBLIC_TTL if public else _PRIVATE_TTL
+            if len(_public_repos) >= 4096:
+                _public_repos.clear()
+            _public_repos[key] = (time.monotonic() + ttl, public)
+    except BaseException as exc:
+        flight.set_exception(exc)
+        raise
+    else:
+        flight.set_result(public)
+        return public
+    finally:
+        with _public_lock:
+            _public_flights.pop(key, None)
+
+
+def _hub_probe_targets(references, repo_type: str, grants: set[str]) -> set[str]:
+    """Distinct repo ids ``model_visible`` would have to ask the Hub about.
+
+    Staged cheapest first: string parsing, then one cache read for the whole listing,
+    then a filesystem check only for what is left. A warm listing stops at stage two.
+    """
+    candidates = {}
+    for reference in references:
+        if not isinstance(reference, str) or not reference:
+            continue
+        reference = reference.strip()
+        if reference.startswith(("./", "../", "~")):
+            continue
+        parts = reference.split(":", 1)[0].split("/")
+        if len(parts) < 2 or not all(parts[:2]):
+            continue
+        repo_id = "/".join(parts[:2])
+        if _grant_key(repo_id, repo_type) not in grants:
+            candidates.setdefault(repo_id, reference)
+    if not candidates:
+        return set()
+    now = time.monotonic()
     with _public_lock:
-        if answer is None:
-            public = name in _load_public_verdicts()
-            ttl = _UNKNOWN_TTL
-        else:
-            public = answer
-            _remember_public_verdict(name, public)
-            ttl = _PUBLIC_TTL if public else _PRIVATE_TTL
-        if len(_public_repos) >= 4096:
-            _public_repos.clear()
-        _public_repos[key] = (now + ttl, public)
-    return public
+        unknown = {
+            repo_id: reference
+            for repo_id, reference in candidates.items()
+            if (entry := _public_repos.get((repo_type, repo_id.lower()))) is None or entry[0] <= now
+        }
+    # A local path that happens to spell a repo id is resolved against the cache, not the Hub.
+    return {
+        repo_id
+        for repo_id, reference in unknown.items()
+        if not Path(reference).expanduser().exists()
+    }
+
+
+def _warm_public_repos(repo_ids: set[str], repo_type: str) -> None:
+    """Ask about distinct unknown repos together instead of one 5 s call after another.
+
+    Threads are created and joined here, so nothing outlives the request that needed them.
+    """
+    if len(repo_ids) < 2:
+        return
+    pending = deque(repo_ids)
+
+    def drain() -> None:
+        while True:
+            try:
+                repo_id = pending.popleft()  # atomic; the deque is the whole work queue
+            except IndexError:
+                return
+            try:
+                repo_is_public(repo_id, repo_type)
+            except Exception:  # noqa: BLE001 - the serial pass below asks again and decides
+                pass
+
+    helpers = [
+        account_thread(target = drain, daemon = True, name = "studio-repo-probe")
+        for _ in range(min(_PROBE_FANOUT, len(pending)) - 1)
+    ]
+    for helper in helpers:
+        helper.start()
+    try:
+        drain()
+    finally:
+        for helper in helpers:
+            helper.join()
 
 
 def _grant_key(repo_id: str, repo_type: str) -> str:
@@ -368,22 +499,28 @@ def require_model_access(reference: str, repo_type: str = "model") -> None:
         raise HTTPException(status_code = 404, detail = "Model not found")
 
 
+def _row_reference(row):
+    get = (
+        row.get
+        if isinstance(row, dict)
+        else lambda key, default = None: getattr(row, key, default)
+    )
+    return get("path") or get("local_path") or get("repo_id") or get("model_id") or get("id")
+
+
 def filter_model_rows(rows, *, repo_type: str = "model"):
     """Filter after shared scans/caches, never store a caller's filtered catalog globally."""
     if not managed_account():
         return rows
     grants = model_grants()
-    visible = []
-    for row in rows:
-        get = (
-            row.get
-            if isinstance(row, dict)
-            else lambda key, default = None: getattr(row, key, default)
-        )
-        ref = get("path") or get("local_path") or get("repo_id") or get("model_id") or get("id")
-        if model_visible(ref, grants = grants, repo_type = repo_type):
-            visible.append(row)
-    return visible
+    rows = list(rows)
+    references = [_row_reference(row) for row in rows]
+    _warm_public_repos(_hub_probe_targets(references, repo_type, grants), repo_type)
+    return [
+        row
+        for row, reference in zip(rows, references)
+        if model_visible(reference, grants = grants, repo_type = repo_type)
+    ]
 
 
 def private_directory(path: str, folder: str) -> str:
@@ -412,29 +549,6 @@ def authorize_download(repo_id: str, repo_type: str, hf_token) -> None:
             api.auth_check(repo_id, repo_type = repo_type, token = token)
     except Exception as exc:  # noqa: BLE001 - never convert another account's cached files into a grant
         raise HTTPException(status_code = 404, detail = "Repository not found") from exc
-
-
-_schema_paths: set[tuple[str, str]] = set()
-_schema_lock = threading.Lock()
-
-
-def ensure_account_schema(module) -> None:
-    """Initialize a private DB for storage modules whose schema flag is still global.
-
-    Retire this bridge once every storage module tracks readiness by database path.
-    """
-    if not managed_account():
-        return
-    path = studio_db_path()
-    key = module.__name__, str(path)
-    with _schema_lock:
-        if key in _schema_paths:
-            return
-        path.parent.mkdir(parents = True, exist_ok = True)
-        with closing(sqlite3.connect(str(path))) as conn, conn:
-            conn.row_factory = sqlite3.Row
-            module._ensure_schema(conn)
-        _schema_paths.add(key)
 
 
 def require_media_references(request) -> None:

@@ -77,7 +77,6 @@ def resolve_provider_api_key_or_400(
     prefer_saved_key: bool = False,
 ) -> str:
     """Resolve an explicit key, or a saved key only for an interactive UI session."""
-    account_access.ensure_account_schema(credential_secrets)
 
     try:
         saved_provider_id = provider_id if allow_saved_key else None

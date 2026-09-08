@@ -173,3 +173,58 @@ def test_rows_written_before_the_fence_are_moved_behind_it(auth_db):
     finally:
         conn.close()
     assert storage.get_jwt_secret("bob") == "legacy-secret"
+
+
+def _owner_row(column: str):
+    conn = sqlite3.connect(storage.DB_PATH)
+    try:
+        return conn.execute(
+            f"SELECT {column} FROM auth_user WHERE username = ?",
+            (storage.DEFAULT_ADMIN_USERNAME,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_an_owner_seeded_by_an_older_build_gets_its_account_id_back(tmp_path, monkeypatch):
+    """Columns present, owner row unbacked: a crash inside this build's first bootstrap,
+    then an older build seeding the owner. Without a repair every request 500s."""
+    monkeypatch.setattr(storage, "DB_PATH", tmp_path / "auth.db")
+    monkeypatch.setattr(storage, "_BOOTSTRAP_PW_PATH", tmp_path / ".bootstrap_password")
+    monkeypatch.setattr(storage, "_bootstrap_password", None)
+    storage.get_connection().close()
+    conn = sqlite3.connect(storage.DB_PATH)
+    with conn:
+        conn.execute(
+            "INSERT INTO auth_user (username, password_salt, password_hash, jwt_secret) "
+            "VALUES (?, 'salt', 'hash', 'secret')",
+            (storage.DEFAULT_ADMIN_USERNAME,),
+        )
+    conn.close()
+    assert _owner_row("account_id") is None
+    assert _owner_row("role") == "user"
+
+    # A restart of this build, reached as a fresh path so no per-process memo is involved.
+    restarted = tmp_path / "restarted.db"
+    source, target = sqlite3.connect(storage.DB_PATH), sqlite3.connect(restarted)
+    with target:
+        source.backup(target)
+    source.close()
+    target.close()
+    monkeypatch.setattr(storage, "DB_PATH", restarted)
+    storage.get_connection().close()
+    owner = storage.get_account(storage.DEFAULT_ADMIN_USERNAME)
+    assert (owner.account_id, owner.role) == ("owner", "owner")
+    assert _owner_row("created_at")
+
+    statements = []
+    connect = sqlite3.connect
+
+    def traced(*args, **kwargs):
+        conn = connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced)
+    storage.get_connection().close()
+    assert statements and not [query for query in statements if "UPDATE auth_user" in query]

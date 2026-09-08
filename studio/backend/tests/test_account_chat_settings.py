@@ -328,14 +328,22 @@ def test_event_wait_executor_retains_account_context(client, monkeypatch):
     ]
 
 
-def test_clear_history_cannot_reap_global_images_or_foreign_runs(client, monkeypatch):
+def test_clear_history_reaps_only_its_own_images_and_leaves_foreign_runs(client, monkeypatch):
+    """The registry and the thumbnail cache are account-scoped, so the reap runs bound to
+    the clearing account rather than being skipped whenever a second account exists."""
     from core.inference import search_images
 
     calls = []
     monkeypatch.setattr(
-        search_images, "snapshot_and_fence_registrations", lambda: calls.append("snapshot")
+        search_images,
+        "snapshot_and_fence_registrations",
+        lambda: calls.append(("snapshot", current_account_id())) or set(),
     )
-    monkeypatch.setattr(search_images, "clear_cache", lambda *args: calls.append("clear"))
+    monkeypatch.setattr(
+        search_images,
+        "clear_cache",
+        lambda *args: calls.append(("clear", current_account_id())),
+    )
     for account in (ALICE, BOB):
         seed_chat(account)
         seed_run(account)
@@ -349,7 +357,7 @@ def test_clear_history_cannot_reap_global_images_or_foreign_runs(client, monkeyp
             )
             assert response.status_code == 200, response.text
         assert not bob_event.is_set()
-    assert calls == []
+    assert calls == [("snapshot", ALICE.account_id), ("clear", ALICE.account_id)]
     assert run_as(BOB, studio_db.get_chat_thread, "private") is not None
 
 
@@ -532,6 +540,34 @@ def test_profile_cache_cannot_follow_a_reused_username(monkeypatch):
     assert "Alice model" in str(alice)
     assert "Alice model" not in str(bob)
     assert "Bob model" in str(bob)
+
+
+def test_alternating_accounts_keep_their_cached_profile_stats(monkeypatch):
+    """The route used to invalidate on every actor change, so two accounts polling in turn
+    never saw a hit in a cache the storage layer already keys by account."""
+    folds = []
+    fold_messages = profile_stats_db._fold_messages
+    monkeypatch.setattr(
+        profile_stats_db,
+        "_fold_messages",
+        lambda *args: folds.append(current_account_id()) or fold_messages(*args),
+    )
+
+    async def stats(account):
+        return await arun_as(
+            account,
+            profile_stats.get_profile_stats(
+                days = 30,
+                tz_offset_minutes = 0,
+                tz = "",
+                current_subject = "reader",
+            ),
+        )
+
+    payloads = [asyncio.run(stats(account)) for account in (ALICE, BOB, ALICE, BOB)]
+    assert payloads[0] is payloads[2]
+    assert payloads[1] is payloads[3]
+    assert folds == [ALICE.account_id, BOB.account_id]
 
 
 def test_api_usage_statistics_read_only_the_account_database(client):

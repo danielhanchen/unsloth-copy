@@ -133,13 +133,11 @@ def raise_if_other_accounts_active(account_id: Optional[str] = None) -> None:
     Call under the lifecycle gate before touching any backend, including replacements
     within CHAT or DIFFUSION where the modality owner does not change.
     """
-    from auth.policy import installation_is_multi_user
     from utils.account_context import current_account_id
 
-    if installation_is_multi_user():
-        busy = other_accounts_active(account_id or current_account_id())
-        if busy:
-            raise GpuBusyForAnotherAccountError(_owner or CHAT, busy)
+    busy = other_accounts_active(account_id or current_account_id())
+    if busy:
+        raise GpuBusyForAnotherAccountError(_owner or CHAT, busy)
 
 
 def require_no_foreign_generations(
@@ -206,11 +204,15 @@ def acquire_for(
         # must not rewrite it: the already-loaded fast paths in routes/inference.py re-assert
         # CHAT without register/``replacing``, and overwriting handed the model to whoever
         # asked last, hiding it from the account that loaded it.
-        if _owner != owner or register is not None or replacing:
-            _owner_account = acting
+        claims = _owner != owner or register is not None or replacing
         _owner = owner
         _owner_epoch += 1
-        return register() if register is not None else None
+        result = register() if register is not None else None
+        # After ``register``: a registration that raised loaded nothing, so it must not take
+        # residency visibility from the account that did.
+        if claims:
+            _owner_account = acting
+        return result
 
 
 def release(owner: str) -> None:

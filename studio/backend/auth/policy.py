@@ -31,6 +31,15 @@ def invalidate_account_cache() -> None:
         _cached = None
 
 
+def account_generation() -> int:
+    """Bumped by every account create, delete, activate and deactivate.
+
+    A per-account answer cached against this is revoked by the lifecycle change itself
+    rather than expiring on a timer.
+    """
+    return _generation
+
+
 def _account_counts() -> tuple[int, int]:
     global _cached
     with _lock:
@@ -42,8 +51,9 @@ def _account_counts() -> tuple[int, int]:
     try:
         active, managed = storage.account_counts()
     except Exception:  # noqa: BLE001 - an unreadable auth.db is a one-user install
-        # Single login form, but count a managed account so the host stays closed.
-        active, managed = 1, 1
+        # Single login form, but count a managed account so the host stays closed. Never
+        # cached: a transient read error would otherwise hold full access off until restart.
+        return 1, 1
     with _lock:
         if generation == _generation:
             _cached = (generation, active, managed)

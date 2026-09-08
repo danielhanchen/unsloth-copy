@@ -104,6 +104,40 @@ def test_wal_keepers_can_close_one_account(account_home):
     assert studio_db._wal_keepers == {}
 
 
+def test_a_managed_database_keeps_its_wal_across_a_connection_close(account_home):
+    studio_db.reset_schema_state_for_tests()
+    alice_db = run_as(ALICE, roots.studio_db_path)
+    owner_db = run_as(OWNER, roots.studio_db_path)
+    for account, db_path in ((OWNER, owner_db), (ALICE, alice_db)):
+        conn = run_as(account, studio_db.get_connection)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value_json, updated_at)"
+                " VALUES ('probe', '1', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    # The owner's keeper is a lifespan concern (main.py); only the managed one opens on demand.
+    assert owner_db not in studio_db._wal_keepers
+    assert not owner_db.with_name("studio.db-wal").exists()
+    assert alice_db in studio_db._wal_keepers
+    assert alice_db.with_name("studio.db-wal").exists()
+
+
+def test_retiring_an_account_releases_its_wal_keeper(account_home):
+    from routes.accounts import retire_account_roots
+
+    studio_db.reset_schema_state_for_tests()
+    alice_db = run_as(ALICE, roots.studio_db_path)
+    run_as(ALICE, studio_db.get_connection).close()
+    keeper = studio_db._wal_keepers[alice_db]
+    retire_account_roots(ALICE)
+    assert alice_db not in studio_db._wal_keepers
+    with pytest.raises(sqlite3.ProgrammingError, match = "closed"):
+        keeper.execute("SELECT 1")
+
+
 def _receipt() -> api_usage_db.ApiUsageReceipt:
     return api_usage_db.ApiUsageReceipt(
         id = "same-receipt",
@@ -144,6 +178,19 @@ def test_usage_writer_retains_account_through_retries(account_home, monkeypatch)
             assert conn.execute("SELECT sum(total_tokens) FROM api_usage_events").fetchone()[0] == 5
         finally:
             conn.close()
+
+
+def test_a_durable_run_poll_resolves_the_account_root_once(account_home, monkeypatch):
+    from storage import chat_generation_runs_db as runs_db
+
+    runs_db.reset_schema_state_for_tests()
+    run_as(ALICE, runs_db._connect).close()
+    resolutions = []
+    monkeypatch.setattr(
+        runs_db, "studio_db_path", lambda: resolutions.append(1) or roots.studio_db_path()
+    )
+    run_as(ALICE, runs_db._connect).close()
+    assert resolutions == []
 
 
 def test_profile_cache_and_invalidation_are_private(account_home):

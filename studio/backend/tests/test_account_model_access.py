@@ -10,6 +10,8 @@ import io
 import json
 import logging
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -188,6 +190,49 @@ def test_shared_catalog_is_filtered_after_each_account_reads_it(monkeypatch, kin
     assert len(rows) == 2
 
 
+def test_concurrent_misses_ask_the_hub_once_per_repo(monkeypatch):
+    """Eight simultaneous listings of the same uncached repos are one probe each, not eight."""
+    calls = []
+    barrier = threading.Barrier(8)
+
+    def answer(repo_id, repo_type):
+        calls.append(repo_id)
+        barrier.wait(timeout = 30)
+        time.sleep(0.02)
+        return True
+
+    monkeypatch.setattr(access, "_hub_public_answer", answer)
+    rows = [{"repo_id": f"org/repo-{index}"} for index in range(8)]
+    with ThreadPoolExecutor(max_workers = 8) as pool:
+        listings = [
+            pool.submit(run_as, ALICE, access.filter_model_rows, list(rows)) for _ in range(8)
+        ]
+        results = [listing.result(timeout = 60) for listing in listings]
+    assert all(len(result) == 8 for result in results)
+    assert sorted(calls) == sorted(row["repo_id"] for row in rows)
+
+
+def test_a_listing_probes_its_unknown_repos_together(monkeypatch):
+    """Eight unknown repos at 100 ms each must not cost 800 ms of serial waiting."""
+    monkeypatch.setattr(access, "_hub_public_answer", lambda *a: time.sleep(0.1) or True)
+    rows = [{"repo_id": f"org/slow-{index}"} for index in range(8)]
+    start = time.perf_counter()
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 8
+    assert time.perf_counter() - start < 0.4
+
+
+def test_a_warm_listing_asks_the_hub_nothing(monkeypatch):
+    rows = [{"repo_id": f"org/warm-{index}"} for index in range(4)]
+    monkeypatch.setattr(access, "_hub_public_answer", lambda *a: True)
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 4
+
+    def unexpected(*args):
+        raise AssertionError("a cached verdict must not be probed again")
+
+    monkeypatch.setattr(access, "_hub_public_answer", unexpected)
+    assert len(run_as(ALICE, access.filter_model_rows, rows)) == 4
+
+
 def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
     """The dataset inventory is the same shared cache scan as the model one, so a
     managed account without a grant must not see a private repository's row."""
@@ -203,6 +248,45 @@ def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
     assert asyncio.run(arun_as(BOB, fn()))["cached"] == [rows[1]]
     assert len(asyncio.run(arun_as(OWNER, fn()))["cached"]) == 2
     assert len(rows) == 2
+
+
+def test_a_blank_managed_token_is_anonymous_not_the_installations(monkeypatch):
+    """A whitespace-only token is no credential; lending the ambient one instead would give
+    a managed caller the installation's Hub access."""
+    assert run_as(ALICE, access.account_hf_token, "   ") is False
+    assert run_as(ALICE, access.account_hf_token, "") is False
+    assert run_as(ALICE, access.account_hf_token, None) is False
+    # Passed through exactly as given, unlike the training-jobs helper which strips.
+    assert run_as(ALICE, access.account_hf_token, " hf_real ") == " hf_real "
+    monkeypatch.setattr(policy, "installation_is_multi_user", lambda: False)
+    assert access.account_hf_token("   ") == "   "
+
+
+def test_the_shared_chat_template_read_needs_model_access(monkeypatch):
+    """The template walks the shared cache and returns a private repo's raw text, so it is
+    a model read like any other."""
+    from picker.routes import templates
+
+    monkeypatch.setattr(access, "repo_is_public", lambda *a, **k: False)
+    monkeypatch.setattr(templates, "read_default_chat_template", lambda *a, **k: "{{ raw }}")
+    run_as(ALICE, access.record_model_grant, "org/secret")
+
+    async def read(account):
+        return await arun_as(
+            account,
+            templates.get_default_chat_template_route(
+                model_name = "org/secret",
+                gguf_variant = None,
+                hf_token = None,
+                current_subject = account.username,
+            ),
+        )
+
+    assert asyncio.run(read(OWNER)).chat_template == "{{ raw }}"
+    assert asyncio.run(read(ALICE)).chat_template == "{{ raw }}"
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(read(BOB))
+    assert refused.value.status_code == 404
 
 
 def test_local_inventory_does_not_mutate_shared_scan_objects():

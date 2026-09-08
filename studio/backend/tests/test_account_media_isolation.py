@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from auth import policy
+from auth import policy, storage as auth_storage
 from auth.authentication import get_current_subject
 from core.inference import audio_gallery, image_gallery, search_images, video_gallery
 from routes import inference, video
@@ -27,6 +27,23 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(policy, "installation_is_multi_user", lambda: True)
     monkeypatch.setattr(search_images, "_account_states", {})
     monkeypatch.setattr(video, "_managed_jobs", {})
+    # Real rows: a signed link is resolved against the account it names, so these accounts
+    # have to exist for one to authorize anything.
+    monkeypatch.setattr(auth_storage, "DB_PATH", tmp_path / "auth.db")
+    monkeypatch.setattr(auth_storage, "_BOOTSTRAP_PW_PATH", tmp_path / ".bootstrap_password")
+    monkeypatch.setattr(auth_storage, "_bootstrap_password", None)
+    policy.invalidate_account_cache()
+    connection = auth_storage.get_connection()
+    with connection:
+        for account in (ALICE, BOB):
+            connection.execute(
+                "INSERT INTO auth_user (username, password_salt, password_hash, jwt_secret,"
+                " account_id, role, is_active) VALUES (?, 'salt', 'hash', 'secret', ?, 'user', 1)",
+                (account.username, account.account_id),
+            )
+    connection.close()
+    yield
+    policy.invalidate_account_cache()
 
 
 def _save(kind):
@@ -170,3 +187,21 @@ def test_openai_video_jobs_are_private_in_memory_and_after_rehydration():
         assert client.get(f"/v1/videos/{job.id}").status_code == 404
         assert client.get(f"/v1/videos/{job.id}/content").status_code == 404
         assert client.delete(f"/v1/videos/{job.id}").status_code == 404
+
+
+def test_clearing_a_managed_chat_history_reaps_only_its_own_thumbnails(monkeypatch):
+    """The clear used to skip the reap entirely once a second account existed, leaving every
+    managed account's private thumbnails on disk."""
+    from routes import chat_history
+
+    monkeypatch.setattr(search_images, "_fetch_thumbnail_bytes", lambda *args: b"thumbnail")
+    raw = [{"thumbnail": "https://example.com/i.jpg", "url": "https://example.com/p"}]
+    ids = {
+        account: run_as(account, search_images.register_images, raw)[0]["id"]
+        for account in (ALICE, BOB)
+    }
+    snapshot = run_as(ALICE, chat_history._snapshot_chat_images)
+    assert snapshot == {ids[ALICE]}
+    run_as(ALICE, search_images.clear_cache, snapshot)
+    assert run_as(ALICE, search_images.thumbnail_bytes, ids[ALICE]) is None
+    assert run_as(BOB, search_images.thumbnail_bytes, ids[BOB]) == b"thumbnail"

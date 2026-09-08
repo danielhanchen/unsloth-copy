@@ -191,8 +191,11 @@ def test_locator_anchors_through_markdown_table_pipes():
 
 def test_sign_verify_roundtrip(rag_home):
     from routes import rag as rag_routes
+    from utils.account_context import OWNER
 
     tok = rag_routes._sign_document("doc-123")
-    assert rag_routes._verify_document_token(tok) == "doc-123"
-    assert rag_routes._verify_document_token("doc-123.0.deadbeef") is None  # expired/bad
-    assert rag_routes._verify_document_token("garbage") is None
+    assert rag_routes._verify_document_token("doc-123", tok) == OWNER
+    # The document is signed, so the same token opens nothing else.
+    assert rag_routes._verify_document_token("doc-456", tok) is None
+    assert rag_routes._verify_document_token("doc-123", "0..deadbeef") is None  # expired/bad
+    assert rag_routes._verify_document_token("doc-123", "garbage") is None

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 from typing import Any, Iterable, Optional
 
 
+from utils.account_context import is_owner_context
 from utils.paths import (
     ensure_dir,
     project_workspaces_root,
@@ -1243,7 +1244,10 @@ def reset_schema_state_for_tests() -> None:
 
 
 def get_connection(
-    busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS, *, check_same_thread: bool = True
+    busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS,
+    *,
+    check_same_thread: bool = True,
+    _manage_keeper: bool = True,
 ) -> sqlite3.Connection:
     """Open studio.db with WAL mode, create tables once per database, enable foreign keys."""
     db_path = studio_db_path()
@@ -1267,6 +1271,19 @@ def get_connection(
                     conn.close()
                     raise
     _apply_wal_synchronous(conn)
+    # Only the owner's database gets a lifespan keeper at startup (main.py); without one here a
+    # managed account is routinely the last WAL participant and checkpoints on every close.
+    if (
+        _manage_keeper
+        and not is_owner_context()
+        and db_path not in _wal_keepers
+        and db_path not in _wal_unsupported
+    ):
+        try:
+            open_wal_keeper(replace = False)
+        except Exception:
+            conn.close()
+            raise
     return conn
 
 
@@ -1275,19 +1292,29 @@ def get_connection(
 # durable chat stream's flush cadence that is several rewrites a second (#9934).
 _wal_keepers: dict[Path, sqlite3.Connection] = {}
 _wal_keeper_lock = threading.Lock()
+_wal_unsupported: set[Path] = set()
 
 
-def open_wal_keeper() -> bool:
-    """Hold this database's WAL open for the process. Returns whether a keeper is engaged."""
+def open_wal_keeper(*, replace: bool = True) -> bool:
+    """Hold this database's WAL open for the process. Returns whether a keeper is engaged.
+
+    ``replace = False`` is the idempotent form used on the connection path: an existing keeper,
+    or a database already known to refuse WAL, is left alone.
+    """
     db_path = studio_db_path().resolve()
     with _wal_keeper_lock:
+        if not replace:
+            if db_path in _wal_keepers:
+                return True
+            if db_path in _wal_unsupported:
+                return False
         # Replace only this database's earlier lifespan keeper.
         previous = _wal_keepers.pop(db_path, None)
         if previous is not None:
             _close_keeper(previous)
         # Only ever runs the pragma below, on this thread. check_same_thread is off so a
         # keeper stranded by an earlier lifespan can still be closed from this one.
-        conn = get_connection(check_same_thread = False)
+        conn = get_connection(check_same_thread = False, _manage_keeper = False)
         try:
             # What is in force, not what was asked for: journal_mode=WAL declines silently
             # on filesystems without shared-memory support and persists in the file. Nothing
@@ -1299,8 +1326,10 @@ def open_wal_keeper() -> bool:
             return False
         if not isinstance(mode, str) or mode.lower() != "wal":
             conn.close()
+            _wal_unsupported.add(db_path)
             logger.info("studio.db is in %s mode, not WAL; WAL keeper not engaged.", mode)
             return False
+        _wal_unsupported.discard(db_path)
         _wal_keepers[db_path] = conn
         return True
 
@@ -1327,6 +1356,7 @@ def close_wal_keeper() -> None:
         for conn in _wal_keepers.values():
             _close_keeper(conn)
         _wal_keepers.clear()
+        _wal_unsupported.clear()
 
 
 def create_run(

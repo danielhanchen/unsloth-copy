@@ -31,6 +31,7 @@ from models.auth import (
 )
 from models.users import Token
 from auth import storage, hashing, policy
+from utils.account_context import OWNER_ACCOUNT_ID
 from auth.authentication import (
     authenticated_via_desktop_jwt,
     authenticated_without_credential,
@@ -48,9 +49,13 @@ router = APIRouter()
 def _account_id_of(username: str) -> "str | None":
     """Immutable id of ``username``'s account, for clients that key state on it.
 
-    Usernames can be renamed or reused, so state keyed on the name alone would
-    hand a recreated account its predecessor's data. None if the row is gone.
+    The owner's id is fixed: its username is reserved (``auth/storage.py``) and there is
+    no rename path, so the lookup is skipped. Managed usernames can be renamed or reused,
+    so state keyed on the name alone would hand a recreated account its predecessor's
+    data; resolve their immutable id from storage. None if the managed row is gone.
     """
+    if username == storage.DEFAULT_ADMIN_USERNAME:
+        return OWNER_ACCOUNT_ID
     account = storage.get_account(username)
     return account.account_id if account is not None else None
 

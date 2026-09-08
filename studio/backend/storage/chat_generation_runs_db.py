@@ -44,10 +44,17 @@ def reset_schema_state_for_tests() -> None:
         _schema_ready.clear()
 
 
+def _database_path(conn: sqlite3.Connection) -> Path:
+    """The file this connection opened, so the polling paths do not resolve the account
+    root a second time after ``get_connection`` already did."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    return Path(row[2]) if row and row[2] else studio_db_path()
+
+
 def _connect() -> sqlite3.Connection:
     """get_connection plus the one-off progress-lease migration for this database."""
     conn = get_connection()
-    db_path = studio_db_path()
+    db_path = _database_path(conn)
     if db_path in _schema_ready:
         return conn
     try:

@@ -8547,7 +8547,6 @@ def test_scan_folder_storage_removals_report_if_a_row_changed(monkeypatch):
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr(scan_folders, "_ensure_schema", lambda _conn: None)
     for storage in (studio_db, scan_folders):
         for rowcount, expected in ((1, True), (0, False)):
             connection = _Connection(rowcount)

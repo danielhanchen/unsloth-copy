@@ -54,6 +54,9 @@ def retire_account_roots(account: AccountContext) -> None:
     retire_account_jobs(account)
     run_as(account, close_mcp_sessions)
     run_as(account, invalidate_tool_cache)
+    from storage.studio_db import close_wal_keeper_for
+
+    close_wal_keeper_for(run_as(account, storage_roots.workspace_root) / "studio.db")
     roots = {
         run_as(account, root).absolute()
         for root in (
