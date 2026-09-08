@@ -76,6 +76,7 @@ _gguf_family_buildable = _catalog_classification._gguf_family_buildable
 _is_h3_bundle_gguf_hint = _catalog_classification._is_h3_bundle_gguf_hint
 SPEECH_GGUF_ARCHS = _gguf_archs.SPEECH_GGUF_ARCHS
 is_speech_gguf_architecture = _gguf_archs.is_speech_gguf_architecture
+from utils.account_context import account_thread
 from utils.utils import canonical_model_repo_id, log_and_http_error
 
 import re as _re
@@ -3720,7 +3721,7 @@ async def _read_native_context_length_bounded(model: str, is_local: bool) -> Opt
         slots.release()
         return None
     try:
-        threading.Thread(target = worker, name = "native-ctx", daemon = True).start()
+        account_thread(target = worker, name = "native-ctx", daemon = True).start()
     except RuntimeError:
         slots.release()  # thread never ran, so it will never release
         return None

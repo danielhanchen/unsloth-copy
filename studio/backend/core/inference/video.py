@@ -1396,7 +1396,8 @@ class VideoBackend:
                 asset_repos = claimed_assets,
             )
 
-        threading.Thread(
+        # Pinned to the requesting account: the load reads and writes its private paths.
+        account_thread(
             target = self._run_load,
             kwargs = dict(
                 repo_id = repo_id,

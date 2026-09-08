@@ -481,3 +481,45 @@ def test_media_adapter_catalogs_and_selection_do_not_reveal_owner_files(
     with pytest.raises(HTTPException) as exc:
         run_as(BOB, access.require_media_adapters, request)
     assert exc.value.status_code == 404
+
+
+def test_the_native_context_worker_runs_as_the_requesting_account(monkeypatch):
+    """The read resolves against the caller's cache roots, so an unbound worker read the
+    owner's."""
+    from utils.account_context import current_account_id
+
+    seen = []
+    monkeypatch.setattr(
+        models,
+        "_read_native_context_length",
+        lambda model, is_local: seen.append(current_account_id()) or 4096,
+    )
+    read = models._read_native_context_length_bounded("org/model", False)
+    assert asyncio.run(arun_as(ALICE, read)) == 4096
+    assert seen == [ALICE.account_id]
+
+
+def test_every_model_load_worker_is_pinned_to_its_account():
+    """``_run_load`` downloads into and writes the requesting account's private paths."""
+    import ast
+    import inspect
+
+    from core.inference import diffusion, sd_cpp_backend, video as video_backend
+
+    for module in (diffusion, sd_cpp_backend, video_backend):
+        tree = ast.parse(inspect.getsource(module))
+        starters = [
+            node.func
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and any(
+                keyword.arg == "target"
+                and isinstance(keyword.value, ast.Attribute)
+                and keyword.value.attr == "_run_load"
+                for keyword in node.keywords
+            )
+        ]
+        assert starters, module.__name__
+        assert all(
+            isinstance(func, ast.Name) and func.id == "account_thread" for func in starters
+        ), module.__name__
