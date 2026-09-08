@@ -119,8 +119,10 @@ def _is_valid_repo_id(repo_id: str) -> bool:
 def _normalize_hf_token(hf_token) -> Optional[str]:
     if not isinstance(hf_token, str):
         return None
-    token = hf_token.strip()
-    return token or None
+    # Trims via normalize_token, not str.strip(): strip() returns a plain str and would drop
+    # the marker saying this token belongs to a UI session already entitled to ambient access,
+    # putting an ordinary session behind the access probe and denying it its own cache offline.
+    return normalize_token(hf_token)
 
 
 def _safe_is_dir(path) -> bool:
@@ -194,7 +196,13 @@ if str(backend_path) not in sys.path:
 
 from auth.authentication import allow_ambient_hf_token, get_current_subject
 from hub.dependencies import get_hf_token, get_request_hf_token
-from hub.utils.hf_tokens import HfTokenArg, hf_token_arg, is_anonymous
+from hub.utils.hf_tokens import (
+    HfTokenArg,
+    cache_reads_authorized,
+    hf_token_arg,
+    is_anonymous,
+    normalize_token,
+)
 from utils.utils import anonymous_and_offline
 
 
@@ -212,9 +220,16 @@ def _resolve_hub_token(header_token: HfTokenArg, query_token: Optional[str]) -> 
     returning ``header_token`` itself would return whatever a caller that bypassed
     FastAPI's injection left in the parameter -- an unresolved ``Depends`` object.
     """
-    explicit = _normalize_hf_token(header_token) or _normalize_hf_token(query_token)
-    if explicit:
-        return explicit
+    header_explicit = _normalize_hf_token(header_token)
+    if header_explicit:
+        return header_explicit
+    query_explicit = _normalize_hf_token(query_token)
+    if query_explicit:
+        # normalize_token can carry a marker through but cannot create one, and the query value
+        # never had it: it arrives as a bare string, not from the dependency. Rebuild it from the
+        # caller class the header already states, so the same UI session is not denied its own
+        # cache for putting its token in the legacy parameter instead of the header.
+        return hf_token_arg(query_explicit, allow_ambient_token = not is_anonymous(header_token))
     return False if is_anonymous(header_token) else None
 
 
@@ -2364,7 +2379,7 @@ def _model_config_inspection_target(
         return model_name
     # The cached snapshot answers from disk without consulting the token, so a caller
     # denied the ambient credential is sent to the Hub, which refuses a private repo.
-    if is_anonymous(hf_token):
+    if not cache_reads_authorized(hf_token, repo_id = canonical_model_repo_id(model_name)):
         return model_name
     from hub.utils.hf_cache_state import (
         latest_snapshot_from_cache_path,
@@ -2440,7 +2455,10 @@ async def get_model_config(
 
             # The bare repo id above only helps if the probes then go over the wire:
             # local_files_only resolves config.json out of the cache, unauthorized.
-            probe_local_only = prefer_local_cache and not is_anonymous(hf_token)
+            # A local folder is not the Hub cache, so it keeps the local-only probe.
+            probe_local_only = prefer_local_cache and (
+                is_local_path(model_name) or cache_reads_authorized(hf_token, repo_id = model_name)
+            )
             is_vision = is_vision_model(
                 inspection_target,
                 hf_token = hf_token,
@@ -2580,6 +2598,20 @@ async def scan_model_remote_code(
         local_model = is_local_path(model_name)
         if not local_model:
             model_name = resolve_cached_repo_id_case(model_name)
+        # The scanner's hf_hub_download resolves a cached repo's configs without consulting
+        # the credential, so a definitive has_remote_code can be answered off the operator's
+        # disk. Gating only the prefer_local snapshot optimization below left scan_target as
+        # the repo id and let the scan run anyway. Only a repo already in a cache can be
+        # served that way; an uncached one goes to the Hub, which enforces its own access.
+        if (
+            not local_model
+            and _repo_in_any_hf_cache(model_name)
+            and not cache_reads_authorized(hf_token, repo_id = model_name)
+        ):
+            raise HTTPException(
+                status_code = 404,
+                detail = "This model is not available to an unauthorized caller.",
+            )
         scan_target = model_name
         exact_snapshot_path = (
             model_snapshot_path.strip()
@@ -2613,7 +2645,11 @@ async def scan_model_remote_code(
                 normalize_path(exact_snapshot_path),
                 hf_token,
             )
-        elif prefer_local_cache is True and not local_model and not is_anonymous(hf_token):
+        elif (
+            prefer_local_cache is True
+            and not local_model
+            and cache_reads_authorized(hf_token, repo_id = model_name)
+        ):
             # Same guard as the exact_snapshot branch: resolving to a cached snapshot
             # hands the scanner a private repo's Python, unauthorized.
             from core.training.training import _resolve_model_snapshot

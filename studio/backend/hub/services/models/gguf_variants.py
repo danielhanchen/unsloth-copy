@@ -23,7 +23,7 @@ from hub.utils import download_manifest
 from hub.utils import download_registry
 from hub.utils import inventory_scan as hf_cache_scan
 from hub.utils.hf_errors import hf_error_status
-from hub.utils.hf_tokens import is_anonymous
+from hub.utils.hf_tokens import cache_reads_authorized as hub_cache_reads_authorized
 from hub.utils.hf_cache_state import (
     incomplete_blob_hash,
     iter_destructive_repo_cache_dirs,
@@ -1274,7 +1274,12 @@ async def get_gguf_variants_answer(
         # The HF cache answers from disk without authorizing, so a denied caller could name
         # a cached private repo and read back its filenames, sizes and vision flag. A
         # local_path the caller named itself is not the Hub cache and stays available.
-        cache_reads_authorized = not is_anonymous(hf_token)
+        # `offline` is this request's own flag, and the branches that honour it are below.
+        # Passing it in stops an explicit token being put on the wire for a probe whose
+        # answer the request had already decided not to use.
+        cache_reads_authorized = hub_cache_reads_authorized(
+            hf_token, repo_id = repo_id, offline = bool(offline)
+        )
 
         def _scoped_local_response():
             """The pinned snapshot's own answer, or None when it holds nothing."""
@@ -1658,6 +1663,16 @@ async def get_gguf_variants_answer(
 
     def _compute_response() -> GgufVariantsResponse:
         skip = is_local_path(repo_id) or not _is_valid_repo_id(repo_id)
+        # The enrichment below reads this repo's cache dir, so it answers to the same
+        # authorization the scan does. _compute raises for a denied caller, and the except
+        # branch would otherwise return 200 carrying an empty quant folder's label, which is
+        # the existence of a cached private repo. Asked only for a remote, valid id, so a
+        # malformed one never reaches the wire; cache_reads_authorized memoizes, so this
+        # rides the decision _compute already made rather than adding a probe.
+        if not skip and not hub_cache_reads_authorized(
+            hf_token, repo_id = repo_id, offline = bool(offline)
+        ):
+            skip = True
         try:
             response = _compute()
         except Exception:
