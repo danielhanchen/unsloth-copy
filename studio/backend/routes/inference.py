@@ -5284,16 +5284,25 @@ def _apply_current_date_prompt(
     return f"{date_line}\n\n{system_prompt.lstrip()}" if system_prompt else date_line
 
 
+# Ollama applies the Modelfile SYSTEM only when `req.Messages[0].Role != "system"` (its
+# server/routes.go ChatHandler, which /v1/chat/completions also routes into), so only a turn at
+# index 0 displaces it.
+_MODELFILE_SYSTEM_PROVIDERS = frozenset({"ollama"})
+
+
 def _prepend_current_date_to_messages(
     messages: list[dict],
     request: Any = None,
     *,
     include_api_key: bool = False,
+    provider_type: str | None = None,
 ) -> list[dict]:
     """Apply the date to an already-built message list for a provider Studio proxies to.
 
     The local path prefixes ``system_prompt`` before the messages exist; an external payload is
-    assembled first, so the date goes onto its leading system turn instead.
+    assembled first, so the date goes onto its leading system turn instead. When there is no
+    such turn one is synthesized, except for ``_MODELFILE_SYSTEM_PROVIDERS``, where it is
+    dropped: the caller's silence is what lets the server's own prompt apply.
     """
     if request is not None and not _wants_current_date(request):
         if not include_api_key or _request_is_internal_workflow(request):
@@ -5333,6 +5342,11 @@ def _prepend_current_date_to_messages(
                 return copied
             msg["content"] = [{"type": "text", "text": date_line}, *copied_parts]
             return copied
+    if provider_type in _MODELFILE_SYSTEM_PROVIDERS:
+        # Synthesizing here is what costs an Ollama caller the Modelfile SYSTEM (#10436). Callers
+        # must not claim this exemption when something later will synthesize a system turn anyway:
+        # the date would be given up for a prompt that is displaced regardless.
+        return messages
     return [{"role": "system", "content": date_line}, *copied]
 
 
@@ -20737,22 +20751,28 @@ async def _proxy_to_external_provider(
         _reject_confirm_gate_without_channel(
             payload, _ui_events, monitor_id, _catalog_names(external_studio_tools)
         )
-    chat_messages = _prepend_current_date_to_messages(
-        chat_messages,
-        request,
-        include_api_key = run_studio_tool_loop,
-    )
+    # Built before the date is applied, not after, because whether it exists decides whether the
+    # Modelfile exemption is worth claiming: _append_to_system_message below synthesizes its own
+    # system turn, which costs an Ollama caller the Modelfile SYSTEM whatever the date does. The
+    # date can only be withheld to save that prompt when nothing after this will displace it.
+    # Full access disables the sandbox at execution time, so the schemas must say so too rather
+    # than describing a sandbox the model will not get.
+    _external_nudge = ""
     if run_studio_tool_loop and payload.bypass_permissions:
-        # Full access disables the sandbox at execution time, so the schemas must
-        # say so too rather than describing a sandbox the model will not get.
         _external_nudge = _build_tool_action_nudge(
             tools = external_studio_tools,
             model_name = model,
             full_access = True,
             full_access_only = True,
         )
-        if _external_nudge:
-            chat_messages = _append_to_system_message(chat_messages, _external_nudge)
+    chat_messages = _prepend_current_date_to_messages(
+        chat_messages,
+        request,
+        include_api_key = run_studio_tool_loop,
+        provider_type = None if _external_nudge else provider_type,
+    )
+    if _external_nudge:
+        chat_messages = _append_to_system_message(chat_messages, _external_nudge)
 
     cancel_event = threading.Event()
     cancel_keys = tuple(key for key in (payload.cancel_id, payload.session_id) if key)
