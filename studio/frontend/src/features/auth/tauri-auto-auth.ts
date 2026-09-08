@@ -80,6 +80,16 @@ async function doTauriAutoAuth(options: TauriAutoAuthOptions): Promise<boolean> 
     const tokens = await invoke<DesktopAuthResponse>("desktop_auth");
     if ("login_required" in tokens) {
       tauriLoginRequired = true;
+      // A managed account signs in in the document, so the shell answering
+      // "login required" must not discard the session the document already holds.
+      if (hasRefreshToken() && (await refreshSession()) && hasAuthToken()) {
+        clearTauriAuthFailure();
+        if (mustChangePassword()) {
+          const { router } = await import("@/app/router");
+          await router.navigate({ to: "/change-password", replace: true });
+        }
+        return true;
+      }
       clearAuthTokens();
       clearTauriAuthFailure();
       // AppProvider's forced startup probe must release the startup screen so
