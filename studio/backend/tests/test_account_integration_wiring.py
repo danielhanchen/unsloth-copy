@@ -214,7 +214,6 @@ def test_scan_folders_schema_is_initialised_for_each_account(tmp_path, monkeypat
     from storage import studio_db
 
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "studio"))
-    monkeypatch.setattr(scan_folders, "_schema_ready", set())
     monkeypatch.setattr(studio_db, "_schema_ready", set())
     folder = tmp_path / "shared-folder"
     folder.mkdir()
@@ -225,7 +224,7 @@ def test_scan_folders_schema_is_initialised_for_each_account(tmp_path, monkeypat
     assert [row["path"] for row in run_as(OWNER, scan_folders.list_scan_folders)] == [
         str(folder.resolve())
     ]
-    assert len(scan_folders._schema_ready) == 2
+    assert len(studio_db._schema_ready) == 2
 
 
 def test_output_scans_resolve_the_acting_account_root(tmp_path, monkeypatch, multi_user):

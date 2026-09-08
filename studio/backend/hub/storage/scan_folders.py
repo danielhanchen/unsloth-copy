@@ -11,23 +11,16 @@ from __future__ import annotations
 import os
 import platform
 import sqlite3
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from storage.studio_db import get_connection
-from utils.paths import studio_db_path
 from hub.utils.paths import normalize_path
 from utils.paths.external_media import is_linux_run_media_path, is_local_filesystem_root
 from utils.paths.scan_folder_health import is_readable_dir
 from utils.paths.sensitive import (
     contains_sensitive_path_component as _shared_contains_sensitive_path_component,
 )
-
-
-_schema_lock = threading.Lock()
-# Keyed by resolved studio.db path: every account's database gets its own schema pass.
-_schema_ready: set[Path] = set()
 
 
 def _denied_path_prefixes() -> list[str]:
@@ -86,31 +79,9 @@ def contains_sensitive_path_component(path: str) -> bool:
     return _contains_sensitive_path_component(path)
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    db_path = studio_db_path().resolve()
-    if db_path in _schema_ready:
-        return
-    with _schema_lock:
-        if db_path in _schema_ready:
-            return
-        collation = "COLLATE NOCASE" if platform.system() == "Windows" else ""
-        conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS scan_folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT NOT NULL UNIQUE {collation},
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
-        _schema_ready.add(db_path)
-
-
 def list_scan_folders() -> list[dict]:
     conn = get_connection()
     try:
-        _ensure_schema(conn)
         rows = conn.execute(
             "SELECT id, path, created_at FROM scan_folders ORDER BY created_at"
         ).fetchall()
@@ -154,7 +125,6 @@ def add_scan_folder_with_status(path: str) -> tuple[dict, bool]:
 
     conn = get_connection()
     try:
-        _ensure_schema(conn)
         now = datetime.now(timezone.utc).isoformat()
         if is_win:
             existing = conn.execute(
@@ -203,7 +173,6 @@ def remove_scan_folder(id: int) -> bool:
         return False
     conn = get_connection()
     try:
-        _ensure_schema(conn)
         cursor = conn.execute("DELETE FROM scan_folders WHERE id = ?", (id,))
         conn.commit()
         return cursor.rowcount > 0

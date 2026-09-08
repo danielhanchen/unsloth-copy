@@ -180,6 +180,19 @@ def test_usage_writer_retains_account_through_retries(account_home, monkeypatch)
             conn.close()
 
 
+def test_a_durable_run_poll_resolves_the_account_root_once(account_home, monkeypatch):
+    from storage import chat_generation_runs_db as runs_db
+
+    runs_db.reset_schema_state_for_tests()
+    run_as(ALICE, runs_db._connect).close()
+    resolutions = []
+    monkeypatch.setattr(
+        runs_db, "studio_db_path", lambda: resolutions.append(1) or roots.studio_db_path()
+    )
+    run_as(ALICE, runs_db._connect).close()
+    assert resolutions == []
+
+
 def test_profile_cache_and_invalidation_are_private(account_home):
     # Empty databases have identical fingerprints; one account's cached object
     # must not be served to another even in that case.
