@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { subscribeResidentStatusRefresh } from "@/features/hub/lib/resident-status-refresh";
 import { type ProfileStats, loadProfileStats } from "../api/profile-stats";
 
 type ProfileStatsState = {
@@ -42,6 +43,13 @@ export function useProfileStats(): ProfileStatsState {
     void load();
     return () => abortRef.current?.abort();
   }, [load]);
+
+  // Coming back to the tab is when the numbers can have moved: the user chatted
+  // in another window, or an API client spent tokens while this one sat open.
+  // Reopening Settings needs no watcher of its own -- the dialog content is not
+  // force-mounted, so the panel unmounts on close and the effect above refetches
+  // when it mounts again.
+  useEffect(() => subscribeResidentStatusRefresh(load), [load]);
 
   const reload = useCallback(() => {
     void load();
