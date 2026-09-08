@@ -104,6 +104,40 @@ def test_wal_keepers_can_close_one_account(account_home):
     assert studio_db._wal_keepers == {}
 
 
+def test_a_managed_database_keeps_its_wal_across_a_connection_close(account_home):
+    studio_db.reset_schema_state_for_tests()
+    alice_db = run_as(ALICE, roots.studio_db_path)
+    owner_db = run_as(OWNER, roots.studio_db_path)
+    for account, db_path in ((OWNER, owner_db), (ALICE, alice_db)):
+        conn = run_as(account, studio_db.get_connection)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value_json, updated_at)"
+                " VALUES ('probe', '1', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    # The owner's keeper is a lifespan concern (main.py); only the managed one opens on demand.
+    assert owner_db not in studio_db._wal_keepers
+    assert not owner_db.with_name("studio.db-wal").exists()
+    assert alice_db in studio_db._wal_keepers
+    assert alice_db.with_name("studio.db-wal").exists()
+
+
+def test_retiring_an_account_releases_its_wal_keeper(account_home):
+    from routes.accounts import retire_account_roots
+
+    studio_db.reset_schema_state_for_tests()
+    alice_db = run_as(ALICE, roots.studio_db_path)
+    run_as(ALICE, studio_db.get_connection).close()
+    keeper = studio_db._wal_keepers[alice_db]
+    retire_account_roots(ALICE)
+    assert alice_db not in studio_db._wal_keepers
+    with pytest.raises(sqlite3.ProgrammingError, match = "closed"):
+        keeper.execute("SELECT 1")
+
+
 def _receipt() -> api_usage_db.ApiUsageReceipt:
     return api_usage_db.ApiUsageReceipt(
         id = "same-receipt",
