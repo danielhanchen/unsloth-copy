@@ -2959,6 +2959,30 @@ def trailing_assistant_text(messages: list) -> Optional[str]:
     return None
 
 
+def trailing_assistant_reasoning(messages: list) -> str:
+    """Reasoning text of a trailing assistant turn that showed no prose yet. A reasoning model
+    preempted inside its thought block has real work and no visible characters, so
+    ``trailing_assistant_text`` reports "" and every truthiness gate on it drops the continuation:
+    ten consecutive pauses with ``kept_chars=0``. Kept apart from ``trailing_assistant_text``, which
+    feeds the splice and would paste the thought into the answer."""
+    if not messages:
+        return ""
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return ""
+    if last.get("tool_calls"):
+        return ""
+    for field in ("reasoning_content", "reasoning", "thinking"):
+        value = last.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def trailing_assistant_resumable(messages: list) -> bool:
+    return bool(trailing_assistant_text(messages) or trailing_assistant_reasoning(messages))
+
+
 def last_user_text(messages: list) -> str:
     """Text of the newest user turn, with any ``<img>`` markup stripped.
 
@@ -3178,6 +3202,12 @@ def append_assistant_turn(
         # Copy rather than mutate: the caller owns assistant_msg and may still read it.
         merged_msg = {**conversation[-1], **assistant_msg}
         merged_msg["content"] = f"{prev_text}{assistant_msg['content']}"
+        # The thought is one turn's work too: a continuation that went on thinking and then
+        # called a tool carried only its own part, and the earlier part left the context.
+        prev_reasoning = conversation[-1].get("reasoning_content")
+        new_reasoning = assistant_msg.get("reasoning_content")
+        if isinstance(prev_reasoning, str) and isinstance(new_reasoning, str):
+            merged_msg["reasoning_content"] = f"{prev_reasoning}{new_reasoning}"
         conversation[-1] = merged_msg
         return
     conversation.append(assistant_msg)

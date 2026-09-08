@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import queue
 import threading
 import time
 import uuid
@@ -428,6 +429,8 @@ from core.inference.tool_call_parser import (
     unfinished_thought_progress as _unfinished_thought_progress,
 )
 from core.inference.passthrough_healing import nudge_enabled as _nudge_enabled
+from core.inference import llama_exact as _exact
+from core.inference import llama_preemption as _preemption
 from core.inference.repetition_guard import is_repetition_dominated
 from core.inference.tool_loop_controller import (
     ToolLoopController,
@@ -480,6 +483,54 @@ class _LlamaStreamCancelled(Exception):
     __slots__ = ()
 
 
+_TOOL_PRIME_PENDING = object()
+# A parallel round entry whose driver has not started; the round starts them all together below.
+_TOOL_START_DEFERRED = object()
+
+
+def _drive_tool_stream(stream, out_queue) -> None:
+    """Read one tool's event generator to the end, on a thread of its own.
+    ``stream_tool_execution`` starts its worker inside the body, so nothing here overlaps two calls."""
+    try:
+        while True:
+            try:
+                out_queue.put(("event", next(stream)))
+            except StopIteration as stop:
+                out_queue.put(("result", stop.value))
+                return
+    except BaseException as exc:  # noqa: BLE001 - replayed at the call's turn
+        out_queue.put(("error", exc))
+
+
+def _start_tool_call(
+    decision,
+    stream,
+    budget_cell,
+    starved_cell,
+    compact_flag = False,
+):
+    """Put one call's tool in flight and return the entry its turn will be read from.
+    ``compact_flag`` is the gate's promise for THIS call; the loop-scoped name has moved on by then."""
+    out_queue: "queue.Queue" = queue.Queue()
+    driver = threading.Thread(
+        target = _drive_tool_stream,
+        args = (stream, out_queue),
+        daemon = True,
+        name = f"tool-drive-{getattr(decision, 'tool_name', '') or 'unknown'}",
+    )
+    driver.start()
+    return (
+        decision,
+        stream,
+        out_queue,
+        _TOOL_PRIME_PENDING,
+        None,
+        budget_cell,
+        starved_cell,
+        compact_flag,
+    )
+
+
 class _CombinedCancelEvent:
     __slots__ = ("_events",)
 
@@ -501,6 +552,16 @@ class _CombinedCancelEvent:
             self._events[0].wait(pause)
             if self.is_set():
                 return True
+
+
+def _interrupt_event(cancel_event, preempt_event):
+    """One waitable for "stop reading" from either reason, so a pause needs no new teardown."""
+    events = [event for event in (cancel_event, preempt_event) if event is not None]
+    if not events:
+        return None
+    if len(events) == 1:
+        return events[0]
+    return _CombinedCancelEvent(*events)
 
 
 # Deliberately NOT ``slots=True``: it drops ``__dict__``, so ``vars(intent)`` raises and
@@ -549,6 +610,8 @@ class GgufLoadIntent:
     spec_draft_cache_type: Optional[str] = None
     ctx_checkpoints: Optional[int] = None
     cache_ram: Optional[int] = None
+    # auto / off / on, or none to follow the stored setting. Passed as child env, not extra_args.
+    exact_concurrency: Optional[str] = None
     extra_args: Optional[tuple[str, ...]] = None
     # The route materialises inherited extras from the live server, so the list alone
     # cannot say whether the caller named it. Duplicate-load checks need the difference:
@@ -1961,15 +2024,160 @@ def _finalize_reasoning_only_cumulative(
 # is exempt because it needs immediate artifact feedback.
 _PROVISIONAL_ARGS_MIN_CHARS = 256
 _DEFAULT_STREAM_STALL_TIMEOUT_S = 120.0  # 2 min
+# Silence allowed while llama-server reports a parked slot; bounds one that parked and then died.
+_SERVER_PARK_STALL_CAP_S = 1800.0  # 30 min
+# SSE comments a swap-capable llama-server (unslothai/llama.cpp#184) writes on park and restore.
+_SERVER_PARKED_COMMENT = ": preempted"
+_SERVER_RESUMED_COMMENT = ": resumed"
+# Every two seconds while parked: the server is alive, not that anything changed.
+_SERVER_KEEPALIVE_COMMENT = ": preempt-keepalive"
+_SERVER_PARK_COMMENTS = (_SERVER_PARKED_COMMENT, _SERVER_RESUMED_COMMENT, _SERVER_KEEPALIVE_COMMENT)
+# How often a Studio-side pause says it is still waiting. Matches the server's parked keepalive.
+_PREEMPT_KEEPALIVE_S = 2.0
+
+
+def _preempt_ram_disabled_in(args, env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when this launch switches the server's parking off with a zero RAM budget.
+
+    Read in llama.cpp's order (environment first, then argv last-wins), since ``--preempt-ram``
+    carries ``set_env("LLAMA_ARG_PREEMPT_RAM")``: a zero in the environment disables parking with
+    nothing on the launch line, and a Studio-managed budget still beats an inherited zero."""
+    value = (os.environ if env is None else env).get("LLAMA_ARG_PREEMPT_RAM")
+    disabled = value is not None and str(value).strip() == "0"
+    tokens = [str(a) for a in (args or ())]
+    for i, tok in enumerate(tokens):
+        if tok == "--preempt-ram":
+            value = tokens[i + 1] if i + 1 < len(tokens) else ""
+            disabled = value.strip() == "0"
+        elif tok.startswith("--preempt-ram="):
+            disabled = tok.split("=", 1)[1].strip() == "0"
+    return disabled
+
+
+# llama-server's own default for --preempt-ram, in MiB.
+_PREEMPT_RAM_DEFAULT_MIB = 8192
+
+
+def _exact_parking_budget_mib(kv_bytes: int, *, args, env: Mapping[str, str]) -> Optional[int]:
+    """The ``--preempt-ram`` an exact launch needs so every park fits host RAM: the pool plus a
+    margin. None when the default holds it, the estimate is unknown, or a budget is named."""
+    if kv_bytes <= 0 or "LLAMA_ARG_PREEMPT_RAM" in env:
+        return None
+    if any(str(a).startswith("--preempt-ram") for a in (args or ())):
+        return None
+    need = -(-int(kv_bytes) // (1024 * 1024)) + 64
+    return need if need > _PREEMPT_RAM_DEFAULT_MIB else None
+
+
+def _named_preempt_ram_mib(args, env: Mapping[str, str]) -> Optional[int]:
+    """The ``--preempt-ram`` budget the launch names in MiB, environment first then argv last-wins."""
+    named: Optional[int] = None
+    raw = env.get("LLAMA_ARG_PREEMPT_RAM")
+    candidates: list[str] = [] if raw is None else [str(raw)]
+    tokens = [str(a) for a in (args or ())]
+    for i, tok in enumerate(tokens):
+        if tok == "--preempt-ram":
+            candidates.append(tokens[i + 1] if i + 1 < len(tokens) else "")
+        elif tok.startswith("--preempt-ram="):
+            candidates.append(tok.split("=", 1)[1])
+    for text in candidates:
+        try:
+            named = int(str(text).strip())
+        except (TypeError, ValueError):
+            continue
+    return named
+
+
+def _exact_parking_shortfall_mib(
+    kv_bytes: int,
+    *,
+    args,
+    env: Mapping[str, str],
+    default_mib: Optional[int] = None,
+) -> Optional[tuple[int, int, int]]:
+    """``(named, pool, need)`` when the budget in force cannot park the whole pool, else None: a
+    park that outgrows it is re-prefilled, which is not byte-identical on CUDA. ``-1`` is unlimited
+    and ``0`` is parking off, which ``server_preempts_kv`` already reports. ``default_mib`` is
+    judged when nothing named a budget (an auto-fit pool is judged after launch instead)."""
+    if kv_bytes <= 0:
+        return None
+    named = _named_preempt_ram_mib(args, env)
+    if named is None:
+        named = default_mib
+    if named is None or named <= 0:
+        return None
+    pool = -(-int(kv_bytes) // (1024 * 1024))
+    need = pool + 64
+    return (named, pool, need) if named < need else None
+
+
+def _exact_auto_blocker(setting: str, args, env: Mapping[str, str]) -> Optional[str]:
+    """Why an ``auto`` exact launch should not start the mode at all, else None.
+
+    Both are knowable before launch and neither is the child's to refuse: under
+    ``UNSLOTH_LLAMA_PREEMPT_MODE=studio``, or with the server's parking off (``--preempt-ram 0``),
+    Studio is the one pausing chats. Judged after launch, the child would have run the mode's slower
+    kernels for a guarantee then reported unavailable. ``on`` fails the load instead."""
+    if setting != _exact.EXACT_AUTO:
+        return None
+    if _preemption.preempt_mode_setting() == _preemption.PREEMPT_MODE_STUDIO:
+        return (
+            "UNSLOTH_LLAMA_PREEMPT_MODE=studio makes Studio the one pausing chats, and a "
+            "chat Studio resumes is re-prefilled rather than restored"
+        )
+    if _preempt_ram_disabled_in(args, env = env):
+        return "the server's parking is switched off (--preempt-ram 0)"
+    conflicts = _exact.contradicting_args(args)
+    if conflicts:
+        return (
+            "the extra arguments pass "
+            + ", ".join(conflicts)
+            + ", which llama-server cannot combine with it"
+        )
+    # The same condition `_stand_down_child_parking` acts on later (studio mode above is its
+    # other): Studio's preemption off and nothing naming a budget hands the child a zero.
+    if not _preemption.preemption_enabled() and _named_preempt_ram_mib(args, env) is None:
+        return (
+            "UNSLOTH_LLAMA_ADMISSION_PREEMPT=0 switches the server's parking off as well, "
+            "with no --preempt-ram named"
+        )
+    return None
+
+
+def _child_parking_stands_down(args, env: Mapping[str, str]) -> bool:
+    """Whether the child's own parking is to be switched off for the line as it stands. Read
+    BEFORE an exact launch sizes a budget of its own: the stand-down reads any ``--preempt-ram`` as
+    one somebody named, so a budget Studio generated for itself would defeat the switch."""
+    studio_pauses = _preemption.preempt_mode_setting() == _preemption.PREEMPT_MODE_STUDIO
+    if (_preemption.preemption_enabled() and not studio_pauses) or "LLAMA_ARG_PREEMPT_RAM" in env:
+        return False
+    return not any(str(a).startswith("--preempt-ram") for a in (args or ()))
+
+
+def _stand_down_child_parking(env: dict, args) -> bool:
+    """One switch means no preemption anywhere: with Studio's off, the child would still park on its
+    own default budget. ``UNSLOTH_LLAMA_PREEMPT_MODE=studio`` stands it down too, a park the child
+    made on its own racing Studio's pause with no relay excusing the silence. Sets
+    ``LLAMA_ARG_PREEMPT_RAM=0`` and returns True, unless the extras or the environment named one."""
+    if not _child_parking_stands_down(args, env):
+        return False
+    env["LLAMA_ARG_PREEMPT_RAM"] = "0"
+    return True
+
+
 # Cap tool calls from a single TEXTUAL-fallback turn (mirrors the safetensors
 # loop). Structured delta.tool_calls are grammar-bounded by llama-server; text
 # parsed from content is not, so one runaway turn could fan out unbounded.
 _MAX_TOOL_CALLS_PER_TURN = 8
+# The most structured calls one round overlaps; a bigger round runs single file, as every round did.
+_MAX_PARALLEL_TOOL_CALLS_PER_ROUND = _MAX_TOOL_CALLS_PER_TURN
 # How many times a turn may be resumed after ending inside its own reasoning. Two, because
 # the first retry already runs with thinking off: if that still produces nothing visible,
 # the window is too small for this model and another attempt only spends more of the user's
 # time reaching the same place.
 _MAX_LENGTH_CONTINUATIONS = 2
+# Per token would take a lock per token; per round is far too late at thousands of tokens.
+_TOKEN_REPORT_EVERY = 32
 _CONTINUE_AFTER_LENGTH_STATUS = "Continuing after a long thought..."
 _CONTINUE_TRUNCATED_ANSWER_STATUS = "Continuing the answer..."
 # Below this, a tool result carries no content: what comes back is the notice saying it was
@@ -5889,6 +6097,107 @@ def _backfill_usage_from_timings(usage, timings):
     return out
 
 
+def _usage_with_earlier_attempts(usage, earlier_completion_tokens: int):
+    """Usage for a response that took more than one upstream request: llama-server counts each
+    attempt alone and the client was handed the LAST one."""
+    if earlier_completion_tokens <= 0:
+        return usage
+    out = dict(usage or {})
+    out["completion_tokens"] = int(out.get("completion_tokens") or 0) + int(
+        earlier_completion_tokens
+    )
+    out["total_tokens"] = int(out.get("prompt_tokens") or 0) + out["completion_tokens"]
+    return out
+
+
+# The `reason` a give-up rides under, shared by the three surfaces that emit it and the client.
+PREEMPT_GAVE_UP_REASON = "preempt_gave_up"
+
+
+def _drop_exact_for_no_flash(env, exact_setting) -> None:
+    """Take exact concurrency off the child env before a ``--flash-attn off`` respawn: the mode
+    needs the non-transposed V cache flash attention buys. Both retries take it."""
+    if exact_setting == _exact.EXACT_AUTO and _exact.apply_child_env(env, on = False):
+        logger.info(
+            "Dropped %s for the --flash-attn off retry; exact "
+            "concurrency requires flash attention.",
+            _exact.CHILD_ENV,
+        )
+
+
+def _decline_the_pause(preempt_policy, where: str) -> None:
+    """Take back a pause this stream will not take: PREEMPTING is outside `_PREEMPTABLE` and
+    nothing moves it back, so merely clearing the signal decodes while permanently unselectable."""
+    _declined = getattr(preempt_policy, "on_declined", None)
+    if not callable(_declined):
+        return
+    try:
+        _declined()
+    except Exception:
+        logger.debug(
+            "preemption policy raised on a declined pause (%s); continuing anyway",
+            where,
+            exc_info = True,
+        )
+
+
+def _await_resume(policy, cancel_event):
+    """Wait for the room to come back, told about the caller's Stop, saying so while it waits.
+
+    A generator: ``resumed = yield from _await_resume(...)``. Every ``_PREEMPT_KEEPALIVE_S`` it
+    yields a keepalive the routes forward as ``: preempt-keepalive``, which renews a durable run's
+    lease so a pause longer than it no longer reaps the run waiting in it. The wait itself can last
+    ``MAX_RESUME_WAIT_MULTIPLE`` stall timeouts.
+
+    A policy that takes ``cancel_event`` returns early when it is set; one written against
+    the older protocol is called as before, so doubles keep working. A user who pressed Stop during
+    a pause meant Stop: without this the worker sat in the wait, holding its tracking entry.
+    """
+    outcome: list = []
+
+    def wait() -> None:
+        try:
+            if cancel_event is not None:
+                try:
+                    outcome.append(bool(policy.await_resume(cancel_event = cancel_event)))
+                    return
+                except TypeError:
+                    pass
+            outcome.append(bool(policy.await_resume()))
+        except BaseException as exc:  # re-raised on the generator's thread
+            outcome.append(exc)
+
+    worker = threading.Thread(target = wait, name = "preempt-await-resume", daemon = True)
+    worker.start()
+    while True:
+        worker.join(_PREEMPT_KEEPALIVE_S)
+        if not worker.is_alive():
+            break
+        yield {"type": "preempt", "state": "keepalive"}
+    result = outcome[0] if outcome else False
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _preempt_gave_up_event(context_length, max_tokens) -> dict:
+    """What a client is owed when a paused chat stops waiting for KV room; both places that end a
+    turn this way used to `return` in silence. Carried on `context_truncated`, which already reaches
+    all five surfaces. `fits` is TRUE and `dropped_messages` zero, or the client raises "compacted"."""
+    window = max(0, int(context_length or 0))
+    event = {
+        "type": "context_truncated",
+        "reason": PREEMPT_GAVE_UP_REASON,
+        "fits": True,
+        "dropped_messages": 0,
+    }
+    if window:
+        event["context_length"] = window
+        # Same formula the preflight's fit reports, so the client stays on one scale.
+        event["prompt_target"] = prompt_budget(window, max_tokens)
+    return event
+
+
 def _report_live_llama_timings(callback, chunk) -> None:
     """Report request-scoped llama.cpp progress without altering the public stream."""
     if callback is None or not isinstance(chunk, dict):
@@ -6334,6 +6643,10 @@ class LlamaCppBackend:
         self._requested_spec_draft_cache_type: Optional[str] = None
         self._requested_ctx_checkpoints: Optional[int] = None
         self._requested_cache_ram: Optional[int] = None
+        # What the last load ASKED for (auto/off/on) and what it GOT (on/off/unavailable).
+        # Off before any launch: no child, no mode.
+        self._requested_exact_concurrency: str = _exact.EXACT_OFF
+        self._exact_concurrency: str = _exact.EXACT_STATE_OFF
         self._idle_slot_clearing_active: bool = False
         self._chat_template: Optional[str] = None
         self._markup_tokens: list = []
@@ -6440,6 +6753,10 @@ class LlamaCppBackend:
         # Bumped by every unload. load_model clears _cancel_event, so a respawn that
         # raced an unload needs a signal that survives the clear (see _respawn_if_dead).
         self._unload_epoch = 0
+        # Keyed per model load: a mid-session respawn picks a fresh port, so a key read off
+        # base_url would strand every live participant under the old one.
+        self._admission_key: Optional[str] = None
+        self._respawn_replay = False
         # Set by the in-app updater while it swaps prebuilt binaries; load_model()
         # rejects fast so no server starts from a half-swapped binary.
         self._llama_update_in_progress = False
@@ -6582,6 +6899,76 @@ class LlamaCppBackend:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._port}"
+
+    @property
+    def admission_key(self) -> str:
+        """Key for the admission queue and the preemption controller.
+
+        One per model load, and held across a respawn: the participants registered before
+        the crash are the ones the replacement must be reconciled against, and a resume
+        looking them up under the new port found an empty ledger and queue.
+        """
+        return getattr(self, "_admission_key", None) or self.base_url
+
+    def _stamp_admission_key(self) -> None:
+        # A replay keeps the key it was launched under; a user-driven load starts fresh.
+        if not getattr(self, "_respawn_replay", False) or not getattr(self, "_admission_key", None):
+            self._admission_key = self.base_url
+
+    @property
+    def server_preempts_kv(self) -> bool:
+        """Whether the running llama-server pauses chats itself: a build with `--preempt-ram`
+        (unslothai/llama.cpp#184), a unified cache, and no `studio` override."""
+        if not getattr(self, "_server_preempts_kv", False):
+            return False
+        if not getattr(self, "_kv_cache_unified", False):
+            return False
+        return _preemption.resolve_preempt_mode(True) == _preemption.PREEMPT_MODE_SERVER
+
+    def _server_park_grace(self) -> bool:
+        """Consulted only when the stall timeout would fire: is a slot parked right now? A swap
+        build predating the stream comments is silent while parked, and `/metrics` says so."""
+        try:
+            from core.inference.llama_stats import scrape_llama_metrics
+
+            # `/metrics` sits behind --api-key like `/slots`: unauthenticated, every check was a 401
+            metrics = scrape_llama_metrics(self.base_url, timeout_s = 3.0, headers = self._auth_headers)
+        except Exception:
+            return False
+        if not metrics:
+            return False
+        try:
+            parked = float(metrics.get("requests_preempted", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+        if parked:
+            # Nothing is forwarded while this excuses the silence, so the lease learns of the park here.
+            self._server_park_grace_at = time.monotonic()
+        return parked
+
+    def server_park_grace_recent(self, within_s: float) -> bool:
+        """Whether `/metrics` excused a silent stream as parked within the last ``within_s`` seconds.
+        A swap build without the stream notices is silent for the whole park, the one signal left."""
+        at = getattr(self, "_server_park_grace_at", None)
+        return at is not None and time.monotonic() - float(at) <= float(within_s)
+
+    @staticmethod
+    def _server_park_event(line: str, preempt_policy = None) -> Optional[dict]:
+        """A `: preempted` / `: resumed` / `: preempt-keepalive` server comment as the stream event
+        the routes relay. The policy is told of a park and a resume, so the epoch ends."""
+        if line == _SERVER_KEEPALIVE_COMMENT:
+            # Still parked. Relayed to renew a durable run's lease; the policy is not told twice.
+            return {"type": "preempt", "state": "keepalive", "source": "server"}
+        parked = line == _SERVER_PARKED_COMMENT
+        if not parked and line != _SERVER_RESUMED_COMMENT:
+            return None
+        hook = getattr(preempt_policy, "on_server_parked" if parked else "on_server_resumed", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                logger.debug("preemption policy raised on a server park notice", exc_info = True)
+        return {"type": "preempt", "state": "paused" if parked else "resumed", "source": "server"}
 
     @property
     def _auth_headers(self) -> "Optional[dict[str, str]]":
@@ -6769,6 +7156,80 @@ class LlamaCppBackend:
         reports; this stays the caller's intent so the dedupe compares like with
         like."""
         return self._requested_load_mode
+
+    @property
+    def requested_exact_concurrency(self) -> str:
+        return getattr(self, "_requested_exact_concurrency", _exact.EXACT_OFF)
+
+    @property
+    def exact_concurrency(self) -> str:
+        """What the RUNNING child does: on, off, or unavailable. Only `auto` reaches unavailable."""
+        return getattr(self, "_exact_concurrency", _exact.EXACT_STATE_OFF)
+
+    @staticmethod
+    def _exact_missing_launch_flags(
+        args: Optional[Sequence[str]],
+        caps: Mapping[str, Any],
+        *,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> list[str]:
+        """What Studio's own launch line is missing for exact concurrency. One flag today:
+        ``--parallel 1`` skips ``--kv-unified``, which the paged pool needs. An explicit
+        ``--no-kv-unified`` in the extras is an opt-out, not an omission, so it is left alone."""
+        if _kv_unified_from_args(args, env = env) or not caps.get("supports_kv_unified"):
+            return []
+        if any(_flag_name(str(a)) in ("-no-kvu", "--no-kv-unified") for a in (args or ())):
+            return []
+        return ["--kv-unified"]
+
+    @staticmethod
+    def _drop_exact_after_refusal(
+        env: dict, *, setting: str, crashed: bool, output: Optional[str]
+    ) -> bool:
+        """Take the mode off ``env`` when THIS crash was the server refusing it. True means
+        relaunch. The variable still being there is what makes a second call a no-op."""
+        if not crashed or setting != _exact.EXACT_AUTO:
+            return False
+        if not _exact.is_exact_refusal(output):
+            return False
+        return _exact.apply_child_env(env, on = False)
+
+    @staticmethod
+    def _exact_state_after_launch(
+        *,
+        setting: str,
+        env: Mapping[str, str],
+        args: Optional[Sequence[str]],
+        supports_exact: bool,
+        server_parks: bool = True,
+        parking_holds: bool = True,
+    ) -> str:
+        """What to report for a child that has just come up healthy.
+
+        ``server_parks`` is ``server_preempts_kv``: a chat the SERVER parks is restored cell for
+        cell, while one Studio pauses resumes as a continuation with fresh sampler and draft state,
+        so exact output needs the server to be the one pausing. ``parking_holds`` is False when a
+        named ``--preempt-ram`` cannot hold the pool, a park outgrowing it being re-prefilled.
+        ``supports_exact`` is the positive evidence, read off the running server's ``/props``: a
+        build predating unslothai/llama.cpp#194 ignores ``LLAMA_EXACT_CONCURRENCY`` and starts
+        perfectly, so a launch that merely ASKED proves nothing and the state is ``unavailable``.
+        """
+        if not _exact.wants_exact(setting):
+            return _exact.EXACT_STATE_OFF
+        running = (
+            bool(supports_exact)
+            and _exact.child_flag_set(env)
+            # The same env-aware readers the rest of the load uses: both flags have LLAMA_ARG_ twins.
+            and _kv_unified_from_args(args, env = env)
+            and _flash_attn_enabled_from_args(args, env = env)
+            and not _exact.contradicting_args(args)
+            and bool(server_parks)
+            and bool(parking_holds)
+        )
+        if running:
+            return _exact.EXACT_STATE_ON
+        # Asked for and not running, however it happened.
+        return _exact.EXACT_STATE_UNAVAILABLE
 
     @property
     def requested_spec_draft_cache_type(self) -> Optional[str]:
@@ -7236,6 +7697,14 @@ class LlamaCppBackend:
             or self._requested_spec_draft_cache_type != intent.spec_draft_cache_type
             or self._requested_ctx_checkpoints != intent.ctx_checkpoints
             or self._requested_cache_ram != intent.cache_ram
+        ):
+            return False
+        # The mode is an environment variable on the child, so changing it needs a new child.
+        # Resolved on both sides, or a request naming nothing and a stored `on` relaunch always.
+        if (
+            not self._is_diffusion
+            and self.requested_exact_concurrency
+            != _exact.resolve_exact_setting(intent.exact_concurrency)
         ):
             return False
 
@@ -7849,6 +8318,7 @@ class LlamaCppBackend:
                 "ctx_checkpoints_flag": None,
                 "supports_no_cache_prompt": False,
                 "supports_metrics": False,
+                "supports_preempt_ram": False,
                 "supports_slot_save": False,
                 "supports_no_mmproj_offload": False,
                 "supports_load_mode": False,
@@ -7896,6 +8366,7 @@ class LlamaCppBackend:
         ctx_checkpoints_flag = None
         supports_no_cache_prompt = False
         supports_metrics = False
+        supports_preempt_ram = False
         supports_slot_save = False
         supports_no_mmproj_offload = False
         supports_load_mode = False
@@ -8121,6 +8592,9 @@ class LlamaCppBackend:
             supports_ctx_checkpoints = ctx_checkpoints_flag is not None
             supports_no_cache_prompt = _is_real("--no-cache-prompt")
             supports_metrics = _is_real("--metrics")
+            # Server-side preemption (unslothai/llama.cpp#184): the server parks a slot in host
+            # RAM instead of failing every slot, and Studio stands down.
+            supports_preempt_ram = _is_real("--preempt-ram")
             supports_slot_save = _is_real("--slot-save-path")
             supports_no_mmproj_offload = _is_real("--no-mmproj-offload")
             # --load-mode supersedes --mlock / --no-mmap, which are deprecated.
@@ -8213,6 +8687,7 @@ class LlamaCppBackend:
             "ctx_checkpoints_flag": ctx_checkpoints_flag,
             "supports_no_cache_prompt": supports_no_cache_prompt,
             "supports_metrics": supports_metrics,
+            "supports_preempt_ram": supports_preempt_ram,
             "supports_slot_save": supports_slot_save,
             "supports_no_mmproj_offload": supports_no_mmproj_offload,
             "supports_load_mode": supports_load_mode,
@@ -14077,6 +14552,7 @@ class LlamaCppBackend:
 
         self._kill_process()
         self._port = self._find_free_port()
+        self._stamp_admission_key()
         # Auto-size (0): the visual server probes the largest context that fits this GPU's VRAM
         # (capped at the training context). An explicit in-range n_ctx overrides it.
         maxtok = n_ctx if (n_ctx and 0 < n_ctx <= 65536) else 0
@@ -14222,6 +14698,11 @@ class LlamaCppBackend:
         self._cache_type_kv = None
         self._swa_full = False
         self._kv_cache_unified = False
+        self._server_preempts_kv = False
+        # The diffusion runner is not llama-server and reads no llama.cpp environment, so a
+        # previous GGUF's mode must not be reported against it.
+        self._requested_exact_concurrency = _exact.EXACT_OFF
+        self._exact_concurrency = _exact.EXACT_STATE_OFF
         self._memory_state = None
         self._memory_policy_active = False
         self._memory_mlock_applicable = True
@@ -16218,6 +16699,26 @@ class LlamaCppBackend:
         blocked = code_integrity_block_reason(returncode) or code_integrity_block_reason(output)
         if blocked is not None:
             return code_integrity_user_message(binary or "the llama.cpp runtime", blocked)
+        # Ahead of every pattern below: the child said in plain words which of its own
+        # requirements it could not meet. Only reachable on `on`.
+        if _exact.is_exact_refusal(output):
+            _exact_line = next(
+                (
+                    line.strip()
+                    for line in (output or "").splitlines()
+                    if _exact.is_exact_refusal(line)
+                ),
+                "",
+            )
+            return (
+                "llama-server refused to start in exact concurrency, which is set to "
+                "'on'. "
+                + (_exact_line + " " if _exact_line else "")
+                + "Exact concurrency needs a unified KV cache, every layer offloaded to "
+                "CUDA, flash attention, an f16 KV cache and no context shift or cache "
+                "reuse. Set it to 'auto' to load without it when the server refuses, or "
+                "'off' to stop asking."
+            )
 
         # The dynamic loader kills llama-server before main(), so nothing below
         # matches and the fallback blames the file or memory instead. The Linux
@@ -19137,6 +19638,7 @@ class LlamaCppBackend:
                 raise LlamaServerNotFoundError(LLAMA_SERVER_NOT_FOUND_DETAIL)
 
             server_caps = _launch_caps(binary)
+            self._server_preempts_kv = bool(server_caps.get("supports_preempt_ram"))
 
             # Outside ``self._lock`` so /unload, /cancel, /status aren't
             # blocked. ``unload_model`` also records the kill, so the
@@ -19152,6 +19654,7 @@ class LlamaCppBackend:
                     return False
 
                 self._port = self._find_free_port()
+                self._stamp_admission_key()
 
                 # Select GPU(s) from model size + estimated KV cache. Seed
                 # safe defaults before probing so the except path has valid
@@ -22088,6 +22591,7 @@ class LlamaCppBackend:
                     cmd.extend(["--ubatch-size", str(n_ubatch)])
 
                 server_caps = _launch_caps(binary)
+                self._server_preempts_kv = bool(server_caps.get("supports_preempt_ram"))
 
                 # Before the extras, like the batch pair: a hand-typed flag still
                 # last-wins over the control. Each is gated on the capability
@@ -23042,6 +23546,94 @@ class LlamaCppBackend:
                         draft_mla = self._draft_kv_symmetry(cmd),
                     )
 
+                # The mode needs a unified cache, and adding one keeps a single-slot load from being refused.
+                _exact_setting = _exact.resolve_exact_setting(intent.exact_concurrency)
+                _exact_wanted = _exact.wants_exact(_exact_setting)
+                if _exact_wanted and _flash_attn_known_off and _exact_setting == _exact.EXACT_AUTO:
+                    # V is left transposed without flash attention and the paged pool refuses
+                    # that. Under `on` the child still gets the variable and refuses it itself.
+                    _exact_wanted = False
+                if _exact_wanted:
+                    # Known before launch, so `auto` does not start the mode only to report it unavailable.
+                    _exact_blocker = _exact_auto_blocker(
+                        _exact_setting,
+                        list(cmd) + [str(a) for a in (extra_args or ())],
+                        os.environ,
+                    )
+                    if _exact_blocker is not None:
+                        _exact_wanted = False
+                        self._record_load_warning(
+                            "Exact concurrency is set to 'auto' and is not started: "
+                            + _exact_blocker
+                            + ". A chat's output can differ depending on which other chats "
+                            "share the KV cache. Set it to 'on' to fail the load instead."
+                        )
+                self._exact_parking_short = None
+                self._exact_pool_unknown = False
+                if _exact_wanted:
+                    # Studio's line contradicts the mode in one place: --parallel 1 skips --kv-unified.
+                    _exact_added = self._exact_missing_launch_flags(cmd, server_caps, env = None)
+                    if _exact_added:
+                        cmd.extend(_exact_added)
+                        logger.info(
+                            "Exact concurrency: added %s, which the paged KV pool requires.",
+                            " ".join(_exact_added),
+                        )
+                    # A park that outgrows the host budget is re-prefilled, which is not
+                    # byte-identical on CUDA, so the budget has to hold the whole pool. Only when
+                    # nothing named one, and not when the stand-down below switches parking off.
+                    if server_caps.get("supports_preempt_ram") and not _child_parking_stands_down(
+                        list(cmd) + [str(a) for a in (extra_args or ())], os.environ
+                    ):
+                        try:
+                            _exact_kv_bytes = _kv_bytes(effective_ctx)
+                        except Exception:
+                            _exact_kv_bytes = 0
+                        _exact_budget = _exact_parking_budget_mib(
+                            _exact_kv_bytes,
+                            args = list(cmd) + [str(a) for a in (extra_args or ())],
+                            env = os.environ,
+                        )
+                        if _exact_budget is not None:
+                            cmd.extend(["--preempt-ram", str(_exact_budget)])
+                            logger.info(
+                                "Exact concurrency: --preempt-ram %d holds the whole %d MiB pool, "
+                                "so no park has to be re-prefilled.",
+                                _exact_budget,
+                                _exact_kv_bytes // (1024 * 1024),
+                            )
+                        # An auto-fit context leaves the pool unknown, so no budget is sized: the
+                        # server's default is judged after launch off the context it chose. A
+                        # budget guessed here survives every abandoned attempt, parking unlimited.
+                        self._exact_pool_unknown = _exact_kv_bytes <= 0
+                        # A budget somebody named is kept, and judged: below the pool the guarantee is gone.
+                        self._exact_parking_short = _exact_parking_shortfall_mib(
+                            _exact_kv_bytes,
+                            args = list(cmd) + [str(a) for a in (extra_args or ())],
+                            env = os.environ,
+                        )
+                        if self._exact_parking_short is not None:
+                            _named, _pool, _need = self._exact_parking_short
+                            self._record_load_warning(
+                                f"Exact concurrency was requested, but --preempt-ram {_named} "
+                                f"MiB cannot hold the {_pool} MiB KV pool, so a parked chat that "
+                                "outgrows it is re-prefilled rather than restored, which is not "
+                                f"byte-identical. Raise it to at least {_need} MiB. The load will "
+                                "run without exact concurrency, or fail, depending on the setting."
+                            )
+                            if _exact_setting == _exact.EXACT_AUTO:
+                                # Known now, so the child does not start the mode for it.
+                                _exact_wanted = False
+                    # The user's extras are appended last and win by last-arg, so name the flag ourselves.
+                    _exact_conflicts = _exact.contradicting_args(extra_args)
+                    if _exact_conflicts:
+                        self._record_load_warning(
+                            "Exact concurrency was requested, but the extra arguments "
+                            "pass " + ", ".join(_exact_conflicts) + ", which llama-server "
+                            "cannot combine with it. The load will run without exact "
+                            "concurrency, or fail, depending on the setting."
+                        )
+
                 kv_cache_unified = _kv_unified_from_args(cmd)
 
                 logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
@@ -23065,6 +23657,13 @@ class LlamaCppBackend:
                     logger.info(
                         "Model Memory owns placement; dropped inherited %s",
                         ", ".join(_mem_scrubbed),
+                    )
+                if _stand_down_child_parking(env, cmd):
+                    logger.info(
+                        "Studio's preemption is off or Studio is the one pausing (%s, %s), so "
+                        "the server's own parking is off as well",
+                        _preemption.PREEMPT_ENV,
+                        _preemption.PREEMPT_MODE_ENV,
                     )
                 # Same reasoning one level up: a flag validate_extra_args refuses has
                 # an env twin llama.cpp reads before argv, so denying the token alone
@@ -23673,6 +24272,16 @@ class LlamaCppBackend:
                 # fallback). A per-call flag left those successes unrecorded.
                 _did_rocm_retry = False
 
+                # The child's own variable (unslothai/llama.cpp#194), the whole interface. Taken
+                # back OUT when the setting resolved to off, or an inherited value outvotes it.
+                if _exact.apply_child_env(env, on = _exact_wanted):
+                    logger.info(
+                        "Exact concurrency %s: %s=%s on llama-server",
+                        _exact_setting,
+                        _exact.CHILD_ENV,
+                        env.get(_exact.CHILD_ENV, "<unset>"),
+                    )
+
                 def _drop_fit_load_mode_for_no_flash(fa_cmd: list) -> list:
                     """The fit's ``--load-mode none`` off a --flash-attn off respawn.
 
@@ -23734,7 +24343,9 @@ class LlamaCppBackend:
                         run_cmd = self._drop_tensor_spill(run_cmd, label.lstrip("-") or "retry")
                     _fit_retry_allowed = self._fit_off_retry_eligible(run_cmd, use_fit)
                     _did_fit_retry = False
-                    for _spawn_attempt in (0, 1, 2):
+                    _did_exact_retry = False
+                    # Four, not three: every rung is one-shot, so the bound is the rungs plus the first launch.
+                    for _spawn_attempt in (0, 1, 2, 3):
                         # Defensive kill: drop an orphan Popen a concurrent load may
                         # have stored before we overwrite the reference (#5161).
                         # Also reaps the crashed first attempt on the retry pass.
@@ -23828,6 +24439,23 @@ class LlamaCppBackend:
                             _startup_output
                         ) or self._is_tensor_quant_kv_unsupported(_startup_output)
                         _hip_rocr_mismatch = self._is_bundled_hip_rocr_mismatch(_startup_output)
+                        # Ahead of every other rung: the server NAMED the mode as the reason it
+                        # would not start, and that is also the only detection there is.
+                        if not _did_exact_retry and self._drop_exact_after_refusal(
+                            env,
+                            setting = _exact_setting,
+                            crashed = _startup_crashed,
+                            output = _startup_output,
+                        ):
+                            _did_exact_retry = True
+                            logger.warning(
+                                "llama-server refused exact concurrency (exit code %s); "
+                                "retrying once without it, as the setting is auto. "
+                                "Crash log: %s",
+                                self._process.returncode,
+                                self._llama_log_path,
+                            )
+                            continue
                         # No fit retry reaches it, and the rung below needs this
                         # launch's argv. Whole buffer: it arrives with a backtrace.
                         _capability_crash = _tensor_capability_crash or self._is_kv_unified_refused(
@@ -24728,6 +25356,7 @@ class LlamaCppBackend:
                                 "Dropped inherited LLAMA_ARG_FLASH_ATTN for the "
                                 "--flash-attn off retry."
                             )
+                        _drop_exact_for_no_flash(env, _exact_setting)
                         _fa_cmd = _drop_fit_load_mode_for_no_flash(_fa_cmd)
                         _flash_attn_known_off = True
                         cmd = _fa_cmd
@@ -24801,6 +25430,7 @@ class LlamaCppBackend:
                                 "Dropped inherited LLAMA_ARG_FLASH_ATTN for the "
                                 "--flash-attn off retry."
                             )
+                        _drop_exact_for_no_flash(env, _exact_setting)
                         _fa_cmd = _drop_fit_load_mode_for_no_flash(_fa_cmd)
                         _flash_attn_known_off = True
                         cmd = _fa_cmd
@@ -25212,6 +25842,102 @@ class LlamaCppBackend:
                 self._commit_effective_parallel_slots(n_parallel)
                 self._swa_full = swa_full
                 self._kv_cache_unified = kv_cache_unified
+                # A `--preempt-ram 0` on the launch line or in the child's environment switches the
+                # server's parking off, and then the build's flag alone is no reason to stand down.
+                if _preempt_ram_disabled_in(_last_spawn_cmd or cmd, env = env):
+                    self._server_preempts_kv = False
+                # Read off the argv that LAUNCHED and the env it launched with, not the intent: respawns rewrite them.
+                self._requested_exact_concurrency = _exact_setting
+                _exact_short = getattr(self, "_exact_parking_short", None)
+                if (
+                    _exact_short is None
+                    and getattr(self, "_exact_pool_unknown", False)
+                    and _exact.wants_exact(_exact_setting)
+                ):
+                    # The pool could not be sized before launch, so the child ran on its default.
+                    # Size it now off the context the server chose (under a unified cache the
+                    # per-slot n_ctx is the whole pool) and judge that default.
+                    try:
+                        _fitted_ctx = int(self._query_server_n_ctx() or 0)
+                    except Exception:
+                        _fitted_ctx = 0
+                    try:
+                        _fitted_bytes = _kv_bytes(_fitted_ctx) if _fitted_ctx > 0 else 0
+                    except Exception:
+                        _fitted_bytes = 0
+                    if _fitted_bytes > 0:
+                        _exact_short = _exact_parking_shortfall_mib(
+                            _fitted_bytes,
+                            args = _last_spawn_cmd or cmd,
+                            env = env,
+                            default_mib = _PREEMPT_RAM_DEFAULT_MIB,
+                        )
+                    else:
+                        _exact_short = (_PREEMPT_RAM_DEFAULT_MIB, 0, 0)
+                    self._exact_parking_short = _exact_short
+                # The server's own answer, not the launch's intent. See the helper.
+                _exact_running = self._server_reports_exact_concurrency()
+                self._exact_concurrency = self._exact_state_after_launch(
+                    setting = _exact_setting,
+                    env = env,
+                    args = _last_spawn_cmd or cmd,
+                    supports_exact = _exact_running,
+                    server_parks = self.server_preempts_kv,
+                    parking_holds = _exact_short is None,
+                )
+                if self._exact_concurrency == _exact.EXACT_STATE_UNAVAILABLE:
+                    if not self.server_preempts_kv:
+                        _exact_why = (
+                            " Studio would be the one pausing chats here, with the server's "
+                            "parking off or UNSLOTH_LLAMA_PREEMPT_MODE=studio, and a chat Studio "
+                            "resumes is re-prefilled rather than restored."
+                        )
+                    elif _exact_short is not None and _exact_short[1] <= 0:
+                        _exact_why = (
+                            " The KV pool could not be sized after the auto-fit, so the "
+                            "parking budget cannot be checked; set an explicit context."
+                        )
+                    elif _exact_short is not None:
+                        _exact_why = (
+                            f" --preempt-ram {_exact_short[0]} MiB cannot hold the "
+                            f"{_exact_short[1]} MiB KV pool; raise it to at least "
+                            f"{_exact_short[2]} MiB, or set an explicit context."
+                        )
+                    else:
+                        _exact_why = ""
+                    if _exact_running:
+                        # The mode is up and its decode cost paid, but a park the budget
+                        # cannot hold is re-prefilled, which is not exact.
+                        _exact_what = (
+                            "this llama-server runs the mode, but it cannot hold every "
+                            "park, and a chat re-prefilled after a park it could not hold "
+                            "can differ depending on which other chats share the KV cache."
+                        )
+                    else:
+                        _exact_what = (
+                            "this llama-server came up without it: either this build does "
+                            "not implement the mode, or the launch it recovered to has no "
+                            "flash attention or no unified KV cache, which the mode "
+                            "requires, so a chat's output can differ depending on which "
+                            "other chats share the KV cache."
+                        )
+                    if _exact_setting == _exact.EXACT_ON:
+                        # `on` means require it, and a server that cannot keep it is what `on` rules out.
+                        self._kill_process()
+                        self._healthy = False
+                        _raise_terminal_load_failure(
+                            "Exact concurrency is set to 'on', but "
+                            + _exact_what
+                            + _exact_why
+                            + " Set exact concurrency to 'auto' to load anyway, or 'off' "
+                            "to stop asking for it."
+                        )
+                    self._record_load_warning(
+                        "Exact concurrency was requested, but "
+                        + _exact_what
+                        + _exact_why
+                        + " Set exact concurrency to 'on' to fail the load instead."
+                    )
                 # Re-derived from the slot count that LAUNCHED, not the one the sizing
                 # pass saw. The drafter drop and the non-MTP retry both hand slots back
                 # after the batch flag is emitted, and this is recorded next to
@@ -26219,6 +26945,9 @@ class LlamaCppBackend:
             self._prompt_cache_disabled = False
             self._swa_full = False
             self._kv_cache_unified = False
+            self._server_preempts_kv = False
+            self._requested_exact_concurrency = _exact.EXACT_OFF
+            self._exact_concurrency = _exact.EXACT_STATE_OFF
             self._memory_state = None
             self._memory_policy_active = False
             self._memory_mlock_applicable = True
@@ -28084,6 +28813,12 @@ class LlamaCppBackend:
         except Exception:
             return None
 
+    def _server_reports_exact_concurrency(self) -> bool:
+        """Whether the running llama-server says it runs exact concurrency: ``/props`` carries
+        ``exact_concurrency`` from unslothai/llama.cpp#197 on. A build ignoring the variable is silent."""
+        props = self._query_server_props() or {}
+        return props.get("exact_concurrency") is True
+
     def _query_server_n_ctx(self) -> Optional[int]:
         """Per-slot context llama-server actually allocated, from ``/props``.
 
@@ -28201,7 +28936,13 @@ class LlamaCppBackend:
     # ── Generation (proxy to llama-server) ────────────────────────
 
     @contextlib.contextmanager
-    def _open_stream(self, url: str, payload: dict, cancel_event):
+    def _open_stream(
+        self,
+        url: str,
+        payload: dict,
+        cancel_event,
+        preempt_event = None,
+    ):
         """Open a streaming POST to llama-server, retrying through prefill, and
         yield ``(response, first_token_deadline)`` once a 200 lands. Owns the
         httpx.Client + auth headers for the stream's lifetime; raises
@@ -28214,6 +28955,9 @@ class LlamaCppBackend:
             trust_env = False,
         ) as client:
             first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
+            # A swap-capable server that predates the stream notices is silent while it holds
+            # a slot parked, so the read wrapper asks before calling that silence a stall.
+            stall_grace = self._server_park_grace if self.server_preempts_kv else None
             with self._stream_with_retry(
                 client,
                 url,
@@ -28221,6 +28965,9 @@ class LlamaCppBackend:
                 cancel_event,
                 headers = self._auth_headers,
                 first_token_deadline = first_token_deadline,
+                # Only when set, so a test double written against the old signature keeps working.
+                **({} if preempt_event is None else {"preempt_event": preempt_event}),
+                **({} if stall_grace is None else {"stall_grace": stall_grace}),
             ) as response:
                 if response.status_code != 200:
                     error_body = response.read().decode()
@@ -28287,8 +29034,12 @@ class LlamaCppBackend:
         stall_timeout_s: float = _DEFAULT_STREAM_STALL_TIMEOUT_S,
         first_token_deadline: Optional[float] = None,
         post_first_chunk_read_timeout_s: Optional[float] = _DEFAULT_STREAM_STALL_TIMEOUT_S,
+        preempt_event = None,
     ) -> Generator[str, None, None]:
-        """Iterate a stream while polling cancel and stall timeouts."""
+        """Iterate a stream while polling cancel and stall timeouts. A preempt raises, so the
+        caller can tell "paused to free KV" from "the user stopped this" and resume."""
+        user_cancel = cancel_event
+        cancel_event = _interrupt_event(cancel_event, preempt_event)
         text_iter = response.iter_text()
         if first_token_deadline is None:
             first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
@@ -28298,6 +29049,14 @@ class LlamaCppBackend:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 response.close()
+                # A user who pressed Stop during a pause still meant Stop, so cancel wins.
+                if (
+                    preempt_event is not None
+                    and preempt_event.is_set()
+                    and not (user_cancel is not None and user_cancel.is_set())
+                ):
+                    logger.info("llama preemption stream-interrupted: raising from iter")
+                    raise _preemption.LlamaStreamPreempted
                 return
             try:
                 if last_chunk_at is None:
@@ -28312,6 +29071,11 @@ class LlamaCppBackend:
                     while match := re.search(r"(?:\r\n|\r|\n){2}", prefill_sse_buffer):
                         event = prefill_sse_buffer[: match.start()]
                         prefill_sse_buffer = prefill_sse_buffer[match.end() :]
+                        if event.startswith((": preempt", ": resumed")):
+                            # Parked by the server before its first token, and the parked
+                            # keepalive says it is alive: a wait is not a stall.
+                            first_token_deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
+                            continue
                         if LlamaCppBackend._sse_event_has_generated_output(event):
                             starts_output = True
                             prefill_sse_buffer = ""
@@ -28386,6 +29150,8 @@ class LlamaCppBackend:
         cancel_event: threading.Event,
         response: Optional["httpx.Response"] = None,
         poll_s: float = 0.2,
+        preempt_event = None,
+        stall_grace: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Wrap the httpcore stream so the reader interrupts its own blocked recv() on cancel.
 
@@ -28394,8 +29160,15 @@ class LlamaCppBackend:
         (plain or TLS); slice timeouts are swallowed so a slow-but-alive stream survives.
         httpcore snapshots request.extensions["timeout"]["read"] once at body start, so
         given ``response`` we re-read the live value per call to honor the post-first-token
-        stall timeout instead of the long prefill timeout."""
+        stall timeout instead of the long prefill timeout.
+
+        ``preempt_event`` aborts the same way, indistinguishable to the read. ``stall_grace``, asked
+        at each read timeout, waits again up to ``_SERVER_PARK_STALL_CAP_S``: a raised iterator is done.
+        """
         import httpcore
+
+        if preempt_event is not None:
+            cancel_event = _interrupt_event(cancel_event, preempt_event)
 
         def _live_read_timeout() -> Optional[float]:
             if response is None:
@@ -28426,7 +29199,37 @@ class LlamaCppBackend:
                 ):
                     live = _live_read_timeout()
                     effective = live if live is not None else timeout
-                    deadline = None if effective is None else time.monotonic() + effective
+                    started = time.monotonic()
+                    deadline = None if effective is None else started + effective
+
+                    # The grace starts at the deadline, not at the read; each retry is bounded by what is left.
+                    crossed_at = None
+
+                    def _parked_by_the_server():
+                        """The next deadline while the server holds the slot parked, else None.
+                        Asked only at the deadline, so an idle stream costs nothing."""
+                        nonlocal crossed_at
+                        if stall_grace is None or effective is None:
+                            return None
+                        now = time.monotonic()
+                        if crossed_at is None:
+                            crossed_at = now
+                        grace_left = crossed_at + _SERVER_PARK_STALL_CAP_S - now
+                        if grace_left <= 0:
+                            return None
+                        try:
+                            parked = bool(stall_grace())
+                        except Exception:
+                            parked = False
+                        if not parked:
+                            return None
+                        logger.info(
+                            "llama stream silent for %.0fs with a slot parked by the "
+                            "server; waiting",
+                            now - started,
+                        )
+                        return now + min(effective, grace_left)
+
                     while True:
                         if cancel_event.is_set():
                             raise httpcore.ReadError("stream cancelled by user")
@@ -28435,12 +29238,18 @@ class LlamaCppBackend:
                         else:
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
+                                deadline = _parked_by_the_server()
+                                if deadline is not None:
+                                    continue
                                 raise httpcore.ReadTimeout("read operation timed out")
                             step = min(poll_s, remaining)
                         try:
                             return _orig(max_bytes, timeout = step)
                         except httpcore.ReadTimeout:
                             if deadline is not None and time.monotonic() >= deadline:
+                                deadline = _parked_by_the_server()
+                                if deadline is not None:
+                                    continue
                                 raise
                             continue  # slow but alive: keep reading
 
@@ -28458,17 +29267,28 @@ class LlamaCppBackend:
         cancel_event: Optional[threading.Event] = None,
         headers: Optional[dict] = None,
         first_token_deadline: Optional[float] = None,
+        preempt_event = None,
+        stall_grace: Optional[Callable[[], bool]] = None,
     ):
-        """Open one streaming POST and let cancel interrupt prefill or reads."""
-        if cancel_event is not None and cancel_event.is_set():
-            raise _LlamaStreamCancelled
+        """Open one streaming POST and let cancel interrupt prefill or reads. A preempt raises
+        ``LlamaStreamPreempted`` instead; cancel wins when both are set."""
+
+        def _raise_interrupt():
+            if cancel_event is not None and cancel_event.is_set():
+                raise _LlamaStreamCancelled
+            logger.info("llama preemption stream-interrupted: raising from _raise_interrupt")
+            raise _preemption.LlamaStreamPreempted
+
+        _interrupt = _interrupt_event(cancel_event, preempt_event)
+        if _interrupt is not None and _interrupt.is_set():
+            _raise_interrupt()
 
         _cancel_closed = threading.Event()
         _response_ref: list = [None]
 
         def _cancel_watcher():
             while not _cancel_closed.is_set():
-                if cancel_event.wait(timeout = 0.3):
+                if _interrupt.wait(timeout = 0.3):
                     while not _cancel_closed.is_set():
                         r = _response_ref[0]
                         try:
@@ -28484,7 +29304,7 @@ class LlamaCppBackend:
                     return
 
         watcher = None
-        if cancel_event is not None:
+        if _interrupt is not None:
             watcher = threading.Thread(target = _cancel_watcher, daemon = True, name = "prefill-cancel")
             watcher.start()
 
@@ -28506,19 +29326,25 @@ class LlamaCppBackend:
                 headers = headers,
             ) as response:
                 _response_ref[0] = response
-                if cancel_event is not None:
+                if _interrupt is not None:
                     # Portable mid-stream cancel: the reader polls cancel itself, so
                     # Stop interrupts a stalled read where the watcher's Windows socket
                     # shutdown does not. Pass response to honor the live stall timeout.
-                    LlamaCppBackend._install_cancel_aware_read(client, cancel_event, response)
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _LlamaStreamCancelled
+                    LlamaCppBackend._install_cancel_aware_read(
+                        client,
+                        cancel_event,
+                        response,
+                        **({} if preempt_event is None else {"preempt_event": preempt_event}),
+                        **({} if stall_grace is None else {"stall_grace": stall_grace}),
+                    )
+                if _interrupt is not None and _interrupt.is_set():
+                    _raise_interrupt()
                 yield response
                 return
         except (httpx.RequestError, RuntimeError):
             # Response was closed by the cancel watcher
-            if cancel_event is not None and cancel_event.is_set():
-                raise _LlamaStreamCancelled
+            if _interrupt is not None and _interrupt.is_set():
+                _raise_interrupt()
             raise
         finally:
             _cancel_closed.set()
@@ -28604,11 +29430,14 @@ class LlamaCppBackend:
                     f"llama-server for '{self._model_identifier}' exited "
                     f"(code {proc.returncode}); respawning to recover the session"
                 )
+                self._respawn_replay = True
                 try:
                     started = bool(self.load_model(intent))
                 except Exception as exc:
                     logger.error(f"Failed to respawn llama-server: {exc}")
                     return False
+                finally:
+                    self._respawn_replay = False
                 if started and self._unload_epoch != epoch:
                     # An unload landed mid-reload. load_model cleared _cancel_event on
                     # the way in, so the epoch is the only surviving evidence; undo the
@@ -28624,6 +29453,7 @@ class LlamaCppBackend:
         payload: dict,
         cancel_event,
         on_respawn: Optional[Callable[[], None]] = None,
+        preempt_event = None,
     ):
         """Open a chat stream, respawning a dead llama-server once before streaming.
 
@@ -28645,7 +29475,12 @@ class LlamaCppBackend:
             response_opened = False
             try:
                 url = f"{self.base_url}/v1/chat/completions"
-                with self._open_stream(url, payload, cancel_event) as opened:
+                with self._open_stream(
+                    url,
+                    payload,
+                    cancel_event,
+                    **({} if preempt_event is None else {"preempt_event": preempt_event}),
+                ) as opened:
                     response_opened = True
                     yield opened
                     return
@@ -28672,6 +29507,7 @@ class LlamaCppBackend:
         top_k: int = 20,
         min_p: float = 0.01,
         max_tokens: Optional[int] = None,
+        admission_output_allowance: Optional[int] = None,
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
@@ -28692,6 +29528,17 @@ class LlamaCppBackend:
         thread_id: Optional[str] = None,
         tools_withheld: bool = False,
         _allow_respawn_retry: bool = True,
+        # Preemption on the NON-tool path. Both default to None, so existing callers are unaffected.
+        preempt_event = None,
+        preempt_policy = None,
+        _preempt_resumes: int = 0,
+        # What earlier attempts of this response decoded, added back into the usage reported.
+        _preempt_earlier_completion_tokens: int = 0,
+        # Reasoning earlier attempts produced: a reasoning-only fallback is built from this alone.
+        _preempt_earlier_reasoning: str = "",
+        # Running token count for THIS attempt, so the sweep sees n_i grow and evicts in time.
+        # Batched by _TOKEN_REPORT_EVERY, must be cheap, must not raise.
+        on_tokens: Optional[Callable[[int], None]] = None,
     ) -> Generator[Union[str, dict], None, None]:
         """
         Send a chat completion to llama-server and stream tokens back.
@@ -28706,12 +29553,14 @@ class LlamaCppBackend:
 
         from core.inference.chat_template_helpers import (
             neutralize_control_markup_in_messages,
-            trailing_assistant_text,
+            trailing_assistant_resumable,
         )
 
         openai_messages = self._build_openai_messages(messages, image_b64)
-        continue_final_message = continue_final_message and bool(
-            trailing_assistant_text(openai_messages)
+        # Resumable, not merely text: a pause inside a thought puts it back as
+        # `reasoning_content` with no prose, and a text-only gate re-issued the turn from scratch.
+        continue_final_message = continue_final_message and trailing_assistant_resumable(
+            openai_messages
         )
 
         payload = {
@@ -28755,6 +29604,10 @@ class LlamaCppBackend:
             if max_tokens is not None
             else (self._effective_context_length or _DEFAULT_MAX_TOKENS_FLOOR)
         )
+        # What admission actually reserved. Applied to the wire only: `max_tokens` stays the
+        # caller's figure so `_loop_budget_left` keeps answering "they set no cap".
+        if admission_output_allowance is not None:
+            payload["max_tokens"] = min(payload["max_tokens"], admission_output_allowance)
         if context_overflow == "truncate_oldest" and self._effective_context_length:
             try:
                 _before_fit = openai_messages
@@ -28862,6 +29715,15 @@ class LlamaCppBackend:
 
         url = f"{self.base_url}/v1/chat/completions"
         cumulative = ""
+        # Prose alone, without the <think> markup `cumulative` carries for display. Replaying
+        # `cumulative` sent a paused thought back as "<think>..." in the answer, tag and all.
+        content_text = ""
+        # Per ATTEMPT, not per turn: a resumed attempt restarts at zero and the controller
+        # re-baselines on note_replayed, so a running total would count the partial twice.
+        _tokens_this_stream = 0
+        # Bound out here because the preempt handler reads it and the pause can arrive before the
+        # stream is open, where the inner `reasoning_text = ""` has not run. That one stays.
+        reasoning_text = ""
         in_thinking = False
         _stream_done = False
         _metadata_usage = None
@@ -28869,7 +29731,14 @@ class LlamaCppBackend:
         _metadata_finish_reason = None
 
         try:
-            with self._open_stream(url, payload, cancel_event) as (
+            with self._open_stream(
+                url,
+                payload,
+                cancel_event,
+                # Conditional, never `preempt_event = preempt_event`: a monkeypatched double
+                # with the old signature must never be handed the kwarg.
+                **({} if preempt_event is None else {"preempt_event": preempt_event}),
+            ) as (
                 response,
                 first_token_deadline,
             ):
@@ -28881,6 +29750,7 @@ class LlamaCppBackend:
                     response,
                     cancel_event,
                     first_token_deadline = first_token_deadline,
+                    **({} if preempt_event is None else {"preempt_event": preempt_event}),
                 ):
                     buffer += raw_chunk
                     while "\n" in buffer:
@@ -28903,7 +29773,7 @@ class LlamaCppBackend:
                                     # the main response, not a thinking block.
                                     cumulative = _finalize_reasoning_only_cumulative(
                                         cumulative,
-                                        reasoning_text,
+                                        _preempt_earlier_reasoning + reasoning_text,
                                         _metadata_finish_reason,
                                         promote_reasoning_only,
                                     )
@@ -28911,6 +29781,12 @@ class LlamaCppBackend:
                                     yield cumulative
                             _stream_done = True
                             break  # exit inner while
+                        if line in _SERVER_PARK_COMMENTS:
+                            # llama-server parked this slot or restored it; nothing here is torn down.
+                            _park_event = self._server_park_event(line, preempt_policy)
+                            if _park_event is not None:
+                                yield _park_event
+                            continue
                         if not line.startswith("data: "):
                             continue
 
@@ -28944,6 +29820,18 @@ class LlamaCppBackend:
                                 if _fr:
                                     _metadata_finish_reason = _fr
 
+                                # The live n_i for THIS chat, the only thing that makes preemption
+                                # act: without it four chats grew to 16354 of a 16384 cache.
+                                _tokens_this_stream += 1
+                                if (
+                                    on_tokens is not None
+                                    and _tokens_this_stream % _TOKEN_REPORT_EVERY == 0
+                                ):
+                                    try:
+                                        on_tokens(_tokens_this_stream)
+                                    except Exception:
+                                        pass
+
                                 # Reasoning/thinking tokens: llama-server
                                 # sends these as "reasoning_content"; wrap
                                 # in <think> tags for the frontend parser.
@@ -28972,6 +29860,7 @@ class LlamaCppBackend:
                                 token = delta.get("content", "")
                                 if token:
                                     has_content_tokens = True
+                                    content_text += token
                                     if in_thinking:
                                         cumulative += "</think>"
                                         in_thinking = False
@@ -28986,6 +29875,11 @@ class LlamaCppBackend:
                     _metadata_usage = _backfill_usage_from_timings(
                         _metadata_usage, _metadata_timings
                     )
+                    # Every earlier attempt of this response, added back: llama-server counts
+                    # only the request it served.
+                    _metadata_usage = _usage_with_earlier_attempts(
+                        _metadata_usage, _preempt_earlier_completion_tokens
+                    )
                     yield {
                         "type": "metadata",
                         # Never None: a finish-only metadata event (no usage,
@@ -28996,6 +29890,160 @@ class LlamaCppBackend:
                         "finish_reason": _metadata_finish_reason,
                     }
 
+        except _preemption.LlamaStreamPreempted:
+            # Paused to free KV, not a cancel. The checkpoint is built from the LIVE
+            # accumulators: an aborted attempt never writes a trailing assistant row.
+            if preempt_policy is None:
+                return
+            checkpoint = _preemption.StreamCheckpoint(
+                visible_text = content_text,
+                reasoning_text = reasoning_text,
+                charged_tokens = self._preempt_charge(
+                    _metadata_usage,
+                    _metadata_timings,
+                    _tokens_this_stream,
+                    content_text,
+                    reasoning_text,
+                ),
+                resumes = _preempt_resumes + 1,
+                reason = "kv-pressure",
+            )
+            # Hands the lease back. Only after the upstream response is closed, which the
+            # `with` above has done by the time this runs.
+            preempt_policy.on_preempted(checkpoint)
+            # Tell the client it is paused, not broken. Yielded AFTER on_preempted, so the signal
+            # cannot arrive before the lease it describes has gone back.
+            yield {"type": "preempt", "state": "paused"}
+
+            def _finish_after_giving_up(notice = True):
+                """End the turn the way a client can read: the notice saying WHY it stopped, then
+                terminal metadata carrying `length`; without the second the caller saw no finish
+                reason, no error and no text. No notice when the caller's own cap ended it."""
+                if notice:
+                    yield _preempt_gave_up_event(self._effective_context_length, max_tokens)
+                _gave_up_usage = _backfill_usage_from_timings(_metadata_usage, _metadata_timings)
+                # The aborted attempt never receives a final usage chunk, so without this a
+                # first-attempt give-up reported zero completion tokens for a turn with text.
+                if not (_gave_up_usage or {}).get("completion_tokens") and _tokens_this_stream:
+                    _gave_up_usage = {
+                        **(_gave_up_usage or {}),
+                        "completion_tokens": _tokens_this_stream,
+                    }
+                _gave_up_usage = _usage_with_earlier_attempts(
+                    _gave_up_usage, _preempt_earlier_completion_tokens
+                )
+                yield {
+                    "type": "metadata",
+                    "usage": _gave_up_usage or {},
+                    "timings": _metadata_timings,
+                    # Not the reason the aborted stream happened to leave behind. The turn is
+                    # incomplete and continuable, and `length` is what says so.
+                    "finish_reason": "length",
+                }
+
+            if _preempt_resumes + 1 > _preemption.DEFAULT_MAX_PREEMPT_RESUMES:
+                logger.warning(
+                    "llama preemption giving up after %s resumes on a non-tool chat",
+                    _preempt_resumes,
+                )
+                yield from _finish_after_giving_up()
+                return
+            resumed_p = yield from _await_resume(preempt_policy, cancel_event)
+            if not resumed_p:
+                # The room never came back. Ending here leaves the client the partial it was
+                # streamed, but it must SAY so or it looks like a model answering with silence.
+                logger.info(
+                    "llama preemption gave up waiting for room; finishing the turn with "
+                    "what it has and telling the client"
+                )
+                yield from _finish_after_giving_up()
+                return
+            # Tell the controller this one is decoding again, or the participant stays PAUSED in
+            # the ledger while generating and its cells count as reclaimable.
+            preempt_policy.on_resumed()
+            # Clears the paused line, paired with the yield above.
+            yield {"type": "preempt", "state": "resumed"}
+            resumed = [dict(message) for message in messages]
+            continues = self._assemble_preempt_resume(
+                resumed, checkpoint, content_text, reasoning_text
+            )
+            # What this attempt decoded before it was cut, which was streamed. An aborted attempt
+            # never receives a final usage chunk, hence `timings` or the chunk tally.
+            _paused_usage = _backfill_usage_from_timings(_metadata_usage, _metadata_timings) or {}
+            _paused_completion_tokens = (
+                int(_paused_usage.get("completion_tokens") or 0) or _tokens_this_stream
+            )
+            # What this attempt showed, and whether it was showing a thought when it was cut.
+            _paused_prefix = cumulative
+            _paused_in_thinking = in_thinking
+            # `max_tokens` bounds NEW tokens and the resumed attempt starts a fresh count, so
+            # forwarding it lets a chat preempted n times emit (n+1) times its cap.
+            resume_max_tokens = max_tokens
+            if isinstance(max_tokens, int) and max_tokens > 0:
+                resume_max_tokens = max_tokens - checkpoint.charged_tokens
+                _window_p = self._effective_context_length or 0
+                if resume_max_tokens <= 0 and not (_window_p and max_tokens >= _window_p):
+                    # Spent: reopening the stream for one floored token went past the cap by
+                    # that token. The partial is on screen and the turn is continuable.
+                    logger.info("Resumed with the caller's output cap spent; ending the turn")
+                    yield from _finish_after_giving_up(notice = False)
+                    return
+                resume_max_tokens = max(1, resume_max_tokens)
+            # `continues` false means the pause landed before anything was produced, so the
+            # attempt is re-issued whole, though not as a fresh turn: dropping the flag on an
+            # attempt that was itself a resume made the whole essay appear twice.
+            _reissue_continues = continues or continue_final_message
+            for _resumed_item in self.generate_chat_completion(
+                messages = resumed if continues else messages,
+                image_b64 = image_b64,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = resume_max_tokens,
+                admission_output_allowance = admission_output_allowance,
+                repetition_penalty = repetition_penalty,
+                presence_penalty = presence_penalty,
+                frequency_penalty = frequency_penalty,
+                logit_bias = logit_bias,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = enable_thinking,
+                reasoning_effort = reasoning_effort,
+                preserve_thinking = preserve_thinking,
+                continue_final_message = _reissue_continues,
+                seed = seed,
+                promote_reasoning_only = promote_reasoning_only,
+                perf_callback = perf_callback,
+                reasoning_provenance = reasoning_provenance,
+                context_overflow = context_overflow,
+                context_policy = context_policy,
+                compaction_headroom_ratio = compaction_headroom_ratio,
+                thread_id = thread_id,
+                tools_withheld = tools_withheld,
+                _allow_respawn_retry = _allow_respawn_retry,
+                **({} if preempt_event is None else {"preempt_event": preempt_event}),
+                preempt_policy = preempt_policy,
+                on_tokens = on_tokens,
+                _preempt_resumes = _preempt_resumes + 1,
+                _preempt_earlier_completion_tokens = (
+                    _preempt_earlier_completion_tokens + _paused_completion_tokens
+                ),
+                _preempt_earlier_reasoning = _preempt_earlier_reasoning + reasoning_text,
+            ):
+                if not isinstance(_resumed_item, str):
+                    yield _resumed_item
+                    continue
+                # Snapshots are cumulative and every consumer diffs them, so the resumed one must
+                # extend this: restarted at "", the client read "Theigm" for "The Paradigm".
+                if _paused_in_thinking:
+                    if _resumed_item.startswith("<think>"):
+                        yield _paused_prefix + _resumed_item[len("<think>") :]
+                    else:
+                        yield _paused_prefix + "</think>" + _resumed_item
+                else:
+                    yield _paused_prefix + _resumed_item
+            return
         except _LlamaStreamCancelled:
             return
         except httpx.ConnectError as e:
@@ -29027,6 +30075,15 @@ class LlamaCppBackend:
                     top_k = top_k,
                     min_p = min_p,
                     max_tokens = retry_max_tokens,
+                    # The route still holds the optimistically priced lease and the participant,
+                    # so the retry keeps the clamp, signal, policy and token reports.
+                    admission_output_allowance = admission_output_allowance,
+                    **({} if preempt_event is None else {"preempt_event": preempt_event}),
+                    preempt_policy = preempt_policy,
+                    on_tokens = on_tokens,
+                    _preempt_resumes = _preempt_resumes,
+                    _preempt_earlier_completion_tokens = _preempt_earlier_completion_tokens,
+                    _preempt_earlier_reasoning = _preempt_earlier_reasoning,
                     repetition_penalty = repetition_penalty,
                     presence_penalty = presence_penalty,
                     frequency_penalty = frequency_penalty,
@@ -29065,6 +30122,67 @@ class LlamaCppBackend:
 
     # ── Tool-calling agentic loop ──────────────────────────────
 
+    @staticmethod
+    def _preempt_charged(visible: str, reasoning: str) -> int:
+        """A rough token count for what the aborted attempt produced, charged once so the resumed
+        attempt's `want` reflects the partial it carries back as prompt."""
+        return max(0, (len(visible or "") + len(reasoning or "")) // 4)
+
+    @staticmethod
+    def _preempt_charge(usage, timings, observed: int, visible: str, reasoning: str) -> int:
+        """What a pause charges the attempt it aborted: the OBSERVED count when the server sent one,
+        with four-characters-per-token as a floor. Zero skips `note_replayed`, leaving the cap unspent."""
+        counted = _backfill_usage_from_timings(usage, timings) or {}
+        return max(
+            int(counted.get("completion_tokens") or 0) or observed,
+            LlamaCppBackend._preempt_charged(visible, reasoning),
+        )
+
+    def _assemble_preempt_resume(
+        self, conversation, checkpoint, content_accum, reasoning_accum
+    ) -> bool:
+        """Put a paused attempt's partial back so the next one continues it. Returns whether the
+        conversation now ends on something continuable."""
+        from core.inference.chat_template_helpers import (
+            append_assistant_turn,
+            trailing_assistant_reasoning,
+        )
+
+        if checkpoint.has_resume_point():
+            # Unstripped, as the length continuation is: the replayed prefix has to match
+            # the text already streamed. A half-parsed tool call is dropped by not being
+            # appended, which is intended: nothing executed, so nothing is lost by asking
+            # again.
+            partial = {"role": "assistant", "content": content_accum}
+            # The thought that preceded the prose is the same turn's work: replayed as prose
+            # alone, the continuation is conditioned on a prefix that never produced it.
+            # `append_assistant_turn` merges it with a thought an earlier pause left trailing.
+            if reasoning_accum:
+                partial["reasoning_content"] = reasoning_accum
+            append_assistant_turn(conversation, partial, continue_final_message = True)
+            return True
+
+        if checkpoint.has_reasoning_resume_point():
+            # Preempted mid-thought, the common case on a reasoning model: carried as
+            # `reasoning_content` so the backend re-opens the thought, and merged, not appended.
+            prior = trailing_assistant_reasoning(conversation)
+            if prior:
+                conversation[-1] = {
+                    **conversation[-1],
+                    "reasoning_content": prior + reasoning_accum,
+                }
+            else:
+                conversation.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": reasoning_accum,
+                    }
+                )
+            return True
+
+        return False
+
     def generate_chat_completion_with_tools(
         self,
         messages: list[dict],
@@ -29074,12 +30192,15 @@ class LlamaCppBackend:
         top_k: int = 20,
         min_p: float = 0.01,
         max_tokens: Optional[int] = None,
+        admission_output_allowance: Optional[int] = None,
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         logit_bias: Optional[dict] = None,
         stop: Optional[list[str]] = None,
         cancel_event: Optional[threading.Event] = None,
+        preempt_event = None,
+        preempt_policy = None,
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
@@ -29111,6 +30232,9 @@ class LlamaCppBackend:
         # MAY BLOCK: recost_waiting waits for cache room. Safe at the top of a round,
         # where the previous round's request has completed.
         on_conversation_grew: Optional[Callable[[list], None]] = None,
+        # Called during generation with the running token count for THIS attempt, so the
+        # preemptor sees n_i grow. Batched by _TOKEN_REPORT_EVERY; cheap, and must not raise.
+        on_tokens: Optional[Callable[[int], None]] = None,
     ) -> Generator[dict, None, None]:
         """
         Agentic loop: let the model call tools, execute them, and continue.
@@ -29137,6 +30261,12 @@ class LlamaCppBackend:
             has_text_only_provisional_card,
             is_always_safe_tool,
             is_high_risk_tool_call,
+        )
+
+        # One switch for both loops. Imported here because this module is large and imported early.
+        from core.inference.studio_tool_loop import (
+            parallel_tool_calls_enabled as _parallel_tool_calls_enabled,
+            round_call_key as _round_call_key,
         )
 
         # "full" and bypass_permissions are the same switch, whichever arrives
@@ -29215,7 +30345,12 @@ class LlamaCppBackend:
         # retrieval call would actually prompt (ask mode); auto never gates the
         # safe search_knowledge_base tool, so retrieval must still run there.
         # off never prompts either, so it also keeps first-pass retrieval.
-        from core.inference.chat_template_helpers import forced_tool_name, trailing_assistant_text
+        from core.inference.chat_template_helpers import (
+            forced_tool_name,
+            trailing_assistant_reasoning,
+            trailing_assistant_resumable,
+            trailing_assistant_text,
+        )
 
         initial_forced_name = forced_tool_name(tool_choice)
         if initial_forced_name and initial_forced_name not in _gguf_active_tool_names(tools):
@@ -29329,6 +30464,22 @@ class LlamaCppBackend:
                 "finish_reason": finish_reason,
             }
 
+        def _folded_attempt(usage, timings):
+            """The interrupted attempt's usage and timings with its decode already in the
+            accumulators, so only the prompt side is left for `_build_metadata_event`. Folding and
+            then building with the whole reading counted one attempt's tokens and timings twice."""
+            _u = {
+                k: v
+                for k, v in (usage or {}).items()
+                if k not in ("completion_tokens", "total_tokens")
+            }
+            _t = {
+                k: v
+                for k, v in (timings or {}).items()
+                if k not in ("predicted_ms", "predicted_n", "predicted_per_second")
+            }
+            return (_u or None), (_t or None)
+
         def _flush_reasoning_and_buffer():
             """Close a live-streamed <think> block (or emit the buffered reasoning
             as one block if it never streamed), then append the held
@@ -29429,6 +30580,9 @@ class LlamaCppBackend:
         # fresh turn with thinking OFF, which is the one thing that guarantees the next turn
         # produces something visible.
         _length_continuations = 0
+        # One `context_truncated` per request from the declines below: the event is not
+        # idempotent on the client (`mergeContextTruncation` SUMS the counters).
+        _continuation_refusal_announced = False
         _effective_enable_thinking = enable_thinking
         # Dropped alongside it, because for the `reasoning_effort` style an explicit
         # effort WINS over enable_thinking: `_request_reasoning_kwargs` returns the
@@ -29558,6 +30712,23 @@ class LlamaCppBackend:
                 self._effective_context_length
             )
 
+        def _continuation_refusal_event() -> "Optional[dict]":
+            """The `context_truncated` the client needs when a continuation cannot be served: its own
+            `shouldAutoContinue` guard under-counts code and auto-continued a turn just declined."""
+            window = self._effective_context_length or 0
+            if not window:
+                return None
+            return {
+                "type": "context_truncated",
+                "fits": False,
+                # The prompt WAS sent; nothing was evicted out of it. Non-zero here raises the
+                # "This conversation was compacted" toast for an eviction that never happened.
+                "dropped_messages": 0,
+                "context_length": window,
+                # Same formula the preflight's fit reports, so both sides stay on one scale.
+                "prompt_target": prompt_budget(window, max_tokens),
+            }
+
         def _loop_budget_left(spent_this_attempt: int) -> "Optional[int]":
             """What remains of a cap the CALLER set, or None when they set none.
 
@@ -29586,6 +30757,23 @@ class LlamaCppBackend:
         _continuation_max_tokens: Optional[int] = None
         _continuation_credits = 0
         _MAX_CONTINUATION_CREDITS = _MAX_LENGTH_CONTINUATIONS * max(1, max_tool_iterations)
+        # A pause is not the model's doing, so it is counted separately: charging a resume to
+        # the tool budget would let contention shorten an agent run.
+        _preempt_resumes = 0
+        _MAX_PREEMPT_RESUMES = _preemption.DEFAULT_MAX_PREEMPT_RESUMES
+        if preempt_policy is None:
+            preempt_policy = _preemption.NullPreemptionPolicy()
+        # `context_truncated` is not idempotent on the client, and the per-iteration list is
+        # rebuilt by `continue`, so a truncation seen on a paused attempt rides across on this.
+        _carried_truncations: list[dict] = []
+        # Seeds the resumed attempt's display so its snapshots extend the paused one's. Every
+        # consumer diffs snapshots, and a shorter one loses the first emission.
+        _preempt_display_seed: Optional[tuple[str, str, bool]] = None
+        # A pause declined at the resume cap keeps its attempt: what it decoded is charged
+        # against the final pass's allowance, and its partial is the turn the pass extends.
+        _declined_charged = 0
+        _declined_continues = False
+        _declined_display: Optional[tuple[str, str, bool]] = None
         iteration = -1
         while True:
             iteration += 1
@@ -29596,7 +30784,7 @@ class LlamaCppBackend:
                     on_conversation_grew(conversation)
                 except Exception:  # accounting must never break a run in progress
                     logger.debug("tool loop recost failed", exc_info = True)
-            if iteration >= max_tool_iterations + _extra + _continuation_credits:
+            if iteration >= max_tool_iterations + _extra + _continuation_credits + _preempt_resumes:
                 break
             if cancel_event is not None and cancel_event.is_set():
                 return
@@ -29819,9 +31007,10 @@ class LlamaCppBackend:
                 payload["tool_choice"] = requested_choice
             if _reasoning_kw is not None:
                 payload["chat_template_kwargs"] = _reasoning_kw
-            # Re-checked per iteration: once a tool result is appended the partial is
-            # no longer trailing, so later turns are normal.
-            if continue_final_message and trailing_assistant_text(conversation):
+            # Re-checked per iteration: once a tool result is appended the partial is no longer
+            # trailing. `trailing_assistant_resumable`, not `trailing_assistant_text`: a chat
+            # preempted inside its thought has real work and an empty content string.
+            if continue_final_message and trailing_assistant_resumable(conversation):
                 payload["continue_final_message"] = True
                 payload["add_generation_prompt"] = False
             payload["max_tokens"] = (
@@ -29836,11 +31025,16 @@ class LlamaCppBackend:
             if _continuation_max_tokens is not None:
                 payload["max_tokens"] = _continuation_max_tokens
                 _continuation_max_tokens = None
+            # After the continuation override: every attempt, first or resumed, has to fit the
+            # share this run was admitted on.
+            if admission_output_allowance is not None:
+                payload["max_tokens"] = min(payload["max_tokens"], admission_output_allowance)
             if stop:
                 payload["stop"] = stop
             _apply_seeded_llama_request(payload, seed)
 
-            _respawn_truncations: list[dict] = []
+            _respawn_truncations: list[dict] = _carried_truncations
+            _carried_truncations = []
 
             def _refit_iteration_after_respawn() -> None:
                 nonlocal conversation
@@ -29938,6 +31132,9 @@ class LlamaCppBackend:
                 content_buffer = ""  # Raw content held during BUFFERING
                 content_accum = ""  # All content tokens (for tool parsing)
                 reasoning_accum = ""
+                # Bound here, not at the chunk loop: a pause can be raised before the first chunk
+                # and its handler charges what this attempt decoded, so an unreached name raises.
+                _tokens_this_stream = 0
                 _prov_entry = None
                 # Time each reasoning pass so final answers can replace tool timing.
                 _reasoning_started_at = None
@@ -29958,6 +31155,11 @@ class LlamaCppBackend:
                 _iter_finish_reason = None
                 _stream_done = False
                 _last_emitted = ""
+                if _preempt_display_seed is not None:
+                    # Resumed after a pause: continue the display where it stopped. Only the
+                    # display; the accumulators stay per attempt, the checkpoint being built on them.
+                    cumulative_display, _last_emitted, in_thinking = _preempt_display_seed
+                    _preempt_display_seed = None
                 # Provisional tool_start cards already shown, keyed by tool_call_id.
                 provisional_started_tool_calls: dict[str, str] = {}
                 resolved_provisional_tool_call_ids: set[str] = set()
@@ -30036,17 +31238,22 @@ class LlamaCppBackend:
                     payload,
                     cancel_event,
                     on_respawn = _refit_iteration_after_respawn,
+                    **({} if preempt_event is None else {"preempt_event": preempt_event}),
                 ) as (
                     response,
                     first_token_deadline,
                 ):
                     for truncation in _respawn_truncations:
                         yield {"type": "context_truncated", **truncation}
+                    # Emitted, so a pause must not replay them.
+                    _respawn_truncations = []
                     raw_buf = ""
+                    _tokens_this_stream = 0
                     for raw_chunk in self._iter_text_cancellable(
                         response,
                         cancel_event,
                         first_token_deadline = first_token_deadline,
+                        **({} if preempt_event is None else {"preempt_event": preempt_event}),
                     ):
                         raw_buf += raw_chunk
                         while "\n" in raw_buf:
@@ -30084,6 +31291,12 @@ class LlamaCppBackend:
                                             }
                                 _stream_done = True
                                 break  # exit inner while
+                            if line in _SERVER_PARK_COMMENTS:
+                                # llama-server parked this slot or restored it; nothing is torn down.
+                                _park_event = self._server_park_event(line, preempt_policy)
+                                if _park_event is not None:
+                                    yield _park_event
+                                continue
                             if not line.startswith("data: "):
                                 continue
 
@@ -30111,6 +31324,20 @@ class LlamaCppBackend:
                                 _fr = choices[0].get("finish_reason")
                                 if _fr:
                                     _iter_finish_reason = _fr
+
+                                # One chunk is about one token, so this is the live n_i the
+                                # preemptor needs. Batched because the sweep takes a lock and
+                                # this runs per token; the slack is well under the buffer.
+                                _tokens_this_stream += 1
+                                if (
+                                    on_tokens is not None
+                                    and _tokens_this_stream % _TOKEN_REPORT_EVERY == 0
+                                ):
+                                    try:
+                                        on_tokens(_tokens_this_stream)
+                                    except Exception:
+                                        # Never let the watermark sweep fail a generation.
+                                        pass
 
                                 # ── Structured tool_calls ──
                                 tc_deltas = delta.get("tool_calls")
@@ -30763,6 +31990,13 @@ class LlamaCppBackend:
                                         if _cap_left_c == 0
                                         else "the retry prompt would not be served",
                                     )
+                                    # Only the window case: a spent output cap belongs to THIS
+                                    # request, and "does not fit" would hide a working Continue.
+                                    if _cap_left_c != 0 and not _continuation_refusal_announced:
+                                        _refusal_c = _continuation_refusal_event()
+                                        if _refusal_c is not None:
+                                            _continuation_refusal_announced = True
+                                            yield _refusal_c
                                     _length_continuations -= 1
                                 else:
                                     conversation[:] = _cand_c
@@ -30868,6 +32102,13 @@ class LlamaCppBackend:
                                 # never the constraint, and this reaches the client as
                                 # ordinary content, so nothing downstream can correct it.
                                 _reasoning_cap_spent = _cap_left_l == 0
+                                # Same signal and the same exclusion for a cap the caller set: this
+                                # turn ends at the window, and a resume meets the preflight's refusal.
+                                if not _reasoning_cap_spent and not _continuation_refusal_announced:
+                                    _refusal_l = _continuation_refusal_event()
+                                    if _refusal_l is not None:
+                                        _continuation_refusal_announced = True
+                                        yield _refusal_l
                                 _length_continuations -= 1
                                 _effective_enable_thinking = enable_thinking
                                 _effective_reasoning_effort = reasoning_effort
@@ -31191,6 +32432,180 @@ class LlamaCppBackend:
                 # the card's id for the first matching call (same tool name) to reconcile.
                 _text_provisional_id = _text_args_id if not has_structured_tc else ""
 
+                # Everything after a tool returns, in one place because the sequential and the
+                # overlapped path have to do it identically and in the order the model asked
+                # for. Only the WAITING above was ever worth overlapping.
+                def _settle_tool_call(
+                    decision, result, _last_result_budget, _starved_call, _compact_flag
+                ):
+                    nonlocal _kb_search_count, _last_reprompt_text, _turn_executed_real_tool
+                    nonlocal _forced_choice_resolved, _forced_tool_call_pending, assistant_msg
+                    # What the result cost against what it was allowed. The pair is the only way
+                    # to tell a budget that was never delivered from one delivered and ignored.
+                    logger.info(
+                        "tool result: name=%s budget_tokens=%s chars=%d",
+                        decision.tool_name,
+                        _last_result_budget[0],
+                        len(result) if isinstance(result, str) else -1,
+                    )
+                    # The window priced this result at nothing before the call ran, so the model
+                    # is told now rather than after three calls prove it.
+                    _result_was_starved = False
+                    # The budget says what the window ALLOWED, not what the tool returned: a short
+                    # result fits whole, so the nudge waits for evidence the result was cut.
+                    if (
+                        _starved_call[0]
+                        and isinstance(result, str)
+                        and (not result.strip() or _is_window_notice(result))
+                    ):
+                        _starved_call[0] = False
+                        _result_was_starved = True
+                        logger.info(
+                            "%s ran with a result budget below %d; telling the model the "
+                            "window cannot carry the result",
+                            decision.tool_name,
+                            _MIN_USEFUL_RESULT_TOKENS,
+                        )
+                        result = _starved_result_message(decision.tool_name, result)
+                    else:
+                        # Cleared either way: it describes THIS call's budget, and leaving it
+                        # set would hand the notice to the next call.
+                        _starved_call[0] = False
+
+                    # Keyed on the RESULT, not the arguments: in the turn this came from the
+                    # arguments differed every time while the answer was the same notice.
+                    if isinstance(result, str):
+                        # The arguments join the key UNLESS the result is one the window produced:
+                        # a tool answering distinct mutations with `OK` is making progress.
+                        _result_key = (
+                            decision.tool_name,
+                            hashlib.sha1(result.encode("utf-8", "replace")).hexdigest(),
+                            None
+                            if _result_was_starved or _is_window_notice(result)
+                            else hashlib.sha1(
+                                json.dumps(decision.arguments, sort_keys = True, default = str).encode(
+                                    "utf-8", "replace"
+                                )
+                            ).hexdigest(),
+                        )
+                        if _result_key == _last_tool_result_key[0]:
+                            _identical_result_runs[0] += 1
+                        else:
+                            _last_tool_result_key[0] = _result_key
+                            _identical_result_runs[0] = 1
+                        if _identical_result_runs[0] >= _MAX_IDENTICAL_TOOL_RESULTS:
+                            logger.info(
+                                "%s returned the same result %d times; saying so instead of "
+                                "letting the turn spend itself repeating it",
+                                decision.tool_name,
+                                _identical_result_runs[0],
+                            )
+                            # Told, not silently stopped: the model can still finish another way.
+                            result = _repeated_result_message(
+                                decision.tool_name, _identical_result_runs[0], result
+                            )
+                            _identical_result_runs[0] = 0
+                            _last_tool_result_key[0] = None
+                    completion = tool_controller.record_result(decision, result)
+                    resolved_provisional_tool_call_ids.add(decision.tool_call_id)
+                    # A real execution opens the post-tool phase; carrying the pre-tool stall
+                    # text over would read as a repeat and swallow the one post-tool nudge.
+                    _last_reprompt_text = ""
+                    _turn_executed_real_tool = True
+                    _forced_choice_resolved = True
+                    yield completion.tool_end_event()
+                    conversation.append(completion.tool_message())
+                    if _compact_flag and decision.tool_call_id:
+                        # The promise the gate made when it let this run, passed in with the call
+                        # because an overlapped round settles after every call was prepared.
+                        _before_len = len(json.dumps(conversation, default = str))
+                        conversation[:] = compact_executed_call_arguments(
+                            conversation, decision.tool_call_id
+                        )
+                        logger.info(
+                            "Compacted %s arguments after running it: %d -> %d chars",
+                            decision.tool_name,
+                            _before_len,
+                            len(json.dumps(conversation, default = str)),
+                        )
+                        # The compaction rebuilds the messages rather than mutating them, so the
+                        # local handle points at a dict no longer in `conversation`. Rebind,
+                        # backwards, because generated ids restart at `call_0` every turn.
+                        for _msg in reversed(conversation):
+                            if _msg.get("role") != "assistant":
+                                continue
+                            if any(
+                                (_tc or {}).get("id") == decision.tool_call_id
+                                for _tc in (_msg.get("tool_calls") or [])
+                            ):
+                                assistant_msg = _msg
+                                break
+
+                    if _forced_tool_call_pending:
+                        _forced_tool_call_pending = False
+
+                # Whether this round's calls may run at once. Decided BEFORE any is prepared: it has
+                # to hold for the whole round, or a modal lands in front of work already in flight.
+                _approval_gate = (
+                    bool(confirm_tool_calls) and not bypass_permissions and permission_mode != "off"
+                )
+                if _approval_gate and permission_mode == "auto":
+
+                    def _risk_args(raw):
+                        """`is_high_risk_tool_call` reads the arguments as a mapping, but on the wire
+                        they are a JSON string. Anything that will not parse is treated as risky."""
+                        if isinstance(raw, Mapping):
+                            return dict(raw)
+                        if isinstance(raw, str):
+                            try:
+                                parsed = json.loads(raw)
+                            except Exception:
+                                return None
+                            return parsed if isinstance(parsed, dict) else None
+                        return None
+
+                    def _round_call_is_risky(_tc):
+                        _fn = (_tc or {}).get("function") or {}
+                        _args = _risk_args(_fn.get("arguments"))
+                        if _args is None:
+                            return True
+                        try:
+                            return bool(is_high_risk_tool_call(_fn.get("name", ""), _args))
+                        except Exception:
+                            return True
+
+                    _approval_gate = any(_round_call_is_risky(_tc) for _tc in (tool_calls or []))
+                # A round may only overlap when its calls cannot depend on each other's RESULTS.
+                # `prepare_call`'s two such dependencies, `_successful_keys` and
+                # `_completed_one_shot_tools`, are written by `record_result`, so a round with
+                # either stays sequential. Keyed as the ledger keys them, healed, so two spellings run once.
+                _one_shot = frozenset(getattr(tool_controller, "_one_shot_tools", ()) or ())
+                _round_keys: list = []
+                _round_one_shot: list = []
+                for _tc in tool_calls or []:
+                    _fn = (_tc or {}).get("function") or {}
+                    _nm = _fn.get("name", "")
+                    try:
+                        _round_keys.append(tool_controller.call_key(_tc or {}))
+                    except Exception:
+                        _round_keys.append(_round_call_key(_nm, _fn.get("arguments")))
+                    if _nm in _one_shot:
+                        _round_one_shot.append(_nm)
+                _parallel_round = (
+                    _parallel_tool_calls_enabled()
+                    and len(tool_calls or []) > 1
+                    and len(tool_calls or []) <= _MAX_PARALLEL_TOOL_CALLS_PER_ROUND
+                    and not _approval_gate
+                    and len(set(_round_keys)) == len(_round_keys)
+                    and len(set(_round_one_shot)) == len(_round_one_shot)
+                )
+                # Started, not yet read back. Empty in a sequential round.
+                _pending_calls: list = []
+                # Calls that reach a driver: a suppressed repeat, disabled tool or spent
+                # one-shot stores no result, and dividing the room by the raw list cut a lone
+                # real read short. A cell the workers read; final before any driver starts.
+                _round_launched = [0]
+
                 for _call_index, tc in enumerate(tool_calls or []):
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
@@ -31217,13 +32632,21 @@ class LlamaCppBackend:
                             # turns the call into an internal no-op (duplicate /
                             # disabled / render_html_repeat).
                             resolved_provisional_tool_call_ids.add(decision.tool_call_id)
-                            yield {
+                            _noop_end = {
                                 "type": "tool_end",
                                 "tool_name": decision.tool_name,
                                 "tool_call_id": decision.tool_call_id,
                                 "result": "",
                                 "provenance": decision.provenance,
                             }
+                            if _parallel_round:
+                                # Behind the calls above it, which are still running: written out
+                                # here it closes this card first, and the client paints in order.
+                                _pending_calls.append(
+                                    (None, None, None, _noop_end, None, None, None, False)
+                                )
+                            else:
+                                yield _noop_end
                         completion = tool_controller.record_noop(decision)
                         deferred_noop_msgs.append(completion.model_message())
                         deferred_noop_tools.add(decision.tool_name)
@@ -31586,6 +33009,21 @@ class LlamaCppBackend:
                         and _kb_search_count >= RAG_MAX_SEARCHES_PER_TURN
                     ):
                         result = RAG_SEARCH_CAP_NUDGE
+                        if _parallel_round:
+                            # No tool to start, but its place in the round is still its own.
+                            _pending_calls.append(
+                                (
+                                    decision,
+                                    None,
+                                    None,
+                                    result,
+                                    None,
+                                    ["<not passed>"],
+                                    [False],
+                                    _compact_after_execution,
+                                )
+                            )
+                            continue
                     else:
                         # Execute in a worker thread so live stdout chunks and heartbeats
                         # stream while the tool blocks (the SSE route turns heartbeats into
@@ -31594,8 +33032,26 @@ class LlamaCppBackend:
                         # the budget that was actually handed over, from a scope that
                         # outlives the closure.
                         _last_result_budget: list = ["<not passed>"]
+                        # Per call, not per turn: the turn-level `_starved_call` was written from
+                        # the tool's worker thread, so the last to finish decided for every call.
+                        _starved_call: list = [False]
 
-                        def _invoke_tool(_output_callback, _decision = decision):
+                        def _invoke_tool(
+                            _output_callback,
+                            _decision = decision,
+                            _budget_cell = _last_result_budget,
+                            _starved_cell = _starved_call,
+                            # Bound, like `_decision`: in an overlapped round this body runs on a
+                            # worker thread while the outer loop has moved on to the LAST call.
+                            _call_position = _call_index,
+                            _compact_flag = _compact_after_execution,
+                            _compacted_tokens = _compacted_turn_tokens,
+                            # Bound for the same reason: an overlapped round's drivers run
+                            # after the loop, and this decides how the room is divided.
+                            _round_parallel = _parallel_round,
+                            # Read, not bound by value: the cell completes after this closure.
+                            _round_launched_cell = _round_launched,
+                        ):
                             # execute_tool is injectable and may be monkey-patched with the
                             # pre-PR signature; forward output_callback only if it's accepted.
                             kwargs = dict(
@@ -31670,11 +33126,11 @@ class LlamaCppBackend:
                                 # its notice but the call itself cannot be unsent.
                                 _size_probe: dict = {
                                     "role": "tool",
-                                    "name": decision.tool_name,
+                                    "name": _decision.tool_name,
                                     "content": "",
                                 }
-                                if decision.tool_call_id:
-                                    _size_probe["tool_call_id"] = decision.tool_call_id
+                                if _decision.tool_call_id:
+                                    _size_probe["tool_call_id"] = _decision.tool_call_id
                                 try:
                                     _exact_prompt_tokens = self.count_chat_tokens(
                                         neutralize_control_markup_in_messages(
@@ -31706,8 +33162,8 @@ class LlamaCppBackend:
                                 # budget and throws its output away, in the one case where
                                 # the room is about to be there.
                                 _spent = (
-                                    _compacted_turn_tokens
-                                    if _compact_after_execution and _compacted_turn_tokens
+                                    _compacted_tokens
+                                    if _compact_flag and _compacted_tokens
                                     else _exact_prompt_tokens
                                     if _exact_prompt_tokens is not None
                                     else estimate_messages_tokens_dense(
@@ -31734,7 +33190,7 @@ class LlamaCppBackend:
                                     # alone, the first result can take all the room the
                                     # other calls and their results still need, and the
                                     # finished exchange is protected as the newest turn.
-                                    _pending = list(tool_calls or [])[_call_index + 1 :]
+                                    _pending = list(tool_calls or [])[_call_position + 1 :]
                                     _pending_msgs = [
                                         {
                                             "role": "assistant",
@@ -31747,8 +33203,15 @@ class LlamaCppBackend:
                                     # carry base64, minified JSON or a block of code, which
                                     # run nearer one or two. Under-priced, the first result
                                     # is handed room the later ARGUMENTS already occupy.
+                                    # Sequential rounds only. An overlapped round attaches
+                                    # EVERY call to the assistant message before any driver
+                                    # starts, so the exact count above already renders the
+                                    # whole round's arguments; adding them again charges the
+                                    # later calls twice and hands a valid result a budget
+                                    # short by their size, cut to a window notice the model
+                                    # then retries against.
                                     _pending_args = 0
-                                    if _pending_msgs:
+                                    if _pending_msgs and not _round_parallel:
                                         try:
                                             _pending_args = self.count_chat_tokens(
                                                 _pending_msgs, None, None, strict = True
@@ -31770,20 +33233,25 @@ class LlamaCppBackend:
                                         # starve a read the request had space for.
                                         _iteration_max_tokens,
                                         _spent + _pending_args,
-                                    ) // (len(_pending) + 1)
+                                    ) // (
+                                        # Sequentially, call k divides by the calls still to
+                                        # run. Run together they price against the same
+                                        # `_spent`, so per-call remainders would hand out
+                                        # more than the batch has; the launched calls, since
+                                        # a suppressed one stores no result.
+                                        max(1, _round_launched_cell[0])
+                                        if _round_parallel
+                                        else (len(_pending) + 1)
+                                    )
                                     # A budget at or near zero means the call cannot deliver
-                                    # anything: the result is cut to a notice saying it was
-                                    # cut, which reads to the model as a fresh failure rather
-                                    # than a wall, so it tries again. Observed at a 4096
-                                    # window, reading a 2401-byte file back: six of the last
-                                    # eight calls priced at zero and returned the same
-                                    # 109-char notice, and the turn went on 18 calls.
-                                    #
-                                    # Room is exactly what compaction reclaims, so spend it
-                                    # here before the call rather than after the turn is lost.
+                                    # A budget at or near zero means the call cannot deliver
+                                    # anything: the result is cut to a notice that reads as a fresh
+                                    # failure, so the model tries again. Compaction reclaims exactly
+                                    # that room. NOT in a parallel round: `conversation[:]` races.
                                     if (
                                         _result_budget < _MIN_USEFUL_RESULT_TOKENS
                                         and self._effective_context_length
+                                        and not _round_parallel
                                     ):
                                         _roomier, _n_roomier = compact_completed_tool_arguments(
                                             conversation, protect_last = 1
@@ -31829,18 +33297,18 @@ class LlamaCppBackend:
                                                 logger.info(
                                                     "Result budget for %s was %d; compacted "
                                                     "%d completed call(s) and it is now %d",
-                                                    decision.tool_name,
+                                                    _decision.tool_name,
                                                     _result_budget,
                                                     _n_roomier,
                                                     _rescued,
                                                 )
                                                 _result_budget = max(_result_budget, _rescued)
                                     kwargs["result_budget_tokens"] = _result_budget
-                                    _last_result_budget[0] = kwargs["result_budget_tokens"]
+                                    _budget_cell[0] = kwargs["result_budget_tokens"]
                                     # Known before the tool runs, so there is no reason to
                                     # spend calls rediscovering it: the repeat guard below
                                     # would reach the same conclusion three calls later.
-                                    _starved_call[0] = _result_budget < _MIN_USEFUL_RESULT_TOKENS
+                                    _starved_cell[0] = _result_budget < _MIN_USEFUL_RESULT_TOKENS
                                 if accepts_kwarg(execute_tool, "conversation_budget_tokens"):
                                     if accepts_kwarg(execute_tool, "conversation_token_counter"):
                                         # The admission check estimates a result's size by
@@ -31883,13 +33351,41 @@ class LlamaCppBackend:
                         # Without this the handler below re-raises and a bad
                         # argument kills the whole answer. A raising tool is the
                         # tool's failure; the other two loops hand it back.
-                        try:
-                            result = yield from stream_tool_execution(
-                                _invoke_tool,
-                                tool_name = decision.tool_name,
-                                tool_call_id = decision.tool_call_id,
-                                cancel_event = cancel_event,
+                        _tool_stream = stream_tool_execution(
+                            _invoke_tool,
+                            tool_name = decision.tool_name,
+                            tool_call_id = decision.tool_call_id,
+                            cancel_event = cancel_event,
+                        )
+                        if _parallel_round:
+                            # Prepared here, started below the loop once every call is attached to
+                            # the assistant message: starting the driver here let a compaction from
+                            # inside the first tool detach it and orphan the later results.
+                            _pending_calls.append(
+                                (
+                                    _TOOL_START_DEFERRED,
+                                    decision,
+                                    _tool_stream,
+                                    _last_result_budget,
+                                    _starved_call,
+                                    _compact_after_execution,
+                                    None,
+                                    None,
+                                )
                             )
+                            _round_launched[0] += 1
+                            # Counted HERE, not when it settles: every call of an overlapped
+                            # round is prepared before any finishes, so counting at the end
+                            # lets four searches through a cap of three.
+                            if decision.tool_name in RAG_SEARCH_TOOLS:
+                                _kb_search_count += 1
+                            # Spent by THIS call: left set, the forced choice would be offered to
+                            # the next call in the round as though the first had not taken it.
+                            if _forced_tool_call_pending:
+                                _forced_tool_call_pending = False
+                            continue
+                        try:
+                            result = yield from _tool_stream
                         except _LlamaStreamCancelled:
                             # Subclasses Exception, so the arm below would eat
                             # the cancel signal. CancelledError needs no arm:
@@ -31906,141 +33402,102 @@ class LlamaCppBackend:
                             result = f"Error: tool raised an exception: {_tool_exc}"
                         if decision.tool_name in RAG_SEARCH_TOOLS:
                             _kb_search_count += 1
-                    # What the result actually cost against what it was allowed. The pair
-                    # is the only way to tell a budget that was never delivered from one
-                    # that was delivered and ignored, and a 400 one second after a tool
-                    # returns cannot distinguish them on its own.
-                    logger.info(
-                        "tool result: name=%s budget_tokens=%s chars=%d",
-                        decision.tool_name,
-                        _last_result_budget[0],
-                        len(result) if isinstance(result, str) else -1,
+                    yield from _settle_tool_call(
+                        decision,
+                        result,
+                        _last_result_budget,
+                        _starved_call,
+                        _compact_after_execution,
                     )
-                    # The window priced this result at nothing before the call ran, so the
-                    # model is told now rather than after three calls prove it.
-                    _result_was_starved = False
-                    # The budget says what the window ALLOWED, not what the tool returned.
-                    # A short result fits a few tokens completely -- "Created a.py", "OK",
-                    # the acknowledgement a mutation gives -- and telling the model that
-                    # nothing usable came back invites it to discard a successful write or
-                    # do it a second time. So the nudge waits for evidence the result was
-                    # actually cut: the truncation notice, or nothing at all.
-                    if (
-                        _starved_call[0]
-                        and isinstance(result, str)
-                        and (not result.strip() or _is_window_notice(result))
-                    ):
-                        _starved_call[0] = False
-                        _result_was_starved = True
-                        logger.info(
-                            "%s ran with a result budget below %d; telling the model the "
-                            "window cannot carry the result",
-                            decision.tool_name,
-                            _MIN_USEFUL_RESULT_TOKENS,
-                        )
-                        result = _starved_result_message(decision.tool_name, result)
+
+                # The round's overlapped calls, read back in the order the model asked for.
+                if _parallel_round and any(
+                    _entry[0] is _TOOL_START_DEFERRED for _entry in _pending_calls
+                ):
+                    # The room every call of the round shares, sized once with the whole round as
+                    # the divisor and reclaimed on the generator thread, the one place that is safe.
+                    if self._effective_context_length:
+                        try:
+                            _round_spent = self.count_chat_tokens(
+                                neutralize_control_markup_in_messages(
+                                    messages_without_unpriced_media(conversation),
+                                    _markup_cache,
+                                    self.markup_profile,
+                                ),
+                                None,
+                                safe_tools,
+                                strict = True,
+                                chat_template_kwargs = _reasoning_kw,
+                            )
+                        except Exception:
+                            logger.debug("round budget: prompt count failed", exc_info = True)
+                            _round_spent = estimate_messages_tokens_dense(
+                                messages_without_unpriced_media(conversation)
+                            )
+                        _round_budget = tool_result_budget(
+                            self._effective_context_length,
+                            _iteration_max_tokens,
+                            _round_spent,
+                        ) // max(1, _round_launched[0])
+                        if _round_budget < _MIN_USEFUL_RESULT_TOKENS:
+                            _roomier, _n_roomier = compact_completed_tool_arguments(
+                                conversation, protect_last = 1
+                            )
+                            if _n_roomier:
+                                conversation[:] = _roomier
+                    for _entry_index, _entry in enumerate(_pending_calls):
+                        if _entry[0] is _TOOL_START_DEFERRED:
+                            _pending_calls[_entry_index] = _start_tool_call(
+                                _entry[1], _entry[2], _entry[3], _entry[4], _entry[5]
+                            )
+
+                # Empty unless `_parallel_round`, so the sequential path never reaches here.
+                for (
+                    _p_decision,
+                    _p_stream,
+                    _p_queue,
+                    _p_result,
+                    _p_error,
+                    _p_budget,
+                    _p_starved,
+                    _p_compact,
+                ) in _pending_calls:
+                    if _p_decision is None:
+                        # A card to close, not a call to settle: the controller made this one an
+                        # internal no-op and its provisional card is still on screen.
+                        yield _p_result
+                        continue
+                    if _p_queue is None:
+                        # Nothing was started for it: the RAG cap answered before the tool would
+                        # have run. It is here only to keep its place in the round.
+                        result = _p_result
                     else:
-                        # Cleared either way: it describes THIS call's budget, and leaving
-                        # it set would hand the notice to the next call instead.
-                        _starved_call[0] = False
-
-                    # ── No-progress guard: the same answer, over and over ──
-                    # Keyed on the RESULT, not the arguments. In the turn this came from,
-                    # the arguments differed every time (different line ranges of one file)
-                    # while the answer was the same 109-char truncation notice, so an
-                    # argument-keyed guard would have watched all 18 calls go by. OpenClaw
-                    # keys on the result for the same reason and never fires while results
-                    # are still changing, which is what makes this safe for polling.
-                    if isinstance(result, str):
-                        # The arguments are part of the key UNLESS the result is one the
-                        # window itself produced. A tool that answers every distinct
-                        # mutation with `OK` is making progress, and the nudge below --
-                        # which says different arguments will not change the answer -- can
-                        # talk it out of the operations it has left. A starved result is
-                        # the opposite: it is the notice, not the tool's answer, so the
-                        # arguments are exactly what must NOT be part of the key. That was
-                        # the observed turn, where 18 calls read different line ranges of
-                        # one file and got the same 109-char truncation notice each time.
-                        _result_key = (
-                            decision.tool_name,
-                            hashlib.sha1(result.encode("utf-8", "replace")).hexdigest(),
-                            None
-                            if _result_was_starved or _is_window_notice(result)
-                            else hashlib.sha1(
-                                json.dumps(decision.arguments, sort_keys = True, default = str).encode(
-                                    "utf-8", "replace"
-                                )
-                            ).hexdigest(),
-                        )
-                        if _result_key == _last_tool_result_key[0]:
-                            _identical_result_runs[0] += 1
-                        else:
-                            _last_tool_result_key[0] = _result_key
-                            _identical_result_runs[0] = 1
-                        if _identical_result_runs[0] >= _MAX_IDENTICAL_TOOL_RESULTS:
-                            logger.info(
-                                "%s returned the same result %d times; saying so instead of "
-                                "letting the turn spend itself repeating it",
-                                decision.tool_name,
-                                _identical_result_runs[0],
+                        try:
+                            while True:
+                                _kind, _payload = _p_queue.get()
+                                if _kind == "event":
+                                    yield _payload
+                                    continue
+                                if _kind == "result":
+                                    result = _payload
+                                    break
+                                raise _payload
+                        except _LlamaStreamCancelled:
+                            raise
+                        except Exception as _tool_exc:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise
+                            logger.exception(
+                                "Tool %s raised: %s",
+                                _p_decision.tool_name,
+                                _tool_exc,
                             )
-                            # Told, not silently stopped. The model can still finish the
-                            # task another way, and hard-stopping a turn that is otherwise
-                            # healthy would trade one dead end for a worse one.
-                            result = _repeated_result_message(
-                                decision.tool_name, _identical_result_runs[0], result
-                            )
-                            _identical_result_runs[0] = 0
-                            _last_tool_result_key[0] = None
-                    completion = tool_controller.record_result(decision, result)
-                    resolved_provisional_tool_call_ids.add(decision.tool_call_id)
-                    # A real execution opens the post-tool phase; carrying the pre-tool
-                    # stall text over would read the same sentence as a repeat and
-                    # swallow the one post-tool nudge.
-                    _last_reprompt_text = ""
-                    # A tool ran this turn, so it counts against the caller's budget.
-                    _turn_executed_real_tool = True
-                    _forced_choice_resolved = True
-                    yield completion.tool_end_event()
-                    conversation.append(completion.tool_message())
-                    if _compact_after_execution and decision.tool_call_id:
-                        # The promise the gate made when it let this run. Applied here
-                        # rather than on the next pass because the next pass may not
-                        # come: this turn's own generation is the request that would
-                        # otherwise be rejected.
-                        _before_len = len(json.dumps(conversation, default = str))
-                        conversation[:] = compact_executed_call_arguments(
-                            conversation, decision.tool_call_id
-                        )
-                        logger.info(
-                            "Compacted %s arguments after running it: %d -> %d chars",
-                            decision.tool_name,
-                            _before_len,
-                            len(json.dumps(conversation, default = str)),
-                        )
-                        # The compaction rebuilds the messages rather than mutating them,
-                        # so the local handle now points at a dict that is no longer in
-                        # `conversation`. One assistant turn can carry several calls, and
-                        # the next one in the batch appends its tool_call to this handle
-                        # while its RESULT goes to `conversation`: the model would receive
-                        # a tool result answering a call it cannot see. Rebind to the live
-                        # message carrying this call.
-                        # Backwards: generated ids restart at `call_0` every turn, so a
-                        # forward scan binds to the OLDEST turn carrying the id and the
-                        # rest of this batch is appended to history instead of to the live
-                        # exchange. The call being compacted is always the current one.
-                        for _msg in reversed(conversation):
-                            if _msg.get("role") != "assistant":
-                                continue
-                            if any(
-                                (_tc or {}).get("id") == decision.tool_call_id
-                                for _tc in (_msg.get("tool_calls") or [])
-                            ):
-                                assistant_msg = _msg
-                                break
-
-                    if _forced_tool_call_pending:
-                        _forced_tool_call_pending = False
+                            result = f"Error: tool raised an exception: {_tool_exc}"
+                    # Already counted at launch. A capped call is not counted at all: no search.
+                    yield from _settle_tool_call(
+                        _p_decision, result, _p_budget, _p_starved, _p_compact
+                    )
+                _pending_calls = []
 
                 # A mixed execute/no-op batch already has a real tool result, so keeping the
                 # feedback with that result beats appending a newer user turn, which makes
@@ -32119,6 +33576,185 @@ class LlamaCppBackend:
 
             except _LlamaStreamCancelled:
                 return
+            except _preemption.LlamaStreamPreempted:
+                logger.info("llama preemption caught: entering pause/resume handshake")
+                # Paused to free KV, not abandoned: only the upstream request was closed, and no
+                # tool has run, execution happening after the stream ends rather than during it.
+                _pre_charged = self._preempt_charge(
+                    _iter_usage,
+                    _iter_timings,
+                    _tokens_this_stream,
+                    content_accum,
+                    reasoning_accum,
+                )
+                _checkpoint = _preemption.StreamCheckpoint(
+                    visible_text = content_accum,
+                    reasoning_text = reasoning_accum,
+                    pending_truncations = list(_respawn_truncations),
+                    charged_tokens = _pre_charged,
+                    resumes = _preempt_resumes + 1,
+                    reason = getattr(preempt_event, "reason", None),
+                )
+
+                if _preempt_resumes >= _MAX_PREEMPT_RESUMES:
+                    # Churning rather than progressing. Refusing to pause again beats pausing
+                    # forever, and the admitted output clamp still bounds this request.
+                    logger.warning(
+                        "Not pausing again after %d resumes; finishing the turn instead",
+                        _preempt_resumes,
+                    )
+                    # The break below decodes a whole final answering pass, so the decision is handed
+                    # back first: clearing the signal alone leaves the participant PREEMPTING.
+                    _decline_the_pause(preempt_policy, "tool round")
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                    # Counted and kept. Breaking without either dropped the attempt's partial
+                    # from the conversation and handed the pass the caller's whole cap again.
+                    _accumulated_completion_tokens += _pre_charged
+                    _it_c = _iter_timings or {}
+                    _accumulated_predicted_ms += _it_c.get("predicted_ms", 0)
+                    _accumulated_predicted_n += _it_c.get("predicted_n", 0)
+                    # Everything the loop has spent, earlier pauses included: charging the declined
+                    # attempt alone handed the final pass their tokens a second time.
+                    _spent_so_far = _loop_budget_left(0)
+                    if _spent_so_far == 0:
+                        # The caller's cap is spent: the final pass, floored at one token,
+                        # would go past it by that token. Ends as the granted pause does.
+                        logger.info(
+                            "Declined the pause with the caller's output cap spent; ending the turn"
+                        )
+                        _spent_meta = _build_metadata_event(
+                            *_folded_attempt(_iter_usage, _iter_timings), "length"
+                        )
+                        if _spent_meta is not None:
+                            yield _spent_meta
+                        return
+                    if _spent_so_far is not None:
+                        _declined_charged = max_tokens - _spent_so_far
+                    else:
+                        _declined_charged += _pre_charged
+                    # Where the display stopped, so the final pass extends it rather than
+                    # starting a turn of its own.
+                    _declined_display = (cumulative_display, _last_emitted, in_thinking)
+                    try:
+                        _declined_continues = self._assemble_preempt_resume(
+                            conversation, _checkpoint, content_accum, reasoning_accum
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not keep the declined attempt's partial; the final pass "
+                            "starts afresh",
+                            exc_info = True,
+                        )
+                        _declined_continues = False
+                    if _declined_continues:
+                        # A nudge appended after the partial would end the turn it extends.
+                        _append_budget_exhausted_nudge = False
+                    break
+                _preempt_resumes += 1
+                # The attempt really did decode these, so charge them once.
+                _accumulated_completion_tokens += _pre_charged
+                _it_p = _iter_timings or {}
+                _accumulated_predicted_ms += _it_p.get("predicted_ms", 0)
+                _accumulated_predicted_n += _it_p.get("predicted_n", 0)
+                if _loop_budget_left(0) == 0:
+                    # The caller's cap is spent: nothing to wait for, and reopening the
+                    # stream for one floored token went past the cap by that token.
+                    logger.info("Paused with the caller's output cap spent; ending the turn")
+                    _spent_meta = _build_metadata_event(
+                        *_folded_attempt(_iter_usage, _iter_timings), "length"
+                    )
+                    if _spent_meta is not None:
+                        yield _spent_meta
+                    return
+                # Unemitted when the pause landed during prefill; carried so the next attempt
+                # emits them once. The archive is content-hash idempotent, the event is not.
+                _carried_truncations = list(_respawn_truncations)
+                # Assembling the resume must never end the turn: this block exists to SAVE a chat,
+                # and any failure degrades to re-issuing the attempt whole.
+                try:
+                    _resume_assembled = self._assemble_preempt_resume(
+                        conversation,
+                        _checkpoint,
+                        content_accum,
+                        reasoning_accum,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not assemble a preemption resume; re-issuing the attempt "
+                        "whole and continuing",
+                        exc_info = True,
+                    )
+                    _resume_assembled = False
+                continue_final_message = _resume_assembled or continue_final_message
+                # Neither prose nor thought means the pause landed before the first token, and
+                # `continue_final_message` refuses an empty assistant turn.
+                try:
+                    preempt_policy.on_preempted(_checkpoint)
+                except Exception:
+                    logger.debug(
+                        "preemption policy raised on pause; resuming anyway", exc_info = True
+                    )
+                # The rollback restarts from the end of the visible prose, so a tool call it had
+                # started streaming is not coming back under this id: close its card.
+                for _pid, _pname in provisional_started_tool_calls.items():
+                    if _pid not in resolved_provisional_tool_call_ids:
+                        resolved_provisional_tool_call_ids.add(_pid)
+                        yield {
+                            "type": "tool_end",
+                            "tool_name": _pname,
+                            "tool_call_id": _pid,
+                            "result": "",
+                            "provenance": provisional_tool_provenance(_pname),
+                        }
+                # Tell the client it is paused, not broken, as the plain path does; this loop never
+                # yielded it. AFTER on_preempted, so the signal cannot precede the lease.
+                yield {"type": "preempt", "state": "paused"}
+                try:
+                    _resumed = yield from _await_resume(preempt_policy, cancel_event)
+                    # Cleared BEFORE `on_resumed`: a signal still set aborts the resumed attempt on
+                    # its first read, while clearing afterwards races the sweep and would erase a
+                    # pause already counted as room.
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                    # Only a granted resume is a resume: told otherwise, the controller marks
+                    # a participant decoding whose turn is about to end.
+                    if _resumed:
+                        preempt_policy.on_resumed()
+                except Exception:
+                    # Not a grant: the lease went back with on_preempted, so decoding on would
+                    # run on room nobody booked. The turn ends with its partial, as a refusal.
+                    logger.warning(
+                        "preemption policy raised during the wait; ending the turn",
+                        exc_info = True,
+                    )
+                    _resumed = False
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                if not _resumed:
+                    # The policy stopped waiting for room. Ending the turn leaves the partial
+                    # in the conversation rather than hanging the chat.
+                    logger.info("Paused generation was not resumed; ending the turn")
+                    # And says so, then ends the turn as the final pass does. Breaking into that pass
+                    # instead decoded on cells the planner had handed out, the lease having gone
+                    # back with on_preempted.
+                    yield _preempt_gave_up_event(self._effective_context_length, max_tokens)
+                    _gave_up_meta = _build_metadata_event(_iter_usage, _iter_timings, "length")
+                    if _gave_up_meta is not None:
+                        yield _gave_up_meta
+                    return
+                # Paired with the pause above, so a client that shows one shows the other.
+                yield {"type": "preempt", "state": "resumed"}
+                # `max_tokens` bounds NEW tokens and the next iteration rebuilds the payload
+                # from the caller's figure, so without this a request capped at 100 could emit
+                # 80, pause, and be handed another 100.
+                _preempt_cap_left = _loop_budget_left(0)
+                if _preempt_cap_left is not None:
+                    # Floored at 1: a request for zero tokens returns nothing at all, which
+                    # would turn a pause into a silently empty turn.
+                    _continuation_max_tokens = max(1, _preempt_cap_left)
+                _preempt_display_seed = (cumulative_display, _last_emitted, in_thinking)
+                continue
             except httpx.ConnectError:
                 # Mark unresolved provisional cards as failed before raising.
                 for _pid, _pname in provisional_started_tool_calls.items():
@@ -32156,8 +33792,10 @@ class LlamaCppBackend:
             if not _attach_internal_feedback_to_tool_result(BUDGET_EXHAUSTED_NUDGE):
                 conversation.append({"role": "user", "content": BUDGET_EXHAUSTED_NUDGE})
 
-        # Clear status.
-        yield {"type": "status", "text": ""}
+        # Clear status. Not when the pass extends a declined pause's partial: an empty status is the
+        # turn boundary consumers reset their cursor on, and the two are one turn.
+        if not _declined_continues:
+            yield {"type": "status", "text": ""}
 
         # Final streaming pass with the full conversation context.
         from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
@@ -32170,6 +33808,12 @@ class LlamaCppBackend:
             if max_tokens is not None
             else (self._effective_context_length or _DEFAULT_MAX_TOKENS_FLOOR)
         )
+        # The same clamp the per-round payload applies: without it a run that spent its tool budget
+        # sent the whole window as its output cap while admission had reserved a share.
+        if admission_output_allowance is not None:
+            _final_max_tokens = min(_final_max_tokens, admission_output_allowance)
+        if _declined_charged and isinstance(_final_max_tokens, int):
+            _final_max_tokens = max(1, _final_max_tokens - _declined_charged)
         _final_preflight_context_length = None
         _final_preflight_succeeded = False
         if context_overflow == "truncate_oldest" and self._effective_context_length:
@@ -32311,6 +33955,9 @@ class LlamaCppBackend:
             stream_payload["stop"] = stop
         _apply_seeded_llama_request(stream_payload, seed)
         stream_payload["stream_options"] = {"include_usage": True}
+        if _declined_continues:
+            stream_payload["continue_final_message"] = True
+            stream_payload["add_generation_prompt"] = False
 
         # Progress events feed the first-token deadline; timings stay opt-in.
         stream_payload["return_progress"] = True
@@ -32446,6 +34093,9 @@ class LlamaCppBackend:
 
         cumulative = ""
         _last_emitted = ""
+        # The model's prose alone, cumulative across attempts. `_last_emitted` is the display
+        # text, thought wrappers included, and a replay of it puts the thought into content.
+        _final_prose = ""
         in_thinking = False
         has_content_tokens = False
         reasoning_text = ""
@@ -32464,20 +34114,34 @@ class LlamaCppBackend:
         _final_length_continuations = 0
         _continue_final = False
         _final_replayed_chars = 0
+        # The same mark for the thought, cumulative like `reasoning_text`: without it a turn paused
+        # twice mid-thought sends the first half of the thought a second time.
+        _final_replayed_reasoning_chars = 0
+        # Per ATTEMPT of the final pass, as the in-loop stream reports its own: `on_tokens` is the
+        # only caller of `observe()`, so a long forced final answer grew invisibly.
+        _final_tokens_this_stream = 0
+        if _declined_continues and _declined_display is not None:
+            # The declined partial is in the prompt and on screen, so this pass's snapshots
+            # carry it: started empty, the non-streaming drain returned the suffix alone.
+            cumulative, _last_emitted, in_thinking = _declined_display
+            _final_prose = trailing_assistant_text(conversation) or ""
+            reasoning_text = trailing_assistant_reasoning(conversation)
+            has_content_tokens = bool(_final_prose)
+            _final_replayed_chars = len(_final_prose)
+            _final_replayed_reasoning_chars = len(reasoning_text)
 
-        def _remaining_output_budget() -> "Optional[int]":
+        def _remaining_output_budget(spent_this_attempt = None) -> "Optional[int]":
             """What is left of a cap the CALLER set, or None when they set none.
 
-            `finish_reason: "length"` does not say which wall was hit. A caller asking for
-            at most 100 completion tokens gets it at their own cap, and continuing twice
-            more returned roughly 300 -- over the limit the API promised, for latency and
-            tokens nobody asked for. Only the context wall deserves a continuation, and a
-            caller who set a cap gets the remainder of it rather than a fresh one.
+            ``spent_this_attempt`` overrides the charge for the attempt that just ended: a pause has
+            already added its tokens, and the fallback would charge the allowance twice.
 
-            None means no explicit cap: `max_tokens` unset, or set to the whole window,
-            which is what the backend substitutes for "Max" and is indistinguishable from
-            unset. There the length stop IS the context wall, which is the case this
-            continuation exists for.
+            `finish_reason: "length"` does not say which wall was hit, and a caller asking
+            for 100 tokens got roughly 300 by continuing twice more. Only the context wall
+            deserves a continuation, so a caller who set a cap gets its remainder.
+
+            None means no explicit cap: unset, or set to the whole window, which is what the
+            backend substitutes for "Max". There the length stop IS the context wall.
             """
             if max_tokens is None:
                 return None
@@ -32489,8 +34153,13 @@ class LlamaCppBackend:
             # allowance it was given, so charge that. Guessing LOW here is what lets the
             # caller's cap be overrun, which is the defect this exists to prevent.
             _this_attempt = (
-                _backfill_usage_from_timings(_metadata_usage, _metadata_timings) or {}
-            ).get("completion_tokens", 0) or int(stream_payload.get("max_tokens") or 0)
+                spent_this_attempt
+                if spent_this_attempt is not None
+                else (_backfill_usage_from_timings(_metadata_usage, _metadata_timings) or {}).get(
+                    "completion_tokens", 0
+                )
+                or int(stream_payload.get("max_tokens") or 0)
+            )
             return max(0, max_tokens - _accumulated_completion_tokens - _this_attempt)
 
         def _continuation_would_be_served(
@@ -32556,6 +34225,9 @@ class LlamaCppBackend:
                     stream_payload,
                     cancel_event,
                     on_respawn = _refit_final_after_respawn,
+                    # The answering pass decodes into the same shared cache, often for longer, so it
+                    # must be interruptible on the same signal or it fills KV unselectably.
+                    **({} if preempt_event is None else {"preempt_event": preempt_event}),
                 ) as (
                     response,
                     first_token_deadline,
@@ -32567,6 +34239,9 @@ class LlamaCppBackend:
                         response,
                         cancel_event,
                         first_token_deadline = first_token_deadline,
+                        # Opening the stream on the signal is half of it: this call polls it and
+                        # raises, so a pause is noticed while the answer is being written.
+                        **({} if preempt_event is None else {"preempt_event": preempt_event}),
                     ):
                         buffer += raw_chunk
                         while "\n" in buffer:
@@ -32608,6 +34283,12 @@ class LlamaCppBackend:
                                         yield {"type": "content", "text": cumulative}
                                 _stream_done = True
                                 break  # exit inner while
+                            if line in _SERVER_PARK_COMMENTS:
+                                # llama-server parked this slot or restored it; nothing is torn down.
+                                _park_event = self._server_park_event(line, preempt_policy)
+                                if _park_event is not None:
+                                    yield _park_event
+                                continue
                             if not line.startswith("data: "):
                                 continue
 
@@ -32632,6 +34313,18 @@ class LlamaCppBackend:
                                     _fr = choices[0].get("finish_reason")
                                     if _fr:
                                         _metadata_finish_reason = _fr
+
+                                    # One chunk is about one token. Batched by
+                                    # _TOKEN_REPORT_EVERY and never allowed to raise.
+                                    _final_tokens_this_stream += 1
+                                    if (
+                                        on_tokens is not None
+                                        and _final_tokens_this_stream % _TOKEN_REPORT_EVERY == 0
+                                    ):
+                                        try:
+                                            on_tokens(_final_tokens_this_stream)
+                                        except Exception:
+                                            pass
 
                                     reasoning = delta.get("reasoning_content", "")
                                     if reasoning:
@@ -32670,6 +34363,7 @@ class LlamaCppBackend:
                                             in_thinking = False
                                             _prov_entry = None
                                         cumulative += token
+                                        _final_prose += token
                                         cleaned = (
                                             _final_answer_stripper.strip(cumulative)
                                             if auto_heal_tool_calls
@@ -32722,7 +34416,7 @@ class LlamaCppBackend:
                             _candidate_messages,
                             {
                                 "role": "assistant",
-                                "content": _last_emitted[_final_replayed_chars:],
+                                "content": _final_prose[_final_replayed_chars:],
                             },
                             continue_final_message = True,
                         )
@@ -32757,7 +34451,7 @@ class LlamaCppBackend:
                         if _served:
                             stream_payload["messages"] = _candidate_messages
                             _record_refit_tail(_candidate_messages, _continuation_tail, _merged_f)
-                            _final_replayed_chars = len(_last_emitted)
+                            _final_replayed_chars = len(_final_prose)
                             stream_payload["continue_final_message"] = True
                             stream_payload["add_generation_prompt"] = False
                             if _next_cap is not None:
@@ -32796,6 +34490,13 @@ class LlamaCppBackend:
                                 "text": _CONTINUE_TRUNCATED_ANSWER_STATUS,
                             }
                         else:
+                            # The final pass's twin of the in-loop decline: the turn ends at
+                            # `length` holding a partial. Cap-spent excluded, that cap being ours.
+                            if _next_cap != 0 and not _continuation_refusal_announced:
+                                _refusal_f = _continuation_refusal_event()
+                                if _refusal_f is not None:
+                                    _continuation_refusal_announced = True
+                                    yield _refusal_f
                             _meta = _build_metadata_event(
                                 _metadata_usage, _metadata_timings, _metadata_finish_reason
                             )
@@ -32918,6 +34619,11 @@ class LlamaCppBackend:
                                     "text": _CONTINUE_AFTER_LENGTH_STATUS,
                                 }
                             else:
+                                if _next_cap_r != 0 and not _continuation_refusal_announced:
+                                    _refusal_r = _continuation_refusal_event()
+                                    if _refusal_r is not None:
+                                        _continuation_refusal_announced = True
+                                        yield _refusal_r
                                 yield {"type": "status", "text": ""}
                                 # Content events on this stream are CUMULATIVE, so an
                                 # explanation sent on its own replaces whatever is on
@@ -32989,6 +34695,166 @@ class LlamaCppBackend:
 
             except _LlamaStreamCancelled:
                 return
+            except _preemption.LlamaStreamPreempted:
+                # Paused to free KV while the answer was being written, which is not a cancel.
+                # Without it a victim here kept decoding, stayed PREEMPTING, and no room came back.
+                if cancel_event is not None and cancel_event.is_set():
+                    # A user who pressed Stop during a pause still meant Stop. The second gate,
+                    # for a signal set between the reader's check and this one.
+                    return
+                logger.info("llama preemption caught in the final answering pass")
+                _paused_visible = _final_prose[_final_replayed_chars:]
+                _paused_reasoning = reasoning_text[_final_replayed_reasoning_chars:]
+                # Charged once, exactly as the round loop charges its own.
+                _pre_charged_f = self._preempt_charge(
+                    _metadata_usage,
+                    _metadata_timings,
+                    _final_tokens_this_stream,
+                    _paused_visible,
+                    _paused_reasoning,
+                )
+                _checkpoint_f = _preemption.StreamCheckpoint(
+                    visible_text = _paused_visible,
+                    reasoning_text = _paused_reasoning,
+                    charged_tokens = _pre_charged_f,
+                    resumes = _preempt_resumes + 1,
+                    reason = getattr(preempt_event, "reason", None),
+                )
+
+                def _final_pause_gave_up():
+                    """End the turn the way a client can read: the notice saying why the answer
+                    stopped, then terminal metadata carrying `length`. The attempt is already in the
+                    accumulators, so the event takes its prompt side only or it is counted twice."""
+                    yield _preempt_gave_up_event(self._effective_context_length, max_tokens)
+                    _gave_up_meta = _build_metadata_event(
+                        *_folded_attempt(_metadata_usage, _metadata_timings), "length"
+                    )
+                    if _gave_up_meta is not None:
+                        yield _gave_up_meta
+
+                if _preempt_resumes >= _MAX_PREEMPT_RESUMES:
+                    # Churning rather than progressing. Refusing to pause again beats pausing
+                    # forever, and the admitted output clamp still bounds this request.
+                    logger.warning(
+                        "Not pausing the final answer again after %d resumes; finishing "
+                        "the turn instead",
+                        _preempt_resumes,
+                    )
+                    # Nothing decodes after this, but the participant must not be left
+                    # PREEMPTING either: a sweep before teardown would count a chosen victim
+                    # whose pause is never coming.
+                    _decline_the_pause(preempt_policy, "final pass")
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                    # The attempt really did decode these: without the fold, an interrupted
+                    # stream with no terminal usage chunk reported none of them.
+                    _accumulated_completion_tokens += _pre_charged_f
+                    _it_d_f = _metadata_timings or {}
+                    _accumulated_predicted_ms += _it_d_f.get("predicted_ms", 0)
+                    _accumulated_predicted_n += _it_d_f.get("predicted_n", 0)
+                    yield from _final_pause_gave_up()
+                    return
+                _preempt_resumes += 1
+                _accumulated_completion_tokens += _pre_charged_f
+                _it_p_f = _metadata_timings or {}
+                _accumulated_predicted_ms += _it_p_f.get("predicted_ms", 0)
+                _accumulated_predicted_n += _it_p_f.get("predicted_n", 0)
+                if _remaining_output_budget(0) == 0:
+                    # The caller's cap is spent: nothing to wait for, and reopening the stream
+                    # for one floored token went past the cap by that token.
+                    logger.info("Paused final answer with the output cap spent; ending the turn")
+                    _spent_meta_f = _build_metadata_event(
+                        *_folded_attempt(_metadata_usage, _metadata_timings), "length"
+                    )
+                    if _spent_meta_f is not None:
+                        yield _spent_meta_f
+                    return
+                try:
+                    preempt_policy.on_preempted(_checkpoint_f)
+                except Exception:
+                    logger.debug(
+                        "preemption policy raised on pause; resuming anyway", exc_info = True
+                    )
+                # Yielded AFTER on_preempted, so the signal cannot reach the client before the
+                # lease it describes has gone back.
+                yield {"type": "preempt", "state": "paused"}
+                try:
+                    _resumed_f = yield from _await_resume(preempt_policy, cancel_event)
+                    # Cleared BEFORE `on_resumed`, for the reason the round loop gives: after it
+                    # the clear races the sweep and can erase a pause already counted as room.
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                    if _resumed_f:
+                        preempt_policy.on_resumed()
+                except Exception:
+                    # Not a grant, as the round loop says: the lease is already back.
+                    logger.warning(
+                        "preemption policy raised during the wait; ending the turn",
+                        exc_info = True,
+                    )
+                    _resumed_f = False
+                    if preempt_event is not None:
+                        preempt_event.clear()
+                if not _resumed_f:
+                    logger.info(
+                        "Paused final answer was not resumed; ending the turn with what "
+                        "it has and telling the client"
+                    )
+                    yield from _final_pause_gave_up()
+                    return
+                # Paired with the pause above, so a client that shows one shows the other.
+                yield {"type": "preempt", "state": "resumed"}
+                # The partial goes back as the turn to EXTEND, through the round loop's assembler.
+                # Assembling must never end the turn, so any failure re-issues the attempt whole.
+                _resume_messages = list(stream_payload["messages"])
+                _merged_p = trailing_assistant_text(_resume_messages) is not None
+                try:
+                    _resume_continues = self._assemble_preempt_resume(
+                        _resume_messages, _checkpoint_f, _paused_visible, _paused_reasoning
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not assemble a preemption resume for the final answer; "
+                        "re-issuing the attempt whole and continuing",
+                        exc_info = True,
+                    )
+                    _resume_continues = False
+                if _resume_continues:
+                    # The replay is text the MODEL just produced and the first payload neutralized
+                    # what it carried, so a template delimiter in it would read as chat structure.
+                    _resume_messages = neutralize_control_markup_in_messages(
+                        _resume_messages, None, self.markup_profile
+                    )
+                    _resume_tail = _resume_messages[-1:]
+                    stream_payload["messages"] = _resume_messages
+                    _record_refit_tail(_resume_messages, _resume_tail, _merged_p)
+                    # Marked as replayed, so a second pause sends only what is new: both
+                    # accumulators are cumulative, and handing them back twice repeats a sentence.
+                    _final_replayed_chars = len(_final_prose)
+                    _final_replayed_reasoning_chars = len(reasoning_text)
+                    stream_payload["continue_final_message"] = True
+                    stream_payload["add_generation_prompt"] = False
+                # `max_tokens` bounds NEW tokens and this attempt's are already in the
+                # accumulator. Floored at 1: a request for zero tokens returns nothing.
+                _cap_left_p = _remaining_output_budget(0)
+                if _cap_left_p is not None:
+                    stream_payload["max_tokens"] = max(1, _cap_left_p)
+                _stream_done = False
+                _metadata_finish_reason = None
+                # Per attempt: this attempt's charge has just been folded into the accumulator,
+                # so leaving these would charge them again to an attempt that reports none.
+                _metadata_usage = None
+                _metadata_timings = None
+                # The resumed attempt starts from what is on screen now, so a resume that shows
+                # nothing new is judged on its own.
+                _attempt_started_at = _last_emitted
+                # Per attempt: `on_preempted` moved this attempt's tokens into `base_tokens` through
+                # `note_replayed` and `observe` adds the reported count, so carried across the resume
+                # the sweep saw the chat as twice its size. The length continuation does NOT reset.
+                _final_tokens_this_stream = 0
+                # No blank status and no cleared display: this pass keeps `cumulative` across
+                # attempts, and a client whose cursor was reset is sent the partial twice.
+                continue
             except httpx.ConnectError:
                 raise RuntimeError("Lost connection to llama-server")
             except Exception as e:
