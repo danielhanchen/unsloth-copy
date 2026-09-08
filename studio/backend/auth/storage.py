@@ -397,9 +397,44 @@ _ACCOUNT_COLUMNS = (
 )
 
 
+_owner_id_repaired: set[str] = set()
+
+
+def _repair_owner_account_id(conn: sqlite3.Connection) -> None:
+    """Give the owner back an identity when the columns exist but its row has none.
+
+    Reachable by a crash inside this build's first bootstrap followed by an older build
+    seeding the owner, which writes no ``account_id``. The backfill below no longer runs
+    for that database, and every authenticated request fails without an id. Once per
+    process per database, so a warm connection issues nothing.
+    """
+    db_key = str(DB_PATH)
+    if db_key in _owner_id_repaired:
+        return
+    from utils.account_context import OWNER_ACCOUNT_ID, ROLE_OWNER
+
+    repaired = conn.execute(
+        "UPDATE auth_user SET account_id = ?, role = ?, created_at = COALESCE(created_at, ?) "
+        "WHERE username = ? AND account_id IS NULL",
+        (
+            OWNER_ACCOUNT_ID,
+            ROLE_OWNER,
+            datetime.now(timezone.utc).isoformat(),
+            DEFAULT_ADMIN_USERNAME,
+        ),
+    ).rowcount
+    if repaired:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS auth_user_account_id ON auth_user(account_id)"
+        )
+    conn.commit()
+    _owner_id_repaired.add(db_key)
+
+
 def _ensure_account_columns(conn: sqlite3.Connection, existing: set) -> None:
     """Add and backfill the identity columns; additive, so older builds ignore them."""
     if all(name in existing for name, _decl in _ACCOUNT_COLUMNS):
+        _repair_owner_account_id(conn)
         return
     # Two connections can both see the columns missing, so take the write lock and
     # re-read; an ALTER that still loses is the other side's, not an error.
