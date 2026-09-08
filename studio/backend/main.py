@@ -682,23 +682,32 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _lifespan_log.warning("studio.db WAL keeper failed at startup: %s", exc)
 
-    # Reap workers/runs orphaned by a previous crash before new work starts.
+    # Reap workers/runs orphaned by a previous crash, once per account database.
+    from utils.account_context import OWNER as _owner_account, run_as as _run_as
     try:
-        from storage.studio_db import cleanup_orphaned_runs
-        cleanup_orphaned_runs()
+        from core.training.account_jobs import startup_reconciliation_accounts
+        _reconcile_accounts = startup_reconciliation_accounts()
     except Exception as exc:
-        _lifespan_log.warning("cleanup_orphaned_runs failed at startup: %s", exc)
+        _lifespan_log.warning("could not enumerate accounts to reconcile: %s", exc)
+        _reconcile_accounts = [_owner_account]
 
-    try:
-        from storage.chat_generation_runs_db import reconcile_orphaned_runs
-        reconciled_chat_runs = reconcile_orphaned_runs()
-        if reconciled_chat_runs:
-            _lifespan_log.warning(
-                "Marked %s interrupted chat generation run(s) failed after restart.",
-                reconciled_chat_runs,
-            )
-    except Exception as exc:
-        _lifespan_log.warning("chat generation orphan reconciliation failed: %s", exc)
+    for _account in _reconcile_accounts:
+        try:
+            from storage.studio_db import cleanup_orphaned_runs
+            _run_as(_account, cleanup_orphaned_runs)
+        except Exception as exc:
+            _lifespan_log.warning("cleanup_orphaned_runs failed at startup: %s", exc)
+
+        try:
+            from storage.chat_generation_runs_db import reconcile_orphaned_runs
+            reconciled_chat_runs = _run_as(_account, reconcile_orphaned_runs)
+            if reconciled_chat_runs:
+                _lifespan_log.warning(
+                    "Marked %s interrupted chat generation run(s) failed after restart.",
+                    reconciled_chat_runs,
+                )
+        except Exception as exc:
+            _lifespan_log.warning("chat generation orphan reconciliation failed: %s", exc)
 
     try:
         # The boot pass above only settles runs orphaned by the previous process. A run

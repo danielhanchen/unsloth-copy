@@ -377,6 +377,31 @@ def job_accounts() -> list[AccountContext]:
         conn.close()
 
 
+def startup_reconciliation_accounts() -> list[AccountContext]:
+    """The accounts whose databases a boot-time reconciliation has to visit.
+
+    Runs and durable generations live in the acting account's ``studio.db``, so a pass made
+    only in the owner's context leaves every managed account's interrupted row reading
+    ``running`` for good. ``[OWNER]`` on a one-account install, where this changes nothing.
+
+    A managed account is skipped until its database exists: opening one would create it for
+    an account that has never used Studio.
+    """
+    from utils.paths.storage_roots import studio_db_path
+
+    accounts: list[AccountContext] = []
+    for account in job_accounts():
+        if account.is_owner:
+            accounts.append(account)
+            continue
+        try:
+            if run_as(account, studio_db_path).is_file():
+                accounts.append(account)
+        except (OSError, ValueError):
+            continue
+    return accounts
+
+
 def validate_recipe_access(recipe) -> None:
     """Validate nested recipe sources before the designer opens files or providers."""
     if not managed_account():
