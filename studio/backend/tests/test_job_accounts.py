@@ -21,7 +21,14 @@ from auth import policy
 from core.training import account_jobs as jobs
 from core.training.training import TrainingBackend, TrainingProgress
 from utils.account_context import AccountContext, OWNER, arun_as, current_account, run_as
-from utils.paths import exports_root, outputs_root, rag_root, tensorboard_root, workspace_root
+from utils.paths import (
+    exports_root,
+    outputs_root,
+    rag_root,
+    studio_db_path,
+    tensorboard_root,
+    workspace_root,
+)
 
 ALICE = AccountContext("alice-job-account", "alice")
 BOB = AccountContext("bob-job-account", "bob")
@@ -895,3 +902,70 @@ def test_diffusion_status_releases_ownership_after_child_teardown():
     state = run_as(BOB, service.status)
     assert service.job_account is None
     assert state["status"] == "idle" and state["base_model"] is None
+
+
+def test_startup_reconciliation_visits_every_account_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "studio"))
+    monkeypatch.setattr(jobs, "job_accounts", lambda: [OWNER, ALICE, BOB])
+    alice_db = run_as(ALICE, studio_db_path)
+    alice_db.parent.mkdir(parents = True, exist_ok = True)
+    alice_db.write_bytes(b"")
+    # BOB has never used Studio: reconciling would create a database for him.
+    assert jobs.startup_reconciliation_accounts() == [OWNER, ALICE]
+    assert not run_as(BOB, studio_db_path).exists()
+
+
+def test_startup_settles_the_runs_of_every_account():
+    """Both boot reconciliations run per account, not once in the owner's context, or a
+    managed account's interrupted rows read `running` for good."""
+    import ast
+
+    source = (Path(jobs.__file__).resolve().parents[2] / "main.py").read_text(encoding = "utf-8")
+    direct = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"cleanup_orphaned_runs", "reconcile_orphaned_runs"}
+    ]
+    assert direct == []
+    assert "startup_reconciliation_accounts" in source
+
+
+def test_a_managed_download_blocks_the_shared_dataset_delete(monkeypatch):
+    from hub.services.datasets import downloads
+    from hub.services.datasets.cache_inventory import delete_cached_dataset_response
+
+    from hub.services.datasets import cache_inventory
+
+    monkeypatch.setattr(downloads, "_account_registries", {})
+    monkeypatch.setattr(downloads, "_deleting", set(), raising = False)
+    deleted = []
+    monkeypatch.setattr(
+        cache_inventory,
+        "_delete_cached_dataset_blocking",
+        lambda *args, **kwargs: deleted.append(args) or {"deleted": True},
+    )
+    alice = run_as(ALICE, downloads._account_registry)
+    alice.claim("org/dataset", "http", repo_type = "dataset", repo_id = "org/dataset")
+    # The owner deletes the shared cache the managed account's worker is writing into.
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(delete_cached_dataset_response("org/dataset"))
+    assert exc.value.status_code == 400
+    assert "Cancel the active download" in exc.value.detail
+    assert deleted == []
+
+
+def test_an_account_registry_opened_during_a_delete_cannot_claim(monkeypatch):
+    from hub.services.datasets import downloads
+
+    monkeypatch.setattr(downloads, "_account_registries", {})
+    monkeypatch.setattr(downloads, "_deleting", set(), raising = False)
+    assert downloads.begin_delete("org/dataset")
+    bob = run_as(BOB, downloads._account_registry)
+    claimed, state = bob.claim("org/dataset", "http", repo_type = "dataset", repo_id = "org/dataset")
+    assert not claimed and state == "deleting"
+    downloads.end_delete("org/dataset")
+    assert run_as(BOB, downloads._account_registry).claim(
+        "org/dataset", "http", repo_type = "dataset", repo_id = "org/dataset"
+    )[0]
