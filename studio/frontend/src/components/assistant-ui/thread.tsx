@@ -143,6 +143,7 @@ import {
   modeAllowsContinuation,
   readIncompleteInfo,
   readTextThoughtSignature,
+  resumesWithoutText,
   claimAutoContinue,
   forgetAutoContinue,
   recordAutoContinue,
@@ -6977,6 +6978,11 @@ const ContinueMessageBarForLastMessage: FC = () => {
   const continuable = useAuiState(({ message }) =>
     isContinuableContent(message.content),
   );
+  // The same question with the "there must be text" half dropped. Selected unconditionally
+  // because the reason is not known until below and a hook cannot be conditional.
+  const continuableIfEmpty = useAuiState(({ message }) =>
+    isContinuableContent(message.content, { allowEmpty: true }),
+  );
   // Gemini signs its text parts, and the resumed turn is replayed from this branch,
   // so the signature travels with the partial.
   const thoughtSignature = useAuiState(({ message }) =>
@@ -6997,7 +7003,15 @@ const ContinueMessageBarForLastMessage: FC = () => {
   const stamped = readIncompleteInfo(metadata);
   const cancelled =
     status?.type === "incomplete" && status?.reason === "cancelled";
-  const reason = cancelled ? ("cancelled" as const) : stamped?.reason;
+  // `paused` has no assistant-ui status of its own, so a reload would relabel it "Response
+  // stopped", which reads as something the user did. The stamp wins for that one.
+  const reason =
+    cancelled && stamped?.reason !== "paused"
+      ? ("cancelled" as const)
+      : stamped?.reason;
+  // A turn the backend gave up on can be empty, and both content gates below assume text,
+  // so together they hid the bar on exactly the turn that most needed it.
+  const noTextIsExpected = resumesWithoutText(reason);
 
   // Every gate the bar itself answers to. Resuming without asking has to clear the same
   // ones, or it would resume a turn the bar would have refused to offer.
@@ -7007,12 +7021,12 @@ const ContinueMessageBarForLastMessage: FC = () => {
     !isRunning &&
     !researchRunId &&
     !researchActive &&
-    continuable &&
+    (noTextIsExpected ? continuableIfEmpty : continuable) &&
     modeAllowsContinuation({
       fromAudioInput,
       audioOutputModel,
     }) &&
-    Boolean(partial.trim());
+    (noTextIsExpected || Boolean(partial.trim()));
 
   // The parent is what every round of one logical turn shares; the message id changes
   // each round, because a continuation runs as a sibling.

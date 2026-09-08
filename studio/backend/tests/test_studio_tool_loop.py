@@ -1199,7 +1199,10 @@ def test_a_second_call_at_one_index_keeps_its_own_argument_fragments(executed):
     )
     _run(transport)
 
-    assert [call["arguments"] for call in executed] == [{"query": "first"}, {"query": "second"}]
+    # Sorted, because the two calls now RUN at once and whichever thread reaches the tool
+    # first records first. This is about argument ROUTING; the order the model sees is the
+    # transcript order, which `_settle_call` still builds in call order.
+    assert sorted((call["arguments"]["query"] for call in executed)) == ["first", "second"]
 
 
 def test_a_fragment_naming_its_call_goes_back_to_that_call(executed):
@@ -1239,4 +1242,7 @@ def test_a_fragment_naming_its_call_goes_back_to_that_call(executed):
     )
     _run(transport)
 
-    assert [call["arguments"] for call in executed] == [{"query": "first"}, {"query": "second"}]
+    # Sorted, because the two calls now RUN at once and whichever thread reaches the tool
+    # first records first. This is about argument ROUTING; the order the model sees is the
+    # transcript order, which `_settle_call` still builds in call order.
+    assert sorted((call["arguments"]["query"] for call in executed)) == ["first", "second"]
