@@ -52,6 +52,9 @@ _dataset_size_cache_lock = threading.Lock()
 _registry = download_registry.get_datasets_registry()
 _account_registries = {}
 _account_registry_lock = threading.Lock()
+# Repos reserved for deletion. Jobs are per account, the Hugging Face cache underneath them is
+# not, so the reservation has to be held in every registry, including one created while it is.
+_deleting: set[str] = set()
 
 
 def _account_registry():
@@ -59,9 +62,43 @@ def _account_registry():
         return _registry
     with _account_registry_lock:
         account_id = current_account().account_id
-        if account_id not in _account_registries:
-            _account_registries[account_id] = download_registry.DownloadRegistry()
-        return _account_registries[account_id]
+        registry = _account_registries.get(account_id)
+        if registry is None:
+            registry = download_registry.DownloadRegistry()
+            # An account whose first download starts mid-delete must not claim the repo either.
+            for reserved in _deleting:
+                registry.begin_delete(reserved)
+            _account_registries[account_id] = registry
+        return registry
+
+
+def begin_delete(repo_id: str) -> bool:
+    """Reserve *repo_id* for deletion across every account's registry.
+
+    One cache is shared by all of them, so a download another account started blocks the
+    delete exactly as the owner's own download does, and the reservation keeps any account's
+    next claim out until :func:`end_delete`. Deleting a repo under a running download leaves
+    its snapshot symlinks pointing at blobs that are gone.
+    """
+    key = download_registry.normalize_repo_key(repo_id)
+    with _account_registry_lock:
+        reserved = []
+        for registry in (_registry, *_account_registries.values()):
+            if not registry.begin_delete(repo_id):
+                for done in reserved:
+                    done.end_delete(repo_id)
+                return False
+            reserved.append(registry)
+        _deleting.add(key)
+        return True
+
+
+def end_delete(repo_id: str) -> None:
+    key = download_registry.normalize_repo_key(repo_id)
+    with _account_registry_lock:
+        _deleting.discard(key)
+        for registry in (_registry, *_account_registries.values()):
+            registry.end_delete(repo_id)
 
 
 def _download_job_key(repo_id: str) -> str:

@@ -680,7 +680,7 @@ async def delete_cached_dataset_response(repo_id: str, cache_path: Optional[str]
         raise HTTPException(status_code = 400, detail = "Invalid repo_id format")
 
     repo_key = await asyncio.to_thread(resolve_cached_repo_id_case, repo_id, repo_type = "dataset")
-    if not downloads.registry.begin_delete(repo_key):
+    if not downloads.begin_delete(repo_key):
         raise HTTPException(
             status_code = 400,
             detail = "Cancel the active download before deleting.",
@@ -688,7 +688,7 @@ async def delete_cached_dataset_response(repo_id: str, cache_path: Optional[str]
     try:
         return await asyncio.to_thread(_delete_cached_dataset_blocking, repo_key, cache_path)
     finally:
-        downloads.registry.end_delete(repo_key)
+        downloads.end_delete(repo_key)
         hf_cache_scan.invalidate_hf_cache_scans()
 
 
