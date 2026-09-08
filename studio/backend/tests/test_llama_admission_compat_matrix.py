@@ -33,6 +33,7 @@ from core.inference.llama_admission import (
 
 def _tokens(payload, *, budget, capacity, tool_loop):
     import routes.inference as routes_inference
+
     return routes_inference._openai_llama_admission_tokens(
         payload,
         budget = budget,
@@ -205,9 +206,9 @@ class TestOldCallers:
         assert queue._reparking == 0, "the non-blocking path must never touch the wait line"
 
     def test_the_route_recost_helper_accepts_no_cancel_event(self):
+        # Reservation None is the "not admitted yet" case every call site can hit.
         import routes.inference as routes_inference
 
-        # Reservation None is the "not admitted yet" case every call site can hit.
         routes_inference._openai_llama_admission_recost(
             None,
             [{"role": "user", "content": "hi"}],
@@ -240,8 +241,9 @@ class TestOldCallers:
         ), f"the hook must be last; signature ends {names[-3:]}"
 
     def test_the_wait_timeout_has_a_sane_default(self):
-        assert DEFAULT_RECOST_WAIT_TIMEOUT_S > 0
         import inspect
+
+        assert DEFAULT_RECOST_WAIT_TIMEOUT_S > 0
 
         from core.inference.llama_admission import LlamaAdmissionLease
 
@@ -329,6 +331,7 @@ class TestTheInjectedToolCatalogueIsCharged:
 
     def test_a_catalogue_of_a_realistic_size_is_not_rounded_away(self):
         import routes.inference as routes_inference
+
         charged = routes_inference._openai_llama_admission_injected_tool_tokens(self.CATALOG)
         assert charged > 500, f"only {charged} tokens charged for a six-tool catalogue"
 
@@ -357,11 +360,13 @@ class TestTheInjectedToolCatalogueIsCharged:
     def test_no_catalogue_means_no_extra_charge(self):
         """A request that injects nothing must be priced exactly as before."""
         import routes.inference as routes_inference
+
         for empty in (None, [], ()):
             assert routes_inference._openai_llama_admission_injected_tool_tokens(empty) == 0
 
     def test_an_unserialisable_catalogue_does_not_break_admission(self):
         import routes.inference as routes_inference
+
         class Awkward:
             def __repr__(self):
                 raise RuntimeError("no")
