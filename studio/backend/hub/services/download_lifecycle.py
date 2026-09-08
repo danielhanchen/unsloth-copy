@@ -32,6 +32,20 @@ _job_accounts: dict[tuple[int, str], str] = {}
 _job_accounts_lock = threading.Lock()
 
 
+def record_download_account(registry, key: str) -> None:
+    """Attribute *key* to the acting account.
+
+    Called the moment the registry claim succeeds, before anything slow: the job is
+    observable to other requests from that instant, and until this lands the key still
+    carries whichever account last downloaded it, so a stale owner would pass
+    ``require_download_account`` for someone else's fresh job.
+    """
+    if account_access.account_scope() is None:
+        return
+    with _job_accounts_lock:
+        _job_accounts[(id(registry), key)] = current_account_id()
+
+
 def download_belongs_to_account(registry, key: str) -> bool:
     if account_access.account_scope() is None:
         return True
@@ -1239,13 +1253,13 @@ def launch_worker(
     # Only the Xet success-recording consumes this, and sampling lazy-loads unsloth_zoo, so torch and
     # transformers, on the request path.
     if account_access.account_scope() is not None:
+        # Before the Hub round trip: the claim is already published as running.
+        record_download_account(registry, key)
         try:
             account_access.authorize_download(repo_id, repo_type, hf_token)
         except HTTPException:
             registry.set_job(key, "error", "Repository not found")
             raise
-        with _job_accounts_lock:
-            _job_accounts[(id(registry), key)] = current_account_id()
     _baseline: Optional[int] = None
     if transport == download_registry.TRANSPORT_XET:
         # Before spawn(), deliberately: a small download can finalize its blobs while we are still

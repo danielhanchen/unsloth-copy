@@ -364,6 +364,54 @@ def test_download_cancel_and_status_are_owned_by_the_initiating_account():
     assert run_as(ALICE, download_lifecycle.download_belongs_to_account, registry, key)
 
 
+def test_download_ownership_replaces_the_previous_downloader_of_the_same_key():
+    registry = download_registry.DownloadRegistry()
+    key = "org/secret::"
+    download_lifecycle._job_accounts[(id(registry), key)] = BOB.account_id
+    run_as(ALICE, download_lifecycle.record_download_account, registry, key)
+    assert run_as(ALICE, download_lifecycle.download_belongs_to_account, registry, key)
+    assert not run_as(BOB, download_lifecycle.download_belongs_to_account, registry, key)
+
+
+def test_download_ownership_lands_before_the_hub_authorization(monkeypatch):
+    """The claim publishes the job as running, so the previous downloader of this key must
+    not still own it while the Hub round trip runs."""
+    registry = download_registry.DownloadRegistry()
+    key = "org/secret::"
+    download_lifecycle._job_accounts[(id(registry), key)] = BOB.account_id
+    registry.claim(key, "http", repo_type = "model", repo_id = "org/secret")
+    seen = {}
+
+    def repo_info(*args, **kwargs):
+        seen["bob"] = run_as(BOB, download_lifecycle.download_belongs_to_account, registry, key)
+        seen["alice"] = run_as(ALICE, download_lifecycle.download_belongs_to_account, registry, key)
+        return SimpleNamespace(gated = False)
+
+    monkeypatch.setattr(access, "HfApi", lambda: SimpleNamespace(repo_info = repo_info))
+
+    def spawn():
+        raise OSError("no worker in this test")
+
+    with pytest.raises(HTTPException):
+        run_as(
+            ALICE,
+            lambda: download_lifecycle.launch_worker(
+                registry,
+                key,
+                spawn = spawn,
+                hf_token = "alice-token",
+                label = "org/secret",
+                log_prefix = "Download",
+                logger = logging.getLogger(__name__),
+                repo_type = "model",
+                repo_id = "org/secret",
+                transport = "http",
+                watch_name = "watch",
+            ),
+        )
+    assert seen == {"bob": False, "alice": True}
+
+
 def test_single_owner_does_no_hub_or_grant_io(monkeypatch, tmp_path):
     def unexpected(*args, **kwargs):
         raise AssertionError("owner must not probe private-model policy")

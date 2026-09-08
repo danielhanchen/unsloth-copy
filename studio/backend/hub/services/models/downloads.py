@@ -326,6 +326,8 @@ async def download_model_response(
             # partial.
             "cancel_transport": _registry.job_cancel_transport(key),
         }
+    # Record ownership with the claim, not at launch, or the last downloader keeps the key.
+    download_lifecycle.record_download_account(_registry, key)
     download_manifest.clear_cancel_marker(
         "model",
         repo_id,
