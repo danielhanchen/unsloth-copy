@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import * as admissionStatus from "../src/features/chat/utils/admission-status.ts";
 import { loadWithStubs } from "./helpers/module-stubs.ts";
 
 type Module = {
@@ -63,6 +64,9 @@ function harness(response: ReturnType<typeof jsonResponse>) {
         notifyChatHistoryUpdated: () => {},
         isCoalescedHistoryEvent: () => false,
       },
+      // The real module, not a double: it is pure, imports nothing, and is only reached from
+      // the SSE reader these tests never enter.
+      "../utils/admission-status": admissionStatus,
       "./generation-length.ts": {},
       "./gguf-variants-request": {},
       "./padded-response": { assertCompletedPaddedBody: () => {} },
