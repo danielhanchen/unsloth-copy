@@ -250,6 +250,33 @@ def test_shared_dataset_catalog_is_filtered_for_each_account(monkeypatch):
     assert len(rows) == 2
 
 
+def test_the_shared_chat_template_read_needs_model_access(monkeypatch):
+    """The template walks the shared cache and returns a private repo's raw text, so it is
+    a model read like any other."""
+    from picker.routes import templates
+
+    monkeypatch.setattr(access, "repo_is_public", lambda *a, **k: False)
+    monkeypatch.setattr(templates, "read_default_chat_template", lambda *a, **k: "{{ raw }}")
+    run_as(ALICE, access.record_model_grant, "org/secret")
+
+    async def read(account):
+        return await arun_as(
+            account,
+            templates.get_default_chat_template_route(
+                model_name = "org/secret",
+                gguf_variant = None,
+                hf_token = None,
+                current_subject = account.username,
+            ),
+        )
+
+    assert asyncio.run(read(OWNER)).chat_template == "{{ raw }}"
+    assert asyncio.run(read(ALICE)).chat_template == "{{ raw }}"
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(read(BOB))
+    assert refused.value.status_code == 404
+
+
 def test_local_inventory_does_not_mutate_shared_scan_objects():
     class Response:
         models = [SimpleNamespace(path = "org/secret", id = "same-id")]
