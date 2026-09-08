@@ -207,10 +207,10 @@ def seed_model(account) -> dict[str, str]:
     return {"model_id": MODEL_ID}
 
 
-# One HMAC link, not the bearer, is the whole credential on the two /file-signed routes.
+# One HMAC link, not the bearer, is the credential on the two /file-signed routes.
 _LINK_IS_THE_CREDENTIAL = (
-    "the signed link is the credential rather than the bearer, so every holder of it is served, "
-    "a deactivated account's own link included"
+    "the signed link is the credential rather than the bearer, so every holder of it is served "
+    "while the minting account is active"
 )
 
 FACTORIES = {
@@ -224,7 +224,6 @@ FACTORIES = {
         owner = (200,),
         wrong = (200,),
         unauthenticated = (200,),
-        deactivated = (200,),
         reason = _LINK_IS_THE_CREDENTIAL,
     ),
     "routes.inference:PATCH:/images/gallery/{image_id}": Factory(
@@ -243,7 +242,6 @@ FACTORIES = {
         owner = (200,),
         wrong = (200,),
         unauthenticated = (200,),
-        deactivated = (200,),
         reason = _LINK_IS_THE_CREDENTIAL,
     ),
     "routes.video:GET:/video/gallery/{video_id}/signed-url": Factory(
