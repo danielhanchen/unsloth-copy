@@ -1,0 +1,2 @@
+unsloth==2026.9.3
+unsloth-zoo==2026.9.2
