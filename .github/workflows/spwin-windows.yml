@@ -89,3 +89,45 @@ jobs:
           # real shipped path rather than a lookalike.
           if ("${{ matrix.flag }}" -eq "") { Remove-Item Env:\UNSLOTH_DISABLE_SENTENCEPIECE -ErrorAction SilentlyContinue }
           python tests/ci/ci_probe_sentencepiece.py ${{ matrix.mode }}
+
+  # The Studio worker shape. Workers are spawned interpreters that import transformers long
+  # before they import unsloth, so the rule has to be installed by their shared entrypoint,
+  # utils.native_path_leases.run_without_native_path_secret, before it imports the worker
+  # module. transformers and sentencepiece only: this path deliberately costs no torch.
+  worker-entrypoint:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: worker-control
+            mode: control
+            flag: "0"
+          - leg: worker-treatment
+            mode: treatment
+            flag: ""
+    name: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "transformers==5.5.0" sentencepiece protobuf huggingface_hub tiktoken blobfile
+          python -c "import sentencepiece, sys; print('sentencepiece', sentencepiece.__version__, 'importable in a fresh process')"
+
+      - name: Probe
+        shell: pwsh
+        env:
+          UNSLOTH_DISABLE_SENTENCEPIECE: ${{ matrix.flag }}
+          PROBE_MODELS: "unsloth/gemma-3-270m-it"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          if ("${{ matrix.flag }}" -eq "") { Remove-Item Env:\UNSLOTH_DISABLE_SENTENCEPIECE -ErrorAction SilentlyContinue }
+          python tests/ci/ci_probe_worker_entrypoint.py ${{ matrix.mode }}

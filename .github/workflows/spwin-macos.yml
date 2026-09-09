@@ -67,6 +67,14 @@ jobs:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: python tests/ci/ci_probe_sentencepiece.py treatment
 
+      # control mode, so the assertion is "a worker still loads sentencepiece": off Windows the
+      # shared entrypoint must leave it alone.
+      - name: The worker entrypoint leaves it alone off Windows
+        env:
+          PROBE_MODELS: "unsloth/gemma-3-270m-it"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python tests/ci/ci_probe_worker_entrypoint.py control
+
       - name: Unit tests
         run: |
           python -m pip install pytest
