@@ -1,0 +1,214 @@
+# Staging-only probe: drive install.ps1 down its NATIVE Windows-on-ARM CUDA path on GitHub's
+# hosted windows-11-arm runner. The runner has no NVIDIA GPU and the default wheelhouse
+# (huggingface.co/unsloth/windows-arm64-wheels) does not exist yet, so two things are
+# supplied here that a real machine would have: a spoofed nvidia-smi that answers every
+# query shape the installers issue, and a local wheelhouse holding the win_arm64 pyarrow
+# wheels built on this runner from the Arrow 25.0.1 tag plus sqlite-vec 0.1.9. Everything else
+# (torch 2.14.0+cu134 from pypi.nvidia.com/nvtorch_oot, the NVIDIA index probing, the
+# override swap, the drop list, setup.ps1's own CUDA trio install) is the real code path.
+#
+# What this proves: the native path installs an importable +cu134 torch, a working pyarrow
+# and a runnable unsloth CLI on a native ARM64 interpreter. What it cannot prove: that CUDA
+# kernels run (no GPU here).
+name: WoA native CUDA probe
+
+on:
+  push:
+    branches: [woa-probe-v1]
+  workflow_dispatch:
+
+concurrency:
+  group: woa-native-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
+
+jobs:
+  native:
+    name: windows-11-arm / native ARM64 CUDA path (spoofed GPU, staged pyarrow)
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The only win_arm64 pyarrow wheel that exists anywhere today: crossbow's cp314 build.
+      # The release's browser URL 404s anonymously; the API asset URL with an octet-stream
+      # Accept header serves it without a token.
+      # The wheelhouse is a real Hugging Face URL, as in production: the win_arm64 wheels built
+      # on this runner (pyarrow 25.0.1 cp311-cp314 from apache/arrow#48539's script, sqlite-vec
+      # 0.1.9 repacked with an ARM64 DLL), with the index.txt the installer reads.
+      - name: Point the installer at the staging wheelhouse
+        shell: pwsh
+        run: |
+          $base = 'https://huggingface.co/danielhanchen/unsloth-blackwell-docker/resolve/main/windows-arm64-wheels'
+          (Invoke-WebRequest -Uri "$base/index.txt" -UseBasicParsing).Content
+          "UNSLOTH_WOA_WHEELHOUSE=$base" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # A real nvidia-smi.exe, built by Windows PowerShell 5.1 (pwsh cannot emit console
+      # exes). It answers -L with a "GPU 0:" row, the bare banner with a CUDA Version, and
+      # every --query-gpu field the installers ask for, honouring nounits.
+      - name: Spoof an NVIDIA GPU
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'fake-nvidia'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $src = @'
+          using System;
+          using System.Collections.Generic;
+          public static class FakeSmi {
+              public static int Main(string[] a) {
+                  string joined = string.Join(" ", a);
+                  const string name = "NVIDIA GeForce RTX 5090 Laptop GPU";
+                  const string uuid = "GPU-12345678-1234-1234-1234-123456789abc";
+                  if (a.Length == 0) {
+                      Console.WriteLine("Sun Sep  6 12:00:00 2026");
+                      Console.WriteLine("+-----------------------------------------------------------------------------------------+");
+                      Console.WriteLine("| NVIDIA-SMI 591.44                 Driver Version: 591.44         CUDA Version: 13.4     |");
+                      Console.WriteLine("|-----------------------------------------+------------------------+----------------------+");
+                      Console.WriteLine("| GPU  Name                  Driver-Model | Bus-Id           Disp.A | Volatile Uncorr. ECC |");
+                      Console.WriteLine("|   0  " + name + "     WDDM  |   00000000:01:00.0  On |                  N/A |");
+                      Console.WriteLine("+-----------------------------------------+------------------------+----------------------+");
+                      return 0;
+                  }
+                  if (a[0] == "-L" || a[0] == "--list-gpus") {
+                      Console.WriteLine("GPU 0: " + name + " (UUID: " + uuid + ")");
+                      return 0;
+                  }
+                  string q = null;
+                  foreach (string x in a) { if (x.StartsWith("--query-gpu=")) { q = x.Substring(12); } }
+                  if (q != null) {
+                      bool nounits = joined.Contains("nounits");
+                      var vals = new List<string>();
+                      foreach (string raw in q.Split(',')) {
+                          string f = raw.Trim(); string v;
+                          if (f == "") continue;
+                          switch (f) {
+                              case "index": v = "0"; break;
+                              case "name": v = name; break;
+                              case "uuid": v = uuid; break;
+                              case "compute_cap": v = "12.0"; break;
+                              case "memory.total": v = nounits ? "24564" : "24564 MiB"; break;
+                              case "memory.used": v = nounits ? "512" : "512 MiB"; break;
+                              case "memory.free": v = nounits ? "24052" : "24052 MiB"; break;
+                              case "utilization.gpu": v = nounits ? "0" : "0 %"; break;
+                              case "utilization.memory": v = nounits ? "0" : "0 %"; break;
+                              case "temperature.gpu": v = "40"; break;
+                              case "driver_version": v = "591.44"; break;
+                              case "power.draw": v = nounits ? "10.00" : "10.00 W"; break;
+                              case "pstate": v = "P8"; break;
+                              case "pci.bus_id": v = "00000000:01:00.0"; break;
+                              default: v = "[N/A]"; break;
+                          }
+                          vals.Add(v);
+                      }
+                      Console.WriteLine(string.Join(", ", vals.ToArray()));
+                      return 0;
+                  }
+                  Console.WriteLine("GPU 0: " + name);
+                  return 0;
+              }
+          }
+          '@
+          Set-Content -LiteralPath (Join-Path $dir 'smi.cs') -Value $src -Encoding utf8
+          & powershell.exe -NoProfile -NonInteractive -Command "Add-Type -TypeDefinition (Get-Content -Raw '$dir\smi.cs') -OutputAssembly '$dir\nvidia-smi.exe' -OutputType ConsoleApplication"
+          if (-not (Test-Path -LiteralPath "$dir\nvidia-smi.exe")) { Write-Host '::error::could not build the spoof'; exit 1 }
+          Write-Host '--- -L'; & "$dir\nvidia-smi.exe" -L
+          Write-Host '--- banner'; & "$dir\nvidia-smi.exe"
+          Write-Host '--- compute_cap'; & "$dir\nvidia-smi.exe" --query-gpu=compute_cap --format=csv,noheader
+          Write-Host '--- memory'; & "$dir\nvidia-smi.exe" --query-gpu=index,name,memory.total --format=csv,noheader,nounits
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # The installer's default minor, found as a user's machine would have it: the image
+      # ships a native ARM64 3.13 on PATH, so no setup-python and no UNSLOTH_PYTHON.
+      - name: Confirm the spoof and the interpreter are what install.ps1 will see
+        shell: pwsh
+        run: |
+          (Get-Command nvidia-smi).Source
+          python -c "import sys, sysconfig, platform; print(sys.version, sysconfig.get_platform(), platform.machine())"
+
+      - name: Install (native path)
+        id: install
+        shell: pwsh
+        env:
+          # The checked-out ref supplies setup.ps1 / install_python_stack.py, not the
+          # released wheel (see clean-machine-install-ci.yml's header).
+          UNSLOTH_CI_SOURCE_OVERLAY: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          # Under powershell.exe, as the desktop and a clean box run it.
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File ./install.ps1 *>&1 | Tee-Object -FilePath logs/install.log
+          $rc = $LASTEXITCODE
+          Write-Host "installer exit code: $rc"
+          exit $rc
+
+      - name: What the installer said about the path it took
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path logs/install.log) {
+            Select-String -Path logs/install.log -Pattern 'windows on arm|Windows on ARM|native|win_arm64|cu134|nvtorch|pyarrow|wheelhouse' |
+              ForEach-Object { $_.Line } | Select-Object -First 80
+          }
+
+      - name: Assert the native ARM64 CUDA stack
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:UNSLOTH_STUDIO_HOME 'unsloth_studio'
+          $py = Join-Path $venv 'Scripts\python.exe'
+          if (-not (Test-Path -LiteralPath $py)) { Write-Host "::error::no managed Python at $py"; exit 1 }
+          $tag = (& $py -c "import sysconfig; print(sysconfig.get_platform())" 2>&1 | Out-String).Trim()
+          Write-Host "venv interpreter platform: $tag"
+          if ($tag -ne 'win-arm64') { Write-Host "::error::the venv is '$tag', so the native path was not taken"; exit 1 }
+          $tv = (& $py -c "import torch; print(torch.__version__)" 2>&1 | Out-String).Trim()
+          Write-Host "torch: $tv"
+          if ($LASTEXITCODE -ne 0 -or $tv -notlike '*+cu13*') { Write-Host "::error::torch is not a native CUDA build: $tv"; exit 1 }
+          $pav = (& $py -c "import pyarrow, sys; print(pyarrow.__version__)" 2>&1 | Out-String).Trim()
+          Write-Host "pyarrow: $pav"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::pyarrow does not import'; exit 1 }
+          if ($pav -ne '25.0.1') { Write-Host "::error::pyarrow is $pav, not the wheelhouse's 25.0.1 release build"; exit 1 }
+          & $py -c "import pyarrow.parquet as pq, pyarrow as pa; t = pa.table({'a': [1, 2]}); pq.write_table(t, 'p.parquet'); assert pq.read_table('p.parquet').equals(t); print('parquet round trip ok')"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::pyarrow parquet round trip failed'; exit 1 }
+          & $py -c "import sqlite3, sqlite_vec; db = sqlite3.connect(':memory:'); db.enable_load_extension(True); sqlite_vec.load(db); print('sqlite_vec', sqlite_vec.__version__, db.execute('select vec_version()').fetchone()[0])"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::sqlite_vec from the wheelhouse does not load'; exit 1 }
+          & $py -c "import torchvision; print('torchvision', torchvision.__version__)"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::torchvision does not import'; exit 1 }
+          & $py -c "import datasets, transformers, trl; print('datasets', datasets.__version__, 'transformers', transformers.__version__, 'trl', trl.__version__)"
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::the HF stack does not import'; exit 1 }
+          $cli = Join-Path $venv 'Scripts\unsloth.exe'
+          & $cli --version
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::the unsloth CLI does not run'; exit 1 }
+          & $py -c "import torch; print('cuda available (expected False, no GPU here):', torch.cuda.is_available())"
+
+      # No GPU on this runner, so an import that insists on one is information, not a verdict.
+      - name: Import unsloth (informational)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:UNSLOTH_STUDIO_HOME 'unsloth_studio\Scripts\python.exe'
+          & $py -c "import unsloth; print('unsloth', unsloth.__version__)"
+
+      - name: What the venv holds
+        if: always()
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:UNSLOTH_STUDIO_HOME 'unsloth_studio\Scripts\python.exe'
+          if (Test-Path -LiteralPath $py) { & $py -m pip list 2>$null | Select-String -Pattern 'torch|pyarrow|numpy|pandas|unsloth|xformers|triton|bitsandbytes|hf|tiktoken|regex|sqlite|grpcio|brotli|llama|numba|librosa' }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: woa-native-probe-logs
+          path: |
+            logs/
+            .studio-home/**/*.log
+            .studio-home/**/*.json
+          if-no-files-found: ignore
