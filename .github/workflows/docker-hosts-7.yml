@@ -1,0 +1,119 @@
+# Round 7: the published Studio image (unsloth/unsloth:latest) after unsloth#10495,
+# which keeps the base image's CUDA llama.cpp bundle instead of letting the GPU-less
+# build replace it with a CPU prebuilt. Every hosted runner is GPU-less too, so this
+# round proves the CUDA bundle still serves CPU inference on Linux amd64/arm64,
+# Windows (WSL 2) and macOS (Apple Silicon and Intel through colima), on top of the
+# round 6 import, JupyterLab and Studio boot checks. Assertions live in
+# .github/staging/latest_check.sh.
+name: Docker on hosted runners, round 7 (latest after 10495)
+
+on:
+  push:
+    branches: ['docker-hosts-7']
+  workflow_dispatch:
+
+env:
+  IMAGE: unsloth/unsloth:latest
+  REV: 580cffabac84cf0d373d27ebed2af4251dbbf88e
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            machine: x86_64
+          - os: ubuntu-24.04-arm
+            machine: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true; df -h /
+      - name: latest on ${{ matrix.machine }} (bundle, CPU inference, imports, Studio boot)
+        run: bash .github/staging/latest_check.sh "$IMAGE" "${{ matrix.machine }}" "$REV" 1
+
+  windows-wsl2:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::rootfs checksum mismatch: got $actual"; exit 1 }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+          $drive = $PWD.Drive.Name.ToLower()
+          $rest = $PWD.Path.Substring(2) -replace '\\', '/'
+          $p = "/mnt/$drive$rest"
+          Write-Host "WSL_WS=$p"
+          Add-Content -Path $env:GITHUB_ENV -Value "WSL_WS=$p"
+
+      - name: Install Docker inside WSL 2 and start the daemon
+        shell: pwsh
+        run: |
+          $setup = @'
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl docker.io iptables >/dev/null
+          dockerd --version
+          nohup dockerd --iptables=false --bridge=none >/var/log/dockerd.log 2>&1 &
+          for i in $(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}} storage={{.Driver}}' || { tail -40 /var/log/dockerd.log; exit 1; }
+          df -h / | tail -1; nproc; free -g | head -2
+          '@
+          [IO.File]::WriteAllText("$PWD/wsl-dist/setup.sh", ($setup -replace "`r`n", "`n"))
+          wsl -d unsloth-ci -u root -- bash "$env:WSL_WS/wsl-dist/setup.sh"
+
+      - name: latest inside WSL 2 (bundle, CPU inference, imports, Studio boot)
+        shell: pwsh
+        run: |
+          $script = Get-Content -Raw .github/staging/latest_check.sh
+          [IO.File]::WriteAllText("$PWD/wsl-dist/latest_check.sh", ($script -replace "`r`n", "`n"))
+          wsl -d unsloth-ci -u root -- bash "$env:WSL_WS/wsl-dist/latest_check.sh" "$env:IMAGE" x86_64 "$env:REV" 1
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            machine: aarch64
+            vm: qemu
+          - os: macos-15-intel
+            machine: x86_64
+            vm: default
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host
+        run: uname -m; sw_vers; sysctl -n kern.hv_support || true; df -h / | tail -1
+      - name: Install colima and start a Linux VM
+        run: |
+          brew install --quiet docker colima qemu 2>&1 | tail -2
+          if [ "${{ matrix.vm }}" = qemu ]; then
+            colima start --vm-type qemu --cpu 3 --memory 8 --disk 90 2>&1 | tail -8
+          elif colima start --cpu 3 --memory 8 --disk 90 2>&1 | tail -8; then
+            echo "backend: default"
+          else
+            colima delete -f 2>/dev/null || true
+            colima start --vm-type qemu --cpu 3 --memory 8 --disk 90 2>&1 | tail -8
+            echo "backend: qemu"
+          fi
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: latest on ${{ matrix.machine }} (bundle, CPU inference, imports)
+        run: bash .github/staging/latest_check.sh "$IMAGE" "${{ matrix.machine }}" "$REV" 0
+      - name: Stop
+        if: always()
+        run: colima stop 2>/dev/null || true
