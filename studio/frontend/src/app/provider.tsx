@@ -408,6 +408,7 @@ function TauriUpdateLayer({
       <UpdateBanner
         status={update.status}
         info={update.info}
+        preparation={update.preparation}
         dismissed={update.dismissed}
         lastFailure={update.lastFailure}
         isExternalServer={isExternalServer}
