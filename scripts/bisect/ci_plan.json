@@ -1,0 +1,119 @@
+{
+ "_comment": "Default job plan per staging repo. pairs = [from, to, mode]; mode plain = `unsloth studio update`, staged = `--stage` then activate (desktop path, releases >= 805 only). pr_matrix = which PR-wheel verification jobs this repo runs; the three staging repos share one PR matrix so a PR is verified in one pass over all three rather than three identical passes. upgrade_from = the releases each repo installs before updating to the PR wheel.",
+ "danielhanchen/unsloth-staging-2": {
+  "pairs": [
+   [
+    800,
+    801,
+    "plain"
+   ],
+   [
+    801,
+    802,
+    "plain"
+   ],
+   [
+    802,
+    803,
+    "plain"
+   ]
+  ],
+  "chain": false,
+  "policy": false,
+  "pr_matrix": {
+   "upgrade_from": [
+    805,
+    806
+   ],
+   "oldshell": true,
+   "nested": false,
+   "faults": false,
+   "prefetch": true,
+   "timing": false,
+   "cargo": false,
+   "policy": false
+  }
+ },
+ "Datta0/unsloth-staging-3": {
+  "pairs": [
+   [
+    803,
+    804,
+    "plain"
+   ],
+   [
+    804,
+    805,
+    "plain"
+   ],
+   [
+    805,
+    806,
+    "staged"
+   ]
+  ],
+  "chain": false,
+  "policy": false,
+  "pr_matrix": {
+   "upgrade_from": [
+    807
+   ],
+   "oldshell": false,
+   "nested": true,
+   "faults": true,
+   "prefetch": true,
+   "timing": false,
+   "cargo": true,
+   "policy": false
+  }
+ },
+ "shimmyshimmer/unsloth-staging-4": {
+  "pairs": [
+   [
+    806,
+    807,
+    "staged"
+   ],
+   [
+    806,
+    807,
+    "plain"
+   ]
+  ],
+  "chain": true,
+  "policy": true,
+  "pr_matrix": {
+   "upgrade_from": [],
+   "oldshell": false,
+   "nested": false,
+   "faults": false,
+   "prefetch": true,
+   "timing": true,
+   "cargo": false,
+   "policy": true
+  }
+ },
+ "_default": {
+  "pairs": [
+   [
+    806,
+    807,
+    "staged"
+   ]
+  ],
+  "chain": false,
+  "policy": false,
+  "pr_matrix": {
+   "upgrade_from": [
+    806
+   ],
+   "oldshell": true,
+   "nested": true,
+   "faults": true,
+   "prefetch": true,
+   "timing": true,
+   "cargo": false,
+   "policy": false
+  }
+ }
+}

@@ -1,0 +1,3 @@
+# harness: time-travel only unsloth + unsloth-zoo to release 805
+[pip]
+exclude-newer-package = { unsloth = "2026-09-02T12:24:40Z", unsloth-zoo = "2026-09-02T12:24:40Z" }
