@@ -951,8 +951,7 @@ STAGE_ROOT="${UNSLOTH_STUDIO_STAGE_ROOT:-}"
 RUNTIME_ROOT="${STAGE_ROOT:-$STUDIO_HOME}"
 VENV_DIR="$RUNTIME_ROOT/unsloth_studio"
 
-# Same uv cache install.sh chose, for the same reasons -- kept byte-identical to the
-# block there, including the write probe and the unwind on failure.
+# Same uv cache install.sh chose, for the same reasons.
 #
 # This script is also the standalone entry point: `unsloth studio update` runs it
 # directly, without install.sh, so an export made only there covers the first install and
@@ -964,22 +963,153 @@ VENV_DIR="$RUNTIME_ROOT/unsloth_studio"
 #
 # STUDIO_HOME, not RUNTIME_ROOT: the cache has to be the one install.sh created, and the
 # two agree whenever UNSLOTH_STUDIO_STAGE_ROOT is unset, which is every non-staged run.
-if [ -z "${UV_CACHE_DIR:-}" ]; then
-    UV_CACHE_DIR="$STUDIO_HOME/cache/uv"
-    export UV_CACHE_DIR
-    # mktemp, not a $$-derived name: this branch exists for a cache directory another
-    # account can write, and there a predictable path can be pre-created as a symlink,
-    # which `: >` would follow and truncate -- as root, any file on the box. mktemp
-    # creates O_EXCL with an unpredictable suffix, so it cannot follow one, and failing
-    # to create IS the writability answer this probe wanted.
+# Under a stage root it is deliberately the LIVE marker that is read: the CLI parks its
+# own choice inside the stage and the old CLI promotes it on acceptance, so a stage that
+# is never activated must not be able to move the live install's cache.
+#
+# setup.sh NEVER writes the marker. Only an installer's own choice becomes one; this
+# script infers, and an inference recorded as a decision is how a stale marker outlives
+# the install that justified it.
+_uv_no_cache_requested() {
+    # uv --no-cache caches into a temporary directory and discards it on exit, and
+    # --no-cache outranks --cache-dir, so naming one changes nothing. Same boolish
+    # spelling unsloth_cli/commands/studio.py's _uv_no_cache_requested accepts.
+    _unc=${UV_NO_CACHE:-}
+    _unc=${_unc#"${_unc%%[![:space:]]*}"}
+    _unc=${_unc%"${_unc##*[![:space:]]}"}
+    case "$_unc" in
+        1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) unset _unc; return 0 ;;
+    esac
+    unset _unc
+    return 1
+}
+
+_uv_cache_probe_writable() {
+    # mkdir -p exits 0 for an existing unwritable directory and -w reads the mode rather
+    # than the filesystem, so probe with a real create. Mirrors install.sh's
+    # _probe_uv_cache_writable.
+    #
+    # mktemp, not a $$-derived name: this runs for a cache directory another account can
+    # write, and there a predictable path can be pre-created as a symlink, which `: >`
+    # would follow and truncate -- as root, any file on the box. mktemp creates O_EXCL
+    # with an unpredictable suffix, so it cannot follow one, and failing to create IS the
+    # writability answer this probe wanted.
     _uv_cache_probe=""
-    if ! mkdir -p "$UV_CACHE_DIR" 2>/dev/null \
-       || ! _uv_cache_probe=$(mktemp "$UV_CACHE_DIR/.unsloth-write-probe.XXXXXX" 2>/dev/null); then
-        echo "[WARN] Cannot write to $UV_CACHE_DIR -- using uv's default cache." >&2
-        unset UV_CACHE_DIR
+    if ! mkdir -p "$1" 2>/dev/null \
+       || ! _uv_cache_probe=$(mktemp "$1/.unsloth-write-probe.XXXXXX" 2>/dev/null); then
+        [ -z "$_uv_cache_probe" ] || rm -f "$_uv_cache_probe" 2>/dev/null || true
+        unset _uv_cache_probe
+        return 1
     fi
-    [ -z "$_uv_cache_probe" ] || rm -f "$_uv_cache_probe" 2>/dev/null || true
+    rm -f "$_uv_cache_probe" 2>/dev/null || true
     unset _uv_cache_probe
+    return 0
+}
+
+_uv_cache_warm() {
+    # Package BYTES, not metadata: wheels-* holds only .msgpack/.http on uv 0.10, so
+    # counting any file would read a cache that was merely resolved against as warm.
+    # Mirror of install.sh's bucket scan in _configure_uv_cache and of
+    # unsloth_cli/commands/studio.py's _uv_cache_has_packages; keep the three in step.
+    [ -n "${1:-}" ] && [ -d "$1" ] && [ -r "$1" ] || return 1
+    for _uvw_bucket in "$1"/archive-* "$1"/builds-* "$1"/built-wheels-* \
+        "$1"/wheels-* "$1"/sdists-*; do
+        [ -d "$_uvw_bucket" ] || continue
+        # Unreadable is not empty, but it is also not proof of warmth.
+        [ -r "$_uvw_bucket" ] && [ -x "$_uvw_bucket" ] || continue
+        # -L: a bucket can be a symlink to another disk, as Get-ChildItem -Recurse follows.
+        # -print -quit, never `-print ... | head -n 1`: this script runs under `set -o
+        # pipefail` (line 5), so on any bucket big enough to fill the 64K pipe buffer --
+        # which is every cache that actually holds wheels -- head exits on the first match,
+        # find dies of SIGPIPE, pipefail reports the pipeline as failed and `|| _uvw_hit=""`
+        # throws away a match that was already in hand. The warm shared cache then reads as
+        # cold, the update walks away from it, and every Torch and CUDA wheel is refetched.
+        # -quit stops find at the first hit inside find itself, so there is no pipe to break
+        # and no second process to fork; it is the idiom the rest of this file already uses.
+        _uvw_hit=$(find -L "$_uvw_bucket" -type f \
+            ! -name CACHEDIR.TAG ! -name .git ! -name .gitignore \
+            ! -name '*.lock' ! -name '*.msgpack' ! -name '*.http' ! -name '*.rev' \
+            -print -quit 2>/dev/null) || true
+        # `|| true`, not `|| _uvw_hit=""`: find exits nonzero when any part of the walk
+        # was unreadable, even after it printed a hit and quit; the hit is already in
+        # the variable, and install.sh keeps it the same way.
+        if [ -n "$_uvw_hit" ]; then
+            unset _uvw_bucket _uvw_hit
+            return 0
+        fi
+    done
+    unset _uvw_bucket _uvw_hit
+    return 1
+}
+
+_recorded_uv_cache() {
+    # The cache the installer recorded, exactly as unsloth_cli writes it: one absolute
+    # path and one trailing newline. Tolerates a UTF-8 BOM (Windows PowerShell 5.1
+    # `-Encoding utf8` writes one) and a CR, and is otherwise byte-for-byte -- a POSIX
+    # path may hold anything but NUL, including spaces at either end.
+    # The sentinel keeps the bytes: command substitution strips EVERY trailing newline,
+    # and the CLI reader removes exactly one delimiter so a pathname that itself ends in
+    # a newline round-trips. One LF, then one CR, so a CRLF record reads the same way.
+    _ruc_raw=$(cat "$STUDIO_HOME/cache/uv-cache-dir" 2>/dev/null && printf x) || return 1
+    _ruc_raw=${_ruc_raw%x}
+    _ruc_raw=${_ruc_raw%"$_UV_MARKER_LF"}
+    _ruc_raw=${_ruc_raw#"$_UV_MARKER_BOM"}
+    _ruc_raw=${_ruc_raw%"$_UV_MARKER_CR"}
+    case "$_ruc_raw" in
+        # Absolute only. install.sh records absolute (_absolutize_uv_cache_dir) precisely
+        # because a relative one names a different directory in each phase, and there is
+        # nothing here to resolve it against: setup.sh has already changed directory.
+        # No [:print:] filter -- in the C locale that rejects every non-ASCII home.
+        "") unset _ruc_raw; return 1 ;;
+        /*) ;;
+        *) unset _ruc_raw; return 1 ;;
+    esac
+    printf '%s' "$_ruc_raw"
+    unset _ruc_raw
+    return 0
+}
+_UV_MARKER_BOM=$(printf '\357\273\277')
+_UV_MARKER_CR=$(printf '\r')
+_UV_MARKER_LF=$(printf '\n.')
+_UV_MARKER_LF=${_UV_MARKER_LF%.}
+
+# Three tiers only: a caller value, --no-cache, then the recorded marker or the Studio
+# cache. There is deliberately NO "use uv's default if it is warm" tier, which is the one
+# install.sh has and this does not, and the asymmetry is the point rather than an omission.
+# install.sh runs before anything is recorded, so it has to look at the default cache to
+# decide; by the time this script runs the decision has already been made and written down,
+# and the CLI injects UV_CACHE_DIR for `unsloth studio update` besides. Adding the tier here
+# would let an update quietly move off the cache the installer chose -- and setup.sh never
+# writes the marker, so nothing would record the move for the run after it.
+if [ -n "${UV_CACHE_DIR:-}" ]; then
+    # A caller value wins outright, here as in install.sh and in the CLI.
+    :
+elif _uv_no_cache_requested; then
+    # Unset, not left alone: an exported EMPTY value is the one thing that reaches this
+    # branch, and uv still parses it as `--cache-dir ''`, which fails every command.
+    unset UV_CACHE_DIR
+else
+    # Same sentinel as the reader: the substitution here would strip the newline the
+    # reader just preserved.
+    _uv_recorded=$(_recorded_uv_cache && printf x) || _uv_recorded=""
+    _uv_recorded=${_uv_recorded%x}
+    if [ -n "$_uv_recorded" ] && _uv_cache_warm "$_uv_recorded" \
+       && _uv_cache_probe_writable "$_uv_recorded"; then
+        # Only while it still holds packages, and only while uv can write to it: a
+        # marker for an emptied cache would point this run at nothing and refetch
+        # everything the Studio cache already has, and uv aborts outright on a cache it
+        # cannot write (a share remounted read-only since the install).
+        UV_CACHE_DIR="$_uv_recorded"
+        export UV_CACHE_DIR
+    else
+        UV_CACHE_DIR="$STUDIO_HOME/cache/uv"
+        export UV_CACHE_DIR
+        if ! _uv_cache_probe_writable "$UV_CACHE_DIR"; then
+            echo "[WARN] Cannot write to $UV_CACHE_DIR -- using uv's default cache." >&2
+            unset UV_CACHE_DIR
+        fi
+    fi
+    unset _uv_recorded
 fi
 VENV_T5_530_DIR="$RUNTIME_ROOT/.venv_t5_530"
 VENV_T5_550_DIR="$RUNTIME_ROOT/.venv_t5_550"
@@ -1791,9 +1921,38 @@ _setup_persist_uv_path() {
     done
 }
 
+_setup_find_installed_uv() {
+    # The uv a previous run put at astral's destination, when it is not on PATH: a desktop
+    # shell launched before the install and never relaunched from Explorer, a CI step with
+    # a fresh PATH, a login shell whose profile line has not been read yet. Without this
+    # the miss re-downloaded the pinned archive on every update -- 19 MB and 42 of the 53
+    # seconds a Windows no-op update took, measured on the staging matrix. The same
+    # priority list _setup_install_uv_pinned writes to, so what is found is what was
+    # installed, and it has to run, not merely exist.
+    for _sfu_dir in "${UV_INSTALL_DIR:-}" "${UV_UNMANAGED_INSTALL:-}" "${XDG_BIN_HOME:-}" \
+        "${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}" "${HOME:+$HOME/.local/bin}"; do
+        [ -n "$_sfu_dir" ] || continue
+        # Bounded, as the pinned installer's own probe is: a binary that starts and never
+        # answers must not hold setup up before the download or pip fallback.
+        if [ -x "$_sfu_dir/uv" ] && _setup_uv_probe_exec "$_sfu_dir/uv"; then
+            printf '%s' "$_sfu_dir"
+            unset _sfu_dir
+            return 0
+        fi
+    done
+    unset _sfu_dir
+    return 1
+}
+
 USE_UV=false
 if command -v uv &>/dev/null; then
     USE_UV=true
+elif _setup_uv_dir=$(_setup_find_installed_uv); then
+    # Read-only reuse, so it is right under a stage root too.
+    export PATH="$_setup_uv_dir:$PATH"
+    step "uv" "reusing the uv installed at $_setup_uv_dir (it was not on PATH)"
+    USE_UV=true
+    unset _setup_uv_dir
 elif [ -n "$STAGE_ROOT" ]; then
     step "uv" "using pip inside the staged environment"
 elif {
@@ -1839,6 +1998,245 @@ fi
 # Skip all Python dependency work if versions match (fast update path).
 # On Colab (no venv), skip this version check (it needs $VENV_DIR/bin/python)
 # but still run install_python_stack below (it uses sys.executable).
+_setup_install_is_verified() {
+    # Does the venv on disk claim, and prove, a finished install? Exit 0 yes, 1 no.
+    #
+    # Two callers ask for opposite reasons: the incomplete-install guard forces the
+    # dependency pass when this says no, and the offline rule below keeps the fast path
+    # when it says yes. One implementation, so those two can never disagree about what
+    # "complete" means.
+    "$VENV_DIR/bin/python" -c "
+import os, sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import install_manifest
+except Exception:
+    # Present but unimportable is damage, not an old release, and this is the
+    # one file whose damage silences every check below. Absent keeps the old
+    # escape: separating it from an old tree needs a RECORD walk here, and the
+    # CLI already reports studio_install_manifest_missing.
+    sys.exit(1 if os.path.isfile(os.path.join(sys.argv[1], 'install_manifest.py')) else 0)
+try:
+    ok = install_manifest.verify_install(deep = True)['ok']
+except TypeError:
+    ok = install_manifest.verify_install()['ok']  # older tree, no payload scan
+sys.exit(0 if ok else 1)
+" "$SCRIPT_DIR" 2>/dev/null
+}
+
+_uv_offline_requested() {
+    # UV_OFFLINE is uv's own "there is no network" switch, and every install command this
+    # script runs goes through uv. The spellings are uv's boolish parser's: y, yes, t,
+    # true, on, 1 (checked against uv 0.10.7: UV_OFFLINE=t and =y both disable the
+    # network), so a value uv honours is never one this rule misses.
+    _uvo=${UV_OFFLINE:-}
+    _uvo=${_uvo#"${_uvo%%[![:space:]]*}"}
+    _uvo=${_uvo%"${_uvo##*[![:space:]]}"}
+    case "$_uvo" in
+        1 | [Tt] | [Tt][Rr][Uu][Ee] | [Yy] | [Yy][Ee][Ss] | [Oo][Nn]) unset _uvo; return 0 ;;
+    esac
+    unset _uvo
+    return 1
+}
+
+_fast_path_escapes() {
+    # Every reason an "up to date" package on disk is still not a working install. Both
+    # callers that can keep the fast path -- the version compare below and the UV_OFFLINE
+    # rule after it -- run this, so an offline skip is held to exactly the bar an online
+    # one is held to. While these lived inline in the version compare alone, an offline
+    # update of a venv below the desktop backend floor (or carrying the anyio/tokenizers
+    # damage, or stranded on a CPU wheel under an XPU pin) reported success and repaired
+    # nothing: only install_python_stack acts on any of it.
+    #
+    # The incomplete-install check is deliberately NOT hoisted here. Both callers already
+    # ask _setup_install_is_verified for themselves, and they report the same answer with
+    # different wording, so one shared copy would have to lose one of the two messages.
+    #
+    # _SKIP_PYTHON_DEPS is set directly: a POSIX sh function shares the caller's variable
+    # scope, so there is nothing to thread back and no way for a caller to forget to.
+
+    # First, because it is the one escape nothing on disk has to earn: the user asked for it
+    # by hand, and answering it here costs no interpreter and no probe.
+    #
+    # UNSLOTH_STUDIO_FULL_DEPS is install_python_stack.py's own switch (_full_deps_requested
+    # there -- "a skip nobody can turn off is a bug nobody can work around"), and the shell
+    # has to know about a Python-side variable because THIS is the branch that never starts
+    # that module. When the installed version equals the PyPI one the whole dependency pass
+    # is skipped up here, so a hatch honoured only inside install_python_stack.py could not
+    # be reached on the very install it exists for: `UNSLOTH_STUDIO_FULL_DEPS=1 unsloth
+    # studio update` printed "dependencies up to date" and did nothing at all.
+    #
+    # Spelled inline rather than as a helper on purpose: the shell suites drive this function
+    # by slicing it out of this file by name, and a helper left behind in setup.sh would read
+    # as "not requested" instead of failing loudly. The accepted values match
+    # _uv_no_cache_requested / _uv_offline_requested above and .strip().lower() in
+    # ("1", "true", "yes", "on") in install_python_stack.py, whitespace stripped either side
+    # so a value threaded through a desktop launcher or a CI matrix still counts.
+    _fpe_full=${UNSLOTH_STUDIO_FULL_DEPS:-}
+    _fpe_full=${_fpe_full#"${_fpe_full%%[![:space:]]*}"}
+    _fpe_full=${_fpe_full%"${_fpe_full##*[![:space:]]}"}
+    case "$_fpe_full" in
+        1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn])
+            substep "UNSLOTH_STUDIO_FULL_DEPS is set -- forcing dependency pass..."
+            _SKIP_PYTHON_DEPS=false
+            ;;
+    esac
+    unset _fpe_full
+
+    # A pre-#6483-fix install can be stuck on anyio>=4.14 even though
+    # $_PKG_NAME itself is current; the fast path would otherwise
+    # never reach install_python_stack's anyio repair (#6797).
+    if "$VENV_DIR/bin/python" -c "
+import re, sys
+from importlib.metadata import version, PackageNotFoundError
+try:
+    parts = version('anyio').split('.')
+    major = int(parts[0])
+    minor = int(re.sub(r'[^0-9].*', '', parts[1])) if len(parts) > 1 else 0
+except (PackageNotFoundError, ValueError, IndexError):
+    sys.exit(1)
+sys.exit(0 if (major, minor) >= (4, 14) else 1)
+" 2>/dev/null; then
+        substep "anyio >=4.14 found (#6483) -- forcing dependency pass to repair..."
+        _SKIP_PYTHON_DEPS=false
+    fi
+    # Same shape, same reason: a venv installed before the tokenizers pin can
+    # hold a tokenizers the installed transformers rejects at import, which
+    # takes down every `import transformers` and so the whole MLX stack, while
+    # $_PKG_NAME itself is current. Without this the fast path reports "up to
+    # date" and repairs nothing. Ask the metadata, not an import: the import is
+    # what is broken. Any unreadable half exits 1 and changes nothing.
+    if "$VENV_DIR/bin/python" -c "
+import sys
+from importlib.metadata import PackageNotFoundError, requires, version
+try:
+    from packaging.requirements import Requirement
+    installed = version('tokenizers')
+    windows = [
+        req.specifier
+        for req in (Requirement(raw) for raw in (requires('transformers') or []))
+        if req.name == 'tokenizers' and req.marker is None
+    ]
+except (PackageNotFoundError, ImportError, ValueError, IndexError):
+    sys.exit(1)
+sys.exit(0 if windows and installed not in windows[0] else 1)
+" 2>/dev/null; then
+        substep "installed transformers rejects the installed tokenizers -- forcing dependency pass to repair..."
+        _SKIP_PYTHON_DEPS=false
+    fi
+    # If the desktop app specifies a minimum required backend version and the installed
+    # package is older than that requirement, force the dependency pass to upgrade it.
+    if [ -n "${UNSLOTH_DESKTOP_BACKEND_VERSION:-}" ]; then
+        if ! "$VENV_DIR/bin/python" -c "
+import re, sys
+try:
+    from packaging.version import parse as parse_v
+except ImportError:
+    def parse_v(v):
+        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', (v or '').strip())
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
+installed = parse_v(sys.argv[1])
+required = parse_v(sys.argv[2])
+sys.exit(0 if installed is not None and required is not None and installed >= required else 1)
+" "$INSTALLED_VER" "$UNSLOTH_DESKTOP_BACKEND_VERSION" 2>/dev/null; then
+            substep "$_PKG_NAME $INSTALLED_VER < $UNSLOTH_DESKTOP_BACKEND_VERSION (required by desktop app) -- forcing dependency pass to update..."
+            _SKIP_PYTHON_DEPS=false
+        fi
+    fi
+    # An XPU pin the venv does not satisfy. Only the dependency pass acts on it
+    # (install_python_stack's _ensure_xpu_torch), so without this escape a CPU install
+    # switched to UNSLOTH_TORCH_INDEX_FAMILY=xpu keeps its CPU wheel forever: the package
+    # version is current, so the fast path calls it up to date. Mirrors setup.ps1.
+    _setup_pin="${UNSLOTH_TORCH_INDEX_URL:-${UNSLOTH_TORCH_INDEX_FAMILY:-}}"
+    # Strip query/fragment first: an authenticated mirror (…/whl/xpu?token=...) is a
+    # supported pin shape, and missing it reads as "no XPU pin" and skips the repair.
+    _setup_pin="${_setup_pin%%\#*}"
+    _setup_pin="${_setup_pin%%\?*}"
+    # ALL trailing slashes, like the shared leaf parsers: a single %/ leaves "…/xpu/" behind.
+    while [ "${_setup_pin%/}" != "$_setup_pin" ]; do _setup_pin="${_setup_pin%/}"; done
+    # Exact, lowercased leaf, like every other leaf parser: a *xpu suffix match (…/private-xpu)
+    # would force a pass every update that _ensure_xpu_torch then declines to act on, and an
+    # uncased match would miss UNSLOTH_TORCH_INDEX_FAMILY=XPU that those parsers do accept.
+    _setup_pin_leaf=$(printf '%s' "${_setup_pin##*/}" | tr '[:upper:]' '[:lower:]')
+    # Disk first, no interpreter: version.py carries the local label, so a wedged Intel
+    # driver cannot hang `studio update` inside `import torch`. Read unconditionally, not
+    # only under a pin: the pin is one-shot, so the installed wheel is the only durable
+    # signal -- the same one _ensure_xpu_triton keys on.
+    _setup_pin_ok=false
+    _setup_pin_is_xpu=false
+    for _setup_pin_tv in "$VENV_DIR"/lib/python*/site-packages/torch/version.py; do
+        [ -f "$_setup_pin_tv" ] || continue
+        _setup_pin_ver=$(sed -n "s/^__version__ = '\([^']*\)'.*/\1/p" "$_setup_pin_tv" | head -1)
+        case "$_setup_pin_ver" in
+            *+xpu)
+                _setup_pin_is_xpu=true
+                _setup_pin_maj=${_setup_pin_ver%%.*}
+                _setup_pin_rest=${_setup_pin_ver#*.}
+                _setup_pin_min=${_setup_pin_rest%%.*}
+                case "$_setup_pin_maj$_setup_pin_min" in
+                    *[!0-9]*) ;;
+                    *) [ "$_setup_pin_maj" -eq 2 ] && [ "$_setup_pin_min" -ge 6 ] && \
+                       [ "$_setup_pin_min" -lt 11 ] && _setup_pin_ok=true ;;
+                esac
+                ;;
+        esac
+        break
+    done
+    # Correct torch is not enough: the Triton swap also lives in install_python_stack, so a
+    # migrated +xpu venv with a leftover generic triton keeps the CUDA build shadowing the
+    # XPU one. The dist-info glob below matches only generic "triton-<ver>" -- the XPU builds
+    # are pytorch_triton_xpu-* / triton_xpu-*.
+    # Leaves the shared classifiers recognise as a non-XPU family. EXACT families, mirroring
+    # install.sh _is_pip_rocm_family_leaf and install_python_stack _is_cuda_family_leaf: a
+    # merely prefixed leaf (cu128-private) is a custom verbatim pin they never repair, so
+    # escaping on one would force a pass every update that changes nothing.
+    _setup_known_nonxpu_leaf() {
+        case "$1" in
+            cpu|gfx[0-9]*) return 0 ;;
+            cu[0-9]*) case "${1#cu}" in *[!0-9]*) return 1 ;; esac ;;
+            rocm[0-9]*)
+                # Both parts non-empty all-digits: rocm7., rocm7.2.1 are custom pins.
+                _setup_rocm_rest="${1#rocm}"
+                case "$_setup_rocm_rest" in
+                    *.*.*) return 1 ;;
+                    *.*)
+                        case "${_setup_rocm_rest%%.*}" in *[!0-9]*) return 1 ;; esac
+                        case "${_setup_rocm_rest#*.}" in "" | *[!0-9]*) return 1 ;; esac
+                        ;;
+                    *[!0-9]*) return 1 ;;
+                esac
+                ;;
+            *) return 1 ;;
+        esac
+        return 0
+    }
+    _setup_pin_known_nonxpu=false
+    _setup_known_nonxpu_leaf "$_setup_pin_leaf" && _setup_pin_known_nonxpu=true
+    _setup_generic_triton=false
+    if [ "$_setup_pin_is_xpu" = true ] || [ "$_setup_pin_leaf" = "xpu" ]; then
+        for _setup_tri in "$VENV_DIR"/lib/python*/site-packages/triton-*.dist-info; do
+            [ -d "$_setup_tri" ] && _setup_generic_triton=true && break
+        done
+    fi
+    if [ "$_setup_pin_leaf" = "xpu" ] && [ "$_setup_pin_ok" = false ]; then
+        substep "XPU index pinned but torch does not match -- forcing dependency pass to repair..."
+        _SKIP_PYTHON_DEPS=false
+    elif [ "$_setup_pin_is_xpu" = true ] && [ "$_setup_generic_triton" = true ]; then
+        substep "generic triton shadows the XPU build -- forcing dependency pass to repair..."
+        _SKIP_PYTHON_DEPS=false
+    elif [ "$_setup_pin_is_xpu" = true ] && [ "$_setup_pin_known_nonxpu" = true ]; then
+        # Migrating AWAY from XPU: the pin is authoritative, but only install_python_stack
+        # acts on it, so an up-to-date install kept its +xpu wheel over the requested family.
+        substep "$_setup_pin_leaf pinned over an XPU wheel -- forcing dependency pass to migrate..."
+        _SKIP_PYTHON_DEPS=false
+    fi
+    # Explicit, because setup.sh runs under `set -e` and both call sites put this last in
+    # their branch: an arm whose final command happened to be false would abort the update
+    # rather than force a dependency pass. What this function decides, it decides in
+    # _SKIP_PYTHON_DEPS; its exit status carries nothing.
+    return 0
+}
+
 _SKIP_PYTHON_DEPS=false
 _SKIP_VERSION_CHECK=false
 if [ "$_COLAB_NO_VENV" = true ]; then
@@ -1871,180 +2269,40 @@ sys.exit(2 if conflict else (0 if version else 1))
     elif [ -n "$INSTALLED_VER" ] && [ -n "$LATEST_VER" ] && [ "$INSTALLED_VER" = "$LATEST_VER" ]; then
         step "python" "$_PKG_NAME $INSTALLED_VER is up to date"
         _SKIP_PYTHON_DEPS=true
-        # A pre-#6483-fix install can be stuck on anyio>=4.14 even though
-        # $_PKG_NAME itself is current; the fast path above would otherwise
-        # never reach install_python_stack's anyio repair (#6797).
-        if "$VENV_DIR/bin/python" -c "
-import re, sys
-from importlib.metadata import version, PackageNotFoundError
-try:
-    parts = version('anyio').split('.')
-    major = int(parts[0])
-    minor = int(re.sub(r'[^0-9].*', '', parts[1])) if len(parts) > 1 else 0
-except (PackageNotFoundError, ValueError, IndexError):
-    sys.exit(1)
-sys.exit(0 if (major, minor) >= (4, 14) else 1)
-" 2>/dev/null; then
-            substep "anyio >=4.14 found (#6483) -- forcing dependency pass to repair..."
-            _SKIP_PYTHON_DEPS=false
-        fi
-        # Same shape, same reason: a venv installed before the tokenizers pin can
-        # hold a tokenizers the installed transformers rejects at import, which
-        # takes down every `import transformers` and so the whole MLX stack, while
-        # $_PKG_NAME itself is current. Without this the fast path reports "up to
-        # date" and repairs nothing. Ask the metadata, not an import: the import is
-        # what is broken. Any unreadable half exits 1 and changes nothing.
-        if "$VENV_DIR/bin/python" -c "
-import sys
-from importlib.metadata import PackageNotFoundError, requires, version
-try:
-    from packaging.requirements import Requirement
-    installed = version('tokenizers')
-    windows = [
-        req.specifier
-        for req in (Requirement(raw) for raw in (requires('transformers') or []))
-        if req.name == 'tokenizers' and req.marker is None
-    ]
-except (PackageNotFoundError, ImportError, ValueError, IndexError):
-    sys.exit(1)
-sys.exit(0 if windows and installed not in windows[0] else 1)
-" 2>/dev/null; then
-            substep "installed transformers rejects the installed tokenizers -- forcing dependency pass to repair..."
-            _SKIP_PYTHON_DEPS=false
-        fi
         # An interrupted install leaves $_PKG_NAME current while studio.txt
         # never finished, so the compare above says "up to date" and update --
         # plus the desktop Repair button -- no-ops on a venv that cannot boot.
-        if ! "$VENV_DIR/bin/python" -c "
-import os, sys
-sys.path.insert(0, sys.argv[1])
-try:
-    import install_manifest
-except Exception:
-    # Present but unimportable is damage, not an old release, and this is the
-    # one file whose damage silences every check below. Absent keeps the old
-    # escape: separating it from an old tree needs a RECORD walk here, and the
-    # CLI already reports studio_install_manifest_missing.
-    sys.exit(1 if os.path.isfile(os.path.join(sys.argv[1], 'install_manifest.py')) else 0)
-try:
-    ok = install_manifest.verify_install(deep = True)['ok']
-except TypeError:
-    ok = install_manifest.verify_install()['ok']  # older tree, no payload scan
-sys.exit(0 if ok else 1)
-" "$SCRIPT_DIR" 2>/dev/null; then
+        if ! _setup_install_is_verified; then
             substep "studio install incomplete -- forcing dependency pass to repair..."
             _SKIP_PYTHON_DEPS=false
         fi
-        # If the desktop app specifies a minimum required backend version and the installed
-        # package is older than that requirement, force the dependency pass to upgrade it.
-        if [ -n "${UNSLOTH_DESKTOP_BACKEND_VERSION:-}" ]; then
-            if ! "$VENV_DIR/bin/python" -c "
-import re, sys
-try:
-    from packaging.version import parse as parse_v
-except ImportError:
-    def parse_v(v):
-        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', (v or '').strip())
-        return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
-installed = parse_v(sys.argv[1])
-required = parse_v(sys.argv[2])
-sys.exit(0 if installed is not None and required is not None and installed >= required else 1)
-" "$INSTALLED_VER" "$UNSLOTH_DESKTOP_BACKEND_VERSION" 2>/dev/null; then
-                substep "$_PKG_NAME $INSTALLED_VER < $UNSLOTH_DESKTOP_BACKEND_VERSION (required by desktop app) -- forcing dependency pass to update..."
-                _SKIP_PYTHON_DEPS=false
-            fi
-        fi
-        # An XPU pin the venv does not satisfy. Only the dependency pass acts on it
-        # (install_python_stack's _ensure_xpu_torch), so without this escape a CPU install
-        # switched to UNSLOTH_TORCH_INDEX_FAMILY=xpu keeps its CPU wheel forever: the package
-        # version is current, so the fast path calls it up to date. Mirrors setup.ps1.
-        _setup_pin="${UNSLOTH_TORCH_INDEX_URL:-${UNSLOTH_TORCH_INDEX_FAMILY:-}}"
-        # Strip query/fragment first: an authenticated mirror (…/whl/xpu?token=...) is a
-        # supported pin shape, and missing it reads as "no XPU pin" and skips the repair.
-        _setup_pin="${_setup_pin%%\#*}"
-        _setup_pin="${_setup_pin%%\?*}"
-        # ALL trailing slashes, like the shared leaf parsers: a single %/ leaves "…/xpu/" behind.
-        while [ "${_setup_pin%/}" != "$_setup_pin" ]; do _setup_pin="${_setup_pin%/}"; done
-        # Exact, lowercased leaf, like every other leaf parser: a *xpu suffix match (…/private-xpu)
-        # would force a pass every update that _ensure_xpu_torch then declines to act on, and an
-        # uncased match would miss UNSLOTH_TORCH_INDEX_FAMILY=XPU that those parsers do accept.
-        _setup_pin_leaf=$(printf '%s' "${_setup_pin##*/}" | tr '[:upper:]' '[:lower:]')
-        # Disk first, no interpreter: version.py carries the local label, so a wedged Intel
-        # driver cannot hang `studio update` inside `import torch`. Read unconditionally, not
-        # only under a pin: the pin is one-shot, so the installed wheel is the only durable
-        # signal -- the same one _ensure_xpu_triton keys on.
-        _setup_pin_ok=false
-        _setup_pin_is_xpu=false
-        for _setup_pin_tv in "$VENV_DIR"/lib/python*/site-packages/torch/version.py; do
-            [ -f "$_setup_pin_tv" ] || continue
-            _setup_pin_ver=$(sed -n "s/^__version__ = '\([^']*\)'.*/\1/p" "$_setup_pin_tv" | head -1)
-            case "$_setup_pin_ver" in
-                *+xpu)
-                    _setup_pin_is_xpu=true
-                    _setup_pin_maj=${_setup_pin_ver%%.*}
-                    _setup_pin_rest=${_setup_pin_ver#*.}
-                    _setup_pin_min=${_setup_pin_rest%%.*}
-                    case "$_setup_pin_maj$_setup_pin_min" in
-                        *[!0-9]*) ;;
-                        *) [ "$_setup_pin_maj" -eq 2 ] && [ "$_setup_pin_min" -ge 6 ] && \
-                           [ "$_setup_pin_min" -lt 11 ] && _setup_pin_ok=true ;;
-                    esac
-                    ;;
-            esac
-            break
-        done
-        # Correct torch is not enough: the Triton swap also lives in install_python_stack, so a
-        # migrated +xpu venv with a leftover generic triton keeps the CUDA build shadowing the
-        # XPU one. The dist-info glob below matches only generic "triton-<ver>" -- the XPU builds
-        # are pytorch_triton_xpu-* / triton_xpu-*.
-        # Leaves the shared classifiers recognise as a non-XPU family. EXACT families, mirroring
-        # install.sh _is_pip_rocm_family_leaf and install_python_stack _is_cuda_family_leaf: a
-        # merely prefixed leaf (cu128-private) is a custom verbatim pin they never repair, so
-        # escaping on one would force a pass every update that changes nothing.
-        _setup_known_nonxpu_leaf() {
-            case "$1" in
-                cpu|gfx[0-9]*) return 0 ;;
-                cu[0-9]*) case "${1#cu}" in *[!0-9]*) return 1 ;; esac ;;
-                rocm[0-9]*)
-                    # Both parts non-empty all-digits: rocm7., rocm7.2.1 are custom pins.
-                    _setup_rocm_rest="${1#rocm}"
-                    case "$_setup_rocm_rest" in
-                        *.*.*) return 1 ;;
-                        *.*)
-                            case "${_setup_rocm_rest%%.*}" in *[!0-9]*) return 1 ;; esac
-                            case "${_setup_rocm_rest#*.}" in "" | *[!0-9]*) return 1 ;; esac
-                            ;;
-                        *[!0-9]*) return 1 ;;
-                    esac
-                    ;;
-                *) return 1 ;;
-            esac
-            return 0
-        }
-        _setup_pin_known_nonxpu=false
-        _setup_known_nonxpu_leaf "$_setup_pin_leaf" && _setup_pin_known_nonxpu=true
-        _setup_generic_triton=false
-        if [ "$_setup_pin_is_xpu" = true ] || [ "$_setup_pin_leaf" = "xpu" ]; then
-            for _setup_tri in "$VENV_DIR"/lib/python*/site-packages/triton-*.dist-info; do
-                [ -d "$_setup_tri" ] && _setup_generic_triton=true && break
-            done
-        fi
-        if [ "$_setup_pin_leaf" = "xpu" ] && [ "$_setup_pin_ok" = false ]; then
-            substep "XPU index pinned but torch does not match -- forcing dependency pass to repair..."
-            _SKIP_PYTHON_DEPS=false
-        elif [ "$_setup_pin_is_xpu" = true ] && [ "$_setup_generic_triton" = true ]; then
-            substep "generic triton shadows the XPU build -- forcing dependency pass to repair..."
-            _SKIP_PYTHON_DEPS=false
-        elif [ "$_setup_pin_is_xpu" = true ] && [ "$_setup_pin_known_nonxpu" = true ]; then
-            # Migrating AWAY from XPU: the pin is authoritative, but only install_python_stack
-            # acts on it, so an up-to-date install kept its +xpu wheel over the requested family.
-            substep "$_setup_pin_leaf pinned over an XPU wheel -- forcing dependency pass to migrate..."
-            _SKIP_PYTHON_DEPS=false
-        fi
+        # ...and every remaining escape, shared verbatim with the offline rule below so
+        # the two branches can never disagree about what an up-to-date install owes.
+        _fast_path_escapes
     elif [ -n "$INSTALLED_VER" ] && [ -n "$LATEST_VER" ]; then
         substep "$_PKG_NAME $INSTALLED_VER -> $LATEST_VER available, updating..."
     elif [ -z "$LATEST_VER" ]; then
-        substep "could not reach PyPI, updating to be safe..."
+        # PyPI unreachable. Updating to be safe stays the default -- an unreachable PyPI is
+        # usually a blip, and a pass over a warm cache is cheap.
+        #
+        # UV_OFFLINE is the exception, because it is not a blip: the caller has declared
+        # there is no network, uv refuses to reach one, and so every install command that
+        # pass would run can only fail. The choice is between a pass that cannot work and
+        # keeping what is on disk, and keeping it is only defensible on the same evidence
+        # the incomplete-install guard demands -- so ask the same question.
+        #
+        # ...and then the same escapes the up-to-date branch takes. A verified tree is not
+        # the whole bar: the desktop backend floor, the anyio and tokenizers damage and the
+        # XPU pin all describe an install that verifies and still cannot do its job, and a
+        # skip here that ducked them would repair nothing while reporting success.
+        if [ -n "$INSTALLED_VER" ] && _uv_offline_requested && _setup_install_is_verified; then
+            substep "PyPI is unreachable and UV_OFFLINE is set -- keeping the verified install"
+            _SKIP_PYTHON_DEPS=true
+            _OFFLINE_FAST_PATH=true
+            _fast_path_escapes
+        else
+            substep "could not reach PyPI, updating to be safe..."
+        fi
     fi
 fi
 
@@ -2094,8 +2352,124 @@ _target_has_pkg_version() {
     done
     return 1
 }
-_NEED_T5_INSTALL=false
-if [ -d "$STUDIO_HOME/.venv_t5" ]; then
+# The pins, once. install_manifest.sidecar_is_current audits these exact strings and
+# _install_sidecar installs them, so the check and the install can never disagree about
+# what a current sidecar holds.
+#
+# Every name here has to be one that audit can actually reach. It proves a distribution
+# arrived by looking for its package directory, and falls back to the top-level names in
+# that distribution's own RECORD only when neither spelling of the project name is a
+# directory (six.py has no directory at all; pillow's is PIL). A pin whose payload is
+# neither -- nothing recorded either -- reads as stale forever, and then every update
+# deletes and refetches a healthy several-hundred-MB sidecar.
+#
+# tiktoken is deliberately not a pin. Both shells treat its install as optional (no wheel
+# for the interpreter is a warning, not a failure), so a sidecar without it is a finished
+# sidecar; as a pin it would read stale on every update and be wiped and refetched three
+# times over, for a package the rebuild would fail to add again. _sidecar_top_up_tiktoken
+# retries it alone instead.
+_SIDECAR_COMMON_PINS="huggingface_hub==1.8.0 hf_xet==1.4.2"
+
+_sidecar_top_up_tiktoken() {
+    _stt_dir="$1"
+    _stt_label="$2"
+    # Under the offline keep this would reach for the network through fast_install's pip
+    # fallback, and for a tier whose rebuild was deferred it would create a directory
+    # holding tiktoken alone.
+    [ "${_OFFLINE_FAST_PATH:-false}" = true ] && return 0
+    for _stt_meta in "$_stt_dir"/tiktoken-*.dist-info/METADATA; do
+        if [ -f "$_stt_meta" ]; then
+            unset _stt_meta
+            return 0
+        fi
+    done
+    unset _stt_meta
+    if ! fast_install_sidecar --target "$_stt_dir" --no-deps "tiktoken" >/dev/null 2>&1; then
+        substep "could not install tiktoken into the $_stt_label sidecar -- Qwen tokenizers may fail"
+    fi
+    return 0
+}
+
+_sidecar_current() {
+    # One predicate for both shells: install_manifest.py answers, setup.ps1 asks the same
+    # way. A shell reimplementation is what let the two drift the last time -- the
+    # version grep below sees a transformers 5.3.0 METADATA and calls a sidecar whose
+    # package tree an interrupted pip left half-written "current", and the training
+    # worker then dies on `import transformers` with the setup log reporting success.
+    _sc_dir="$1"
+    _sc_ver="$2"
+    [ -d "$_sc_dir" ] || return 1
+    # No venv interpreter is the Colab path (_COLAB_NO_VENV), where the backend deps go
+    # into system Python and $VENV_DIR/bin/python never exists. The shim is stdlib-only,
+    # so the `python` the installer itself runs under there asks it the same question;
+    # the version grep this replaced sees only transformers, and a sidecar install
+    # interrupted after transformers landed read as current on every later run. Only a
+    # tree with no interpreter to ask at all falls back to the grep.
+    _sc_python="$VENV_DIR/bin/python"
+    if [ ! -x "$_sc_python" ]; then
+        _sc_python=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || true)
+    fi
+    if [ -z "$_sc_python" ]; then
+        unset _sc_python
+        _target_has_pkg_version "$_sc_dir" "transformers" "$_sc_ver"
+        return $?
+    fi
+    # shellcheck disable=SC2086 - the pins are a deliberate word-split list
+    _sc_out=$("$_sc_python" "$SCRIPT_DIR/install_manifest.py" sidecar "$_sc_dir" \
+        "transformers==$_sc_ver" $_SIDECAR_COMMON_PINS 2>/dev/null)
+    unset _sc_python
+    # The marker, not the exit code alone. An install_manifest.py predating the shim has
+    # no __main__ block at all, so running it exits 0 with no output -- and reading that
+    # silence as "current" would retire the sidecar rebuild entirely.
+    case "$_sc_out" in
+        "sidecar: current")
+            unset _sc_out
+            return 0
+            ;;
+        sidecar:*)
+            verbose_substep "sidecar $_sc_dir: ${_sc_out#sidecar: }"
+            unset _sc_out
+            return 1
+            ;;
+    esac
+    unset _sc_out
+    # An old or unusable tree: fall back to the version grep this replaced.
+    _target_has_pkg_version "$_sc_dir" "transformers" "$_sc_ver"
+}
+
+_install_sidecar() {
+    _is_dir="$1"
+    _is_ver="$2"
+    _is_label="$3"
+    _assert_studio_owned_or_absent "$_is_dir" "transformers $_is_label sidecar venv"
+    [ -d "$_is_dir" ] && rm -rf "$_is_dir"
+    mkdir -p "$_is_dir"
+    : > "$_is_dir/$_STUDIO_OWNED_MARKER" 2>/dev/null || true
+    run_quiet "install transformers $_is_ver" fast_install_sidecar --target "$_is_dir" --no-deps "transformers==$_is_ver"
+    run_quiet "install huggingface_hub for $_is_label" fast_install_sidecar --target "$_is_dir" --no-deps "huggingface_hub==1.8.0"
+    run_quiet "install hf_xet for $_is_label" fast_install_sidecar --target "$_is_dir" --no-deps "hf_xet==1.4.2"
+    # Optional, as in setup.ps1: a missing tiktoken wheel must not fail the whole setup,
+    # and it is retried by _sidecar_top_up_tiktoken on later updates.
+    if ! run_quiet_no_exit "install tiktoken for $_is_label" fast_install_sidecar --target "$_is_dir" --no-deps "tiktoken"; then
+        substep "could not install tiktoken into the $_is_label sidecar -- Qwen tokenizers may fail"
+    fi
+    step "transformers" "$_is_ver pre-installed"
+}
+
+# Per tier, not one flag for all three. The old single flag rebuilt every sidecar
+# whenever any one of them was stale, and -- through the `_SKIP_PYTHON_DEPS = false`
+# clause that used to sit at the end of this list -- on every update that touched the
+# dependency pass at all, whether or not a sidecar had moved. That is three wipes and
+# twelve `--target` installs, measured at 60-90 s on Windows, for work already done.
+_NEED_T5_530=false
+_NEED_T5_550=false
+_NEED_T5_510=false
+if [ -d "$STUDIO_HOME/.venv_t5" ] && [ "${_OFFLINE_FAST_PATH:-false}" = true ]; then
+    # The migration below is a wipe followed by three rebuilds, and under the offline
+    # keep nothing can be fetched: the legacy sidecar is the only one this install has,
+    # so it stays, untouched, for the next online update to migrate.
+    substep "legacy transformers sidecar left in place -- UV_OFFLINE is set, migration waits for the next online update"
+elif [ -d "$STUDIO_HOME/.venv_t5" ]; then
     # Legacy layout — migrate. The tiered venvs a staged run builds land under the
     # stage root and may never be activated, so removing the live legacy one here
     # would strip the running install of its only sidecar. The live update does it.
@@ -2103,47 +2477,46 @@ if [ -d "$STUDIO_HOME/.venv_t5" ]; then
         _assert_studio_owned_or_absent "$STUDIO_HOME/.venv_t5" "legacy transformers sidecar venv"
         rm -rf "$STUDIO_HOME/.venv_t5"
     fi
-    _NEED_T5_INSTALL=true
+    _NEED_T5_530=true
+    _NEED_T5_550=true
+    _NEED_T5_510=true
 fi
-[ ! -d "$VENV_T5_530_DIR" ] && _NEED_T5_INSTALL=true
-[ ! -d "$VENV_T5_550_DIR" ] && _NEED_T5_INSTALL=true
-[ ! -d "$VENV_T5_510_DIR" ] && _NEED_T5_INSTALL=true
-_target_has_pkg_version "$VENV_T5_530_DIR" "transformers" "5.3.0" || _NEED_T5_INSTALL=true
-_target_has_pkg_version "$VENV_T5_550_DIR" "transformers" "5.5.0" || _NEED_T5_INSTALL=true
-_target_has_pkg_version "$VENV_T5_510_DIR" "transformers" "5.10.2" || _NEED_T5_INSTALL=true
-# Also reinstall when python deps were updated (packages may need rebuild)
-[ "$_SKIP_PYTHON_DEPS" = false ] && _NEED_T5_INSTALL=true
+_sidecar_current "$VENV_T5_530_DIR" "5.3.0" || _NEED_T5_530=true
+_sidecar_current "$VENV_T5_550_DIR" "5.5.0" || _NEED_T5_550=true
+_sidecar_current "$VENV_T5_510_DIR" "5.10.2" || _NEED_T5_510=true
+# The offline rule above kept the install because nothing could be fetched. A sidecar
+# rebuild is a wipe followed by four fetches, and fast_install falls back from an offline
+# uv to pip, so under that rule it would either reach for the network or destroy a
+# usable sidecar and then fail. Left for the next online update; the runtime self-heal
+# (transformers_version._ensure_venv_dir) covers a missing tier in the meantime.
+if [ "${_OFFLINE_FAST_PATH:-false}" = true ]; then
+    for _ofp in "530 5.3.0" "550 5.5.0" "510 5.10.2"; do
+        set -- $_ofp
+        if eval "[ \"\$_NEED_T5_$1\" = true ]"; then
+            substep "transformers $2 sidecar is stale but UV_OFFLINE is set -- left for the next online update"
+            eval "_NEED_T5_$1=false"
+        fi
+    done
+    unset _ofp
+fi
 
-if [ "$_NEED_T5_INSTALL" = true ]; then
-    _assert_studio_owned_or_absent "$VENV_T5_530_DIR" "transformers 5.3 sidecar venv"
-    [ -d "$VENV_T5_530_DIR" ] && rm -rf "$VENV_T5_530_DIR"
-    mkdir -p "$VENV_T5_530_DIR"
-    : > "$VENV_T5_530_DIR/$_STUDIO_OWNED_MARKER" 2>/dev/null || true
-    run_quiet "install transformers 5.3.0" fast_install_sidecar --target "$VENV_T5_530_DIR" --no-deps "transformers==5.3.0"
-    run_quiet "install huggingface_hub for t5_530" fast_install_sidecar --target "$VENV_T5_530_DIR" --no-deps "huggingface_hub==1.8.0"
-    run_quiet "install hf_xet for t5_530" fast_install_sidecar --target "$VENV_T5_530_DIR" --no-deps "hf_xet==1.4.2"
-    run_quiet "install tiktoken for t5_530" fast_install_sidecar --target "$VENV_T5_530_DIR" --no-deps "tiktoken"
-    step "transformers" "5.3.0 pre-installed"
-
-    _assert_studio_owned_or_absent "$VENV_T5_550_DIR" "transformers 5.5 sidecar venv"
-    [ -d "$VENV_T5_550_DIR" ] && rm -rf "$VENV_T5_550_DIR"
-    mkdir -p "$VENV_T5_550_DIR"
-    : > "$VENV_T5_550_DIR/$_STUDIO_OWNED_MARKER" 2>/dev/null || true
-    run_quiet "install transformers 5.5.0" fast_install_sidecar --target "$VENV_T5_550_DIR" --no-deps "transformers==5.5.0"
-    run_quiet "install huggingface_hub for t5_550" fast_install_sidecar --target "$VENV_T5_550_DIR" --no-deps "huggingface_hub==1.8.0"
-    run_quiet "install hf_xet for t5_550" fast_install_sidecar --target "$VENV_T5_550_DIR" --no-deps "hf_xet==1.4.2"
-    run_quiet "install tiktoken for t5_550" fast_install_sidecar --target "$VENV_T5_550_DIR" --no-deps "tiktoken"
-    step "transformers" "5.5.0 pre-installed"
-
-    _assert_studio_owned_or_absent "$VENV_T5_510_DIR" "transformers 5.10 sidecar venv"
-    [ -d "$VENV_T5_510_DIR" ] && rm -rf "$VENV_T5_510_DIR"
-    mkdir -p "$VENV_T5_510_DIR"
-    : > "$VENV_T5_510_DIR/$_STUDIO_OWNED_MARKER" 2>/dev/null || true
-    run_quiet "install transformers 5.10.2" fast_install_sidecar --target "$VENV_T5_510_DIR" --no-deps "transformers==5.10.2"
-    run_quiet "install huggingface_hub for t5_510" fast_install_sidecar --target "$VENV_T5_510_DIR" --no-deps "huggingface_hub==1.8.0"
-    run_quiet "install hf_xet for t5_510" fast_install_sidecar --target "$VENV_T5_510_DIR" --no-deps "hf_xet==1.4.2"
-    run_quiet "install tiktoken for t5_510" fast_install_sidecar --target "$VENV_T5_510_DIR" --no-deps "tiktoken"
-    step "transformers" "5.10.2 pre-installed"
+if [ "$_NEED_T5_530" = true ]; then
+    _install_sidecar "$VENV_T5_530_DIR" "5.3.0" "5.3"
+else
+    step "transformers" "5.3.0 sidecar current"
+    _sidecar_top_up_tiktoken "$VENV_T5_530_DIR" "5.3"
+fi
+if [ "$_NEED_T5_550" = true ]; then
+    _install_sidecar "$VENV_T5_550_DIR" "5.5.0" "5.5"
+else
+    step "transformers" "5.5.0 sidecar current"
+    _sidecar_top_up_tiktoken "$VENV_T5_550_DIR" "5.5"
+fi
+if [ "$_NEED_T5_510" = true ]; then
+    _install_sidecar "$VENV_T5_510_DIR" "5.10.2" "5.10"
+else
+    step "transformers" "5.10.2 sidecar current"
+    _sidecar_top_up_tiktoken "$VENV_T5_510_DIR" "5.10"
 fi
 fi
 
@@ -3634,6 +4007,12 @@ else
     if [ "$_WHISPER_STATUS" -eq 0 ]; then
         if grep -Fq "already matches" "$_WHISPER_LOG"; then
             step "whisper.cpp" "prebuilt up to date"
+        elif grep -Fq "keeping the existing complete install" "$_WHISPER_LOG"; then
+            # Exit 0 can also mean the installer kept the tree already on disk after a
+            # release lookup that could not answer. "prebuilt installed" would name a
+            # release nothing fetched. Same wording and same grep token as the llama arm
+            # above, so a strictly offline update reads the same for both components.
+            step "whisper.cpp" "update unavailable, existing prebuilt kept" "$C_WARN"
         else
             step "whisper.cpp" "prebuilt installed"
         fi
