@@ -1,0 +1,27 @@
+# Disk and VM budget probe for the macOS hosted runners (round 7 support).
+name: macOS runner disk probe
+on:
+  push:
+    branches: ['docker-hosts-7-probe']
+  workflow_dispatch:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Host disk, memory, hypervisor
+        run: |
+          uname -m; sw_vers | head -2
+          sysctl -n hw.memsize | awk '{printf "mem_gb=%.0f\n", $1/1073741824}'
+          sysctl -n kern.hv_support || true
+          df -h / /Users /private/var 2>/dev/null
+          df -g / | tail -1 | awk '{print "free_gb_root=" $4}'
+          ls -d /Applications/Docker.app 2>/dev/null && echo docker_desktop=present || echo docker_desktop=absent
+          which docker colima qemu-system-aarch64 qemu-system-x86_64 2>/dev/null || true
+          brew --prefix; du -sh /Users/runner/hostedtoolcache 2>/dev/null || true
+          du -sh /Applications/Xcode*.app 2>/dev/null | sort -h | tail -3
+          echo "removable:"; du -sh /Users/runner/hostedtoolcache /usr/local/lib/node_modules /Users/runner/.dotnet /Library/Developer/CoreSimulator /Applications/Xcode_15*.app /Applications/Xcode_16.[0-2]*.app 2>/dev/null | sort -h
