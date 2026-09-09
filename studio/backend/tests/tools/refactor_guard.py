@@ -206,6 +206,18 @@ _FRAGMENTS = (
     "get_weather[ARGS]{",
     "get_weather[ARGS]",
     'unlisted_tool[ARGS]{"city": "Paris"}',
+    # Markerless execution-class forms: the guard refuses to promote these, and without an
+    # execution name in the corpus every function gating on it is constant and pins nothing.
+    'terminal[ARGS]{"command": "id"}',
+    'call:terminal{command:<|"|>id<|"|>}',
+    # A guarded call chained to a benign one, so blocked_bare_json_chain_may_continue is
+    # driven rather than constant.
+    '{"name": "terminal", "parameters": {"command": "id"}};'
+    '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+    # Chunk boundaries mid-call, so the streaming holds are driven rather than constant.
+    "Here is prose call:get_weather{city:",
+    "Here is prose cal",
+    '{"name": "terminal", "parameters": {"command": "id"}}; call:get_weather{city:1}',
     '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}',
     '<|python_tag|>get_weather.call(city="Paris")',
     '{"name": "get_weather", "parameters": {"city": "Paris"}}',
@@ -247,7 +259,10 @@ _FRAGMENTS = (
     '{"a": "\\""}',
 )
 
-_ENABLED_NAMES = ("get_weather", "search", "trunc", "broken")
+# ``terminal`` is here so the corpus actually exercises the markerless execution guard:
+# without an execution name enabled, every gated function is constant over the corpus and
+# its golden digest pins nothing.
+_ENABLED_NAMES = ("get_weather", "search", "trunc", "broken", "terminal")
 
 
 def build_corpus(seed: int = 20260811, count: int = 600) -> list:
@@ -271,10 +286,15 @@ def build_corpus(seed: int = 20260811, count: int = 600) -> list:
 _ARG_FIXTURES = {
     "brace_start": lambda text: max(text.find("{"), 0),
     "brace_pos": lambda text: max(text.find("{"), 0),
+    "paren_start": lambda text: max(text.find("("), 0),
     "start": lambda text: max(text.find("["), 0),
     "pos": lambda text: len(text),
     "body_start": lambda text: max(text.find("[") + 1, 0),
     "body_end": lambda text: len(text),
+    "end": lambda text: len(text),
+    # Nothing to restore: the masker's own output is what pairs with it, and an invented
+    # list would pin a substitution the corpus never produced.
+    "bodies": lambda text: [],
     "body": lambda text: text,
     "hard_stop": lambda text: len(text),
     "i": lambda text: 0,
