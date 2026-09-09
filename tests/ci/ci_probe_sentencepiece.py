@@ -85,6 +85,20 @@ def _sentencepiece_installed_on_disk():
 
 
 def _import_unsloth():
+    """Import unsloth on a runner with no GPU.
+
+    `import unsloth` raises NotImplementedError ("cannot find any torch accelerator") on a
+    CPU-only runner, which made both unsloth legs VOID rather than answering anything. The
+    repo's own CI solves this with tests/_zoo_aggressive_cuda_spoof.py; the same harness is
+    used here so the leg exercises the real entry point instead of a reduced one.
+    """
+    import sys
+    from pathlib import Path as _Path
+    tests_dir = _Path(__file__).resolve().parents[1]
+    if str(tests_dir) not in sys.path:
+        sys.path.insert(0, str(tests_dir))
+    import _zoo_aggressive_cuda_spoof as _spoof
+    _spoof.apply()
     import unsloth
     return getattr(unsloth, "__version__", "?")
 
