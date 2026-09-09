@@ -6595,6 +6595,13 @@ class LlamaCppBackend:
 
     @property
     def base_url(self) -> str:
+        # On a paired DGX Spark serving replicas this is the in-process router that
+        # spreads requests over both nodes; None everywhere else.
+        from core.inference.spark_serving import route_base_url
+
+        routed = route_base_url(self)
+        if routed is not None:
+            return routed
         return f"http://127.0.0.1:{self._port}"
 
     @property
@@ -29108,6 +29115,11 @@ class LlamaCppBackend:
             "presence_penalty": presence_penalty,
             "frequency_penalty": frequency_penalty,
         }
+        # Name the conversation, so the router keeps every turn of this thread on the
+        # llama-server that holds its prefix in KV. The router pops the field again.
+        from core.inference.spark_serving import tag_conversation
+
+        tag_conversation(payload, thread_id)
         retry_messages = messages
         retry_image_b64 = image_b64
         retry_max_tokens = max_tokens
