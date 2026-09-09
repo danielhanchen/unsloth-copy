@@ -1,0 +1,74 @@
+{
+  "800": {
+    "tag": "v0.1.800-beta",
+    "pypi_version": "2026.8.18",
+    "zoo": "2026.8.12",
+    "cutoff": "2026-08-14T15:01:36Z",
+    "unsloth_upload": "2026-08-14T15:00:36.102986Z",
+    "install_sh_blob": "d87e90c6fc1c8259f3a5b739191fff3ef20eef34",
+    "install_ps1_blob": "13f6dc3211103f6e267022e3e15b7187c0660841"
+  },
+  "801": {
+    "tag": "v0.1.801-beta",
+    "pypi_version": "2026.8.19",
+    "zoo": "2026.8.13",
+    "cutoff": "2026-08-20T17:11:26Z",
+    "unsloth_upload": "2026-08-20T17:10:26.780355Z",
+    "install_sh_blob": "907e2fc08b3df33c5d920aaea8ad945b3e8fb8ca",
+    "install_ps1_blob": "dc64ba6065291ea09c085ef3e5fb8dad5f7f8d95"
+  },
+  "802": {
+    "tag": "v0.1.802-beta",
+    "pypi_version": "2026.8.20",
+    "zoo": "2026.8.15",
+    "cutoff": "2026-08-25T11:39:26Z",
+    "unsloth_upload": "2026-08-25T11:38:26.785005Z",
+    "install_sh_blob": "9b18137d7d79e53df42f06e85ea46a81eff7ebe3",
+    "install_ps1_blob": "fdb74e92c34d4ab5001f8df769521798432d59b2"
+  },
+  "803": {
+    "tag": "v0.1.803-beta",
+    "pypi_version": "2026.8.21",
+    "zoo": "2026.8.15",
+    "cutoff": "2026-08-25T13:19:09Z",
+    "unsloth_upload": "2026-08-25T13:18:09.338678Z",
+    "install_sh_blob": "22c0b7d772757acbc2c19ce87f360a78cb003326",
+    "install_ps1_blob": "7265e47f8e7316554dbec6b50008e8c76c6e48f6"
+  },
+  "804": {
+    "tag": "v0.1.804-beta",
+    "pypi_version": "2026.8.22",
+    "zoo": "2026.8.16",
+    "cutoff": "2026-08-27T14:21:46Z",
+    "unsloth_upload": "2026-08-27T14:20:46.675608Z",
+    "install_sh_blob": "71d0cb0f51dc70dd025188f95b67a4834454a01c",
+    "install_ps1_blob": "9d8549dfadac1dae2f478fecce3cebae5fda2873"
+  },
+  "805": {
+    "tag": "v0.1.805-beta",
+    "pypi_version": "2026.9.1",
+    "zoo": "2026.9.1",
+    "cutoff": "2026-09-02T12:24:40Z",
+    "unsloth_upload": "2026-09-02T12:23:40.127592Z",
+    "install_sh_blob": "c7976892c4ce25bab9437aff8b7668c64bbfb20b",
+    "install_ps1_blob": "e9bf1deefaacc630c876ab727ca91700ec7063ac"
+  },
+  "806": {
+    "tag": "v0.1.806-beta",
+    "pypi_version": "2026.9.2",
+    "zoo": "2026.9.1",
+    "cutoff": "2026-09-02T13:08:20Z",
+    "unsloth_upload": "2026-09-02T13:07:20.895047Z",
+    "install_sh_blob": "5e2ca122d9e12d6739527cef8e11bd3232ccc637",
+    "install_ps1_blob": "4a1cb3c51b8445a40f9d182a64254ae8376de006"
+  },
+  "807": {
+    "tag": "v0.1.807-beta",
+    "pypi_version": "2026.9.3",
+    "zoo": "2026.9.2",
+    "cutoff": "2026-09-08T15:22:19Z",
+    "unsloth_upload": "2026-09-08T15:21:19.267374Z",
+    "install_sh_blob": "f8ba55d76ebe3a439855ad9f96b794af9bd26598",
+    "install_ps1_blob": "134531c9e74418806d1e0e71548454291c5198ec"
+  }
+}

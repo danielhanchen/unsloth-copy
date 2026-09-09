@@ -1,0 +1,986 @@
+name: Bisect Studio update timing
+
+# Installs release N with that tag's own installer (pinned to N's backend wheel), then updates
+# to N+1 the way the desktop does, timing each phase and attributing network bytes per host.
+# Disposable staging-branch workflow; never merged.
+
+on:
+  push:
+    branches: [bisect-update-ci]
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: 'comma list of from-to:mode, e.g. 806-807:staged,806-807:plain (empty = repo default)'
+        type: string
+        default: ''
+      chain:
+        description: 'run the 800 -> 807 chain (empty = repo default)'
+        type: string
+        default: ''
+      policy:
+        description: 'run the uv cache policy checks (empty = repo default)'
+        type: string
+        default: ''
+      oses:
+        description: 'runner labels'
+        type: string
+        default: 'ubuntu-latest,macos-15,windows-latest'
+      pr_wheel:
+        description: 'build a wheel from this branch and verify the PR against it (upgrade/oldshell/nested/faults/prefetch/timing jobs)'
+        type: boolean
+        default: false
+      upgrade_from:
+        description: 'releases to install before updating to the PR wheel, e.g. 805,806,807 (empty = repo default)'
+        type: string
+        default: ''
+      pr_jobs:
+        description: 'restrict the PR jobs, e.g. upgrade,faults (empty = the repo plan)'
+        type: string
+        default: ''
+      time_budget_json:
+        description: 'per-OS seconds budget for the timing job, e.g. {"ubuntu-latest":15,"macos-15":65,"windows-latest":155}'
+        type: string
+        default: '{"ubuntu-latest": 15, "macos-15": 65, "windows-latest": 155}'
+      expect_idempotent:
+        description: 'false = record the idempotency verdict without failing the job (a branch that predates the fix under test)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bisect-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pairs: ${{ steps.plan.outputs.pairs }}
+      chain: ${{ steps.plan.outputs.chain }}
+      policy: ${{ steps.plan.outputs.policy }}
+      has_pairs: ${{ steps.plan.outputs.has_pairs }}
+      has_chain: ${{ steps.plan.outputs.has_chain }}
+      has_policy: ${{ steps.plan.outputs.has_policy }}
+      upgrade: ${{ steps.plan.outputs.upgrade }}
+      oldshell: ${{ steps.plan.outputs.oldshell }}
+      nested: ${{ steps.plan.outputs.nested }}
+      faults: ${{ steps.plan.outputs.faults }}
+      prefetch: ${{ steps.plan.outputs.prefetch }}
+      timing: ${{ steps.plan.outputs.timing }}
+      cargo: ${{ steps.plan.outputs.cargo }}
+      has_upgrade: ${{ steps.plan.outputs.has_upgrade }}
+      has_oldshell: ${{ steps.plan.outputs.has_oldshell }}
+      has_nested: ${{ steps.plan.outputs.has_nested }}
+      has_faults: ${{ steps.plan.outputs.has_faults }}
+      has_prefetch: ${{ steps.plan.outputs.has_prefetch }}
+      has_timing: ${{ steps.plan.outputs.has_timing }}
+      has_cargo: ${{ steps.plan.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        run: |
+          python3 scripts/bisect/ci_plan.py --repo "${{ github.repository }}" \
+            --oses "${{ inputs.oses || 'ubuntu-latest,macos-15,windows-latest' }}" \
+            --pairs "${{ inputs.pairs }}" --chain "${{ inputs.chain }}" --policy "${{ inputs.policy }}" \
+            --pr-wheel "${{ inputs.pr_wheel }}" --upgrade-from "${{ inputs.upgrade_from }}" \
+            --jobs "${{ inputs.pr_jobs }}" | tee -a "$GITHUB_OUTPUT"
+
+  pair:
+    needs: plan
+    if: needs.plan.outputs.has_pairs == 'true'
+    name: ${{ matrix.os }} ${{ matrix.from }}->${{ matrix.to }} ${{ matrix.mode }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.pairs) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-${{ matrix.from }}-${{ matrix.to }}-${{ matrix.mode }}
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Install ${{ matrix.from }} then update to ${{ matrix.to }} (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install ${{ matrix.from }}
+          if [ "${{ matrix.mode }}" = staged ]; then
+            bash "$B" update ${{ matrix.from }} ${{ matrix.to }} --stage
+            bash "$B" activate ${{ matrix.from }}-to-${{ matrix.to }}
+          else
+            bash "$B" update ${{ matrix.from }} ${{ matrix.to }}
+          fi
+          bash "$B" launch pair-${{ matrix.to }} 150 || true
+      - name: Install ${{ matrix.from }} then update to ${{ matrix.to }} (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N ${{ matrix.from }}
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ("${{ matrix.mode }}" -eq "staged") {
+            pwsh -NoProfile -File $B -Cmd update -N ${{ matrix.from }} -To ${{ matrix.to }} -Stage
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            pwsh -NoProfile -File $B -Cmd activate -Label "${{ matrix.from }}-to-${{ matrix.to }}"
+          } else {
+            pwsh -NoProfile -File $B -Cmd update -N ${{ matrix.from }} -To ${{ matrix.to }}
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          pwsh -NoProfile -File $B -Cmd launch -Label "pair-${{ matrix.to }}" -Seconds 150
+          exit 0
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - "$OUT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import glob, json, os, sys
+          out = sys.argv[1]
+          print(f"### {os.path.basename(out)}")
+          print("| step | seconds | exit | assert | proxy MB | top hosts | torch after |")
+          print("|---|---:|---:|---|---:|---|---|")
+          for f in sorted(glob.glob(f"{out}/*/summary.json")):
+              s = json.load(open(f)); p = s.get("proxy") or {}
+              hosts = ", ".join(f"{h.split('.')[0]}={v['bytes_down']/1e6:.0f}" for h, v in list((p.get("by_host") or {}).items())[:3])
+              d = s.get("diff") or {}
+              print(f"| {s.get('label')} | {s.get('seconds_total','')} | {s.get('exit_code','')} | {s.get('assert_ok','')} | {p.get('total_bytes_down',0)/1e6:.0f} | {hosts} | {(d.get('torch_after') or {}).get('version','')} |")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-${{ matrix.from }}-${{ matrix.to }}-${{ matrix.mode }}
+          path: results/**
+          if-no-files-found: warn
+
+  chain:
+    needs: plan
+    if: needs.plan.outputs.has_chain == 'true'
+    name: ${{ matrix.os }} chain 800->807
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.chain) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-chain
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Chain (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install 800 || exit 1
+          for n in 800 801 802 803 804 805 806; do
+            m=$((n+1))
+            if [ "$n" -ge 805 ]; then
+              if bash "$B" update "$n" "$m" --stage; then bash "$B" activate "$n-to-$m"; else bash "$B" update "$n" "$m" || exit 1; fi
+            else
+              bash "$B" update "$n" "$m" || exit 1
+            fi
+          done
+          bash "$B" launch chain-807 150 || true
+      - name: Chain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N 800; if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($n in 800..806) {
+            $m = $n + 1
+            if ($n -ge 805) {
+              pwsh -NoProfile -File $B -Cmd update -N $n -To $m -Stage
+              if ($LASTEXITCODE -eq 0) { pwsh -NoProfile -File $B -Cmd activate -Label "$n-to-$m" }
+              else { pwsh -NoProfile -File $B -Cmd update -N $n -To $m; if ($LASTEXITCODE -ne 0) { exit 1 } }
+            } else {
+              pwsh -NoProfile -File $B -Cmd update -N $n -To $m; if ($LASTEXITCODE -ne 0) { exit 1 }
+            }
+          }
+          pwsh -NoProfile -File $B -Cmd launch -Label "chain-807" -Seconds 150
+          exit 0
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - "$OUT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import glob, json, os, sys
+          out = sys.argv[1]
+          print(f"### {os.path.basename(out)}")
+          print("| step | seconds | exit | assert | proxy MB | torch after |")
+          print("|---|---:|---:|---|---:|---|")
+          for f in sorted(glob.glob(f"{out}/*/summary.json")):
+              s = json.load(open(f)); p = s.get("proxy") or {}; d = s.get("diff") or {}
+              print(f"| {s.get('label')} | {s.get('seconds_total','')} | {s.get('exit_code','')} | {s.get('assert_ok','')} | {p.get('total_bytes_down',0)/1e6:.0f} | {(d.get('torch_after') or {}).get('version','')} |")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-chain
+          path: results/**
+          if-no-files-found: warn
+
+  policy:
+    needs: plan
+    if: needs.plan.outputs.has_policy == 'true'
+    name: ${{ matrix.os }} uv cache policy
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.policy) }}
+    env:
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Policy checks (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          B="$BISECT_DIR/run_step.sh"; R="$RUNNER_TEMP/bisect"; export BISECT_REAL_HOME=0; O="$GITHUB_WORKSPACE/results/${{ matrix.os }}"
+          # P1: 806-origin install (global cache), real 806->807 update, then the 807 CLI again, then uninstall.
+          RUN_ROOT=$R/p1 OUT=$O/p1 bash "$B" install 806 --no-torch && RUN_ROOT=$R/p1 OUT=$O/p1 bash "$B" update 806 807 && RUN_ROOT=$R/p1 OUT=$O/p1 bash "$B" update 807 807
+          RUN_ROOT=$R/p1 OUT=$O/p1 bash "$B" uninstall 807 p1 || true
+          # P2: warm global uv cache first, then a fresh 807 install (contract says: reuse the shared cache).
+          mkdir -p $R/p2/home; python3 -m pip install -q "uv==0.12.1"
+          ( cd $R/p2/home && HOME=$R/p2/home uv venv $R/p2/warm -q && HOME=$R/p2/home uv pip install --python $R/p2/warm/bin/python -q requests rich typer )
+          RUN_ROOT=$R/p2 OUT=$O/p2 bash "$B" install 807 --no-torch && RUN_ROOT=$R/p2 OUT=$O/p2 bash "$B" update 807 807
+          RUN_ROOT=$R/p2 OUT=$O/p2 bash "$B" uninstall 807 p2 || true
+          # P3: forced isolation.
+          RUN_ROOT=$R/p3 OUT=$O/p3 bash "$B" install 807 --no-torch --isolated-uv-cache
+          RUN_ROOT=$R/p3 OUT=$O/p3 bash "$B" uninstall 807 p3 || true
+          grep -h -E 'uv cache' $O/p*/install-*/log.txt | tee $O/uv_cache_mode_lines.txt || true
+      - name: Policy checks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"; $O = "$env:GITHUB_WORKSPACE/results/${{ matrix.os }}"
+          # P1
+          $env:OUT = "$O/p1"
+          pwsh -NoProfile -File $B -Cmd install -N 806 -NoTorch
+          if ($LASTEXITCODE -eq 0) { pwsh -NoProfile -File $B -Cmd update -N 806 -To 807; pwsh -NoProfile -File $B -Cmd update -N 807 -To 807 }
+          pwsh -NoProfile -File $B -Cmd uninstall -N 807 -Label p1
+          # P2: warm %LOCALAPPDATA%\uv\cache first (the uninstall above must have left it alone).
+          $env:OUT = "$O/p2"
+          python -m pip install -q "uv==0.12.1"
+          uv venv "$env:RUNNER_TEMP\warm" -q; uv pip install --python "$env:RUNNER_TEMP\warm\Scripts\python.exe" -q requests rich typer
+          pwsh -NoProfile -File $B -Cmd install -N 807 -NoTorch
+          if ($LASTEXITCODE -eq 0) { pwsh -NoProfile -File $B -Cmd update -N 807 -To 807 }
+          pwsh -NoProfile -File $B -Cmd uninstall -N 807 -Label p2
+          # P3
+          $env:OUT = "$O/p3"
+          pwsh -NoProfile -File $B -Cmd install -N 807 -NoTorch -IsolatedUvCache
+          pwsh -NoProfile -File $B -Cmd uninstall -N 807 -Label p3
+          Get-ChildItem "$O/p*/install-*/log.txt" | ForEach-Object { Select-String -Path $_ -Pattern 'uv cache' } | Out-File "$O/uv_cache_mode_lines.txt"
+          exit 0
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          O="$GITHUB_WORKSPACE/results/${{ matrix.os }}"
+          { echo "### policy ${{ matrix.os }}"; echo '```'; cat "$O/uv_cache_mode_lines.txt" 2>/dev/null; for f in "$O"/p*/uninstall-*/summary.json "$O"/p*/update-*/summary.json; do [ -f "$f" ] && python3 -c "import json,sys; s=json.load(open(sys.argv[1], encoding='utf-8-sig')); print(s.get('label'), {k:v for k,v in s.items() if k in ('exit_code','studio_root_exists','global_uv_cache_exists','global_uv_cache_growth_bytes','studio_cache_growth_bytes','seconds_total')}, (s.get('diff') or {}).get('marker_after'))" "$f"; done; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-policy
+          path: results/**
+          if-no-files-found: warn
+
+  upgrade:
+    needs: plan
+    if: needs.plan.outputs.has_upgrade == 'true'
+    name: ${{ matrix.os }} upgrade ${{ matrix.from }} -> PR
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.upgrade) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-upgrade-${{ matrix.from }}
+      BISECT_REAL_HOME: '1'
+      # workflow_dispatch only: on a push the input is null, and GitHub casts null == false to
+      # true, which would silently disarm the assert on every push run.
+      EXPECT_IDEMPOTENT: ${{ (github.event_name == 'workflow_dispatch' && inputs.expect_idempotent == false) && '0' || '1' }}
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      # Three no-op updates, not two. The FIRST update run by the new code after an upgrade is a
+      # settle pass: it legitimately rewrites the manifest (pass_inputs / step_results / uv_version
+      # exist only in code that writes them), may repair torchao to the +cpu build the index
+      # actually serves, and backfills the uv cache marker. Comparing it against the upgrade
+      # measured the upgrade, not idempotency. The pair that means something is settle -> noop
+      # (relaxed) and noop -> noop-offline (strict).
+      #
+      # What each run exercises, and why they are not the same route (report.py prints it per
+      # step as `path=`):
+      #   settle / noop  a full dependency pass whose steps all skip. The harness relabels the PR
+      #                  wheel `<version>.post1`, and setup compares the INSTALLED version string
+      #                  against what PyPI reports as latest, so `2026.9.3.post1` never equals
+      #                  `2026.9.3` and the "is up to date" fast path a real user hits is
+      #                  unreachable online. There is no override for the probe URL in
+      #                  setup.sh / setup.ps1 (it is a literal https://pypi.org/pypi/<pkg>/json),
+      #                  and dropping the relabel would let `unsloth==<version>` resolve from PyPI
+      #                  instead of the branch wheel -- a job could then pass having installed the
+      #                  very release it was meant to replace. The pessimistic timing is the price.
+      #   offline        the probe is refused, so with UV_OFFLINE=1 the verified install is kept:
+      #                  this is the run that exercises a fast path, and the only one whose
+      #                  connection counts mean anything.
+      #
+      # Windows: setup.ps1 probes PyPI with Invoke-RestMethod, which under Windows PowerShell 5.1
+      # uses the per-user WinINET proxy and ignores HTTP(S)_PROXY, so the refuse-all run reached
+      # PyPI anyway. run_step.ps1 now hands the proxy over in _UNSLOTH_PS_PROXY_DEFAULTS -- the
+      # product's own corporate-proxy path, replayed into $PSDefaultParameterValues by the prelude
+      # unsloth_cli wraps setup.ps1 in -- rather than editing the registry or the firewall. The
+      # assert fails any refuse-all run whose probe was still answered.
+      - name: Install ${{ matrix.from }}, update to the PR wheel, launch, then settle + two no-ops (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install ${{ matrix.from }}
+          bash "$B" update ${{ matrix.from }} pr
+          bash "$B" launch upgrade-pr 150 || true
+          bash "$B" noop-update after-pr-settle --role settle
+          bash "$B" noop-update after-pr --role noop
+          bash "$B" noop-update after-pr --offline --role offline
+      - name: Install ${{ matrix.from }}, update to the PR wheel, launch, then settle + two no-ops (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N ${{ matrix.from }}
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd update -N ${{ matrix.from }} -To pr
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd launch -Label "upgrade-pr" -Seconds 150
+          pwsh -NoProfile -File $B -Cmd noop-update -Label after-pr-settle -Role settle
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd noop-update -Label after-pr -Role noop
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd noop-update -Label after-pr -Offline -Role offline
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          exit 0
+      - name: Assert the no-op updates did nothing
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --assert idempotent \
+            --expect-idempotent "$EXPECT_IDEMPOTENT"
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-upgrade-${{ matrix.from }}
+          path: results/**
+          if-no-files-found: warn
+
+  oldshell:
+    needs: plan
+    if: needs.plan.outputs.has_oldshell == 'true'
+    name: ${{ matrix.os }} old shell --stage refused
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.oldshell) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-oldshell
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      # leftover-seed / leftover-check only PREPARE and RECORD the legacy state; the
+      # reconciliation itself is Rust and runs in the cargo-legacy-tests job.
+      - name: Fresh PR install, then an old shell asks for a staged update (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install pr
+          bash "$B" old-shell-stage
+          bash "$B" leftover-seed
+          bash "$B" leftover-check
+      - name: Fresh PR install, then an old shell asks for a staged update (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N pr
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd old-shell-stage
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd leftover-seed
+          pwsh -NoProfile -File $B -Cmd leftover-check
+          exit 0
+      - name: Assert the refusal was clean
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --assert old-shell-stage
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-oldshell
+          path: results/**
+          if-no-files-found: warn
+
+  nested:
+    needs: plan
+    if: needs.plan.outputs.has_nested == 'true'
+    name: ${{ matrix.os }} 806 CLI stages the PR wheel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.nested) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-nested
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      - name: Install 806, let its own CLI stage the PR wheel, assert the live venv is untouched
+        # POSIX only: this exercises the 806 CLI's real --stage path, which has no Windows twin in
+        # the harness (ci_plan.py keeps windows out of this matrix).
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install 806
+          bash "$B" update 806 pr --stage
+          bash "$B" nested-old-stage
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-nested
+          path: results/**
+          if-no-files-found: warn
+
+  faults:
+    needs: plan
+    if: needs.plan.outputs.has_faults == 'true'
+    name: ${{ matrix.os }} idempotency fault injection
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.faults) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-faults
+      BISECT_REAL_HOME: '1'
+      # workflow_dispatch only: on a push the input is null, and GitHub casts null == false to
+      # true, which would silently disarm the assert on every push run.
+      EXPECT_IDEMPOTENT: ${{ (github.event_name == 'workflow_dispatch' && inputs.expect_idempotent == false) && '0' || '1' }}
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      - name: Fresh PR install, then break one thing at a time (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install pr
+          for k in sidecar-dist-info sidecar-truncate manifest req-edit llama-truncate; do
+            bash "$B" fault "$k" || exit 1
+            bash "$B" noop-update "after-$k" || exit 1
+          done
+      - name: Fresh PR install, then break one thing at a time (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N pr
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($k in "sidecar-dist-info", "sidecar-truncate", "manifest", "req-edit", "llama-truncate") {
+            pwsh -NoProfile -File $B -Cmd fault -Kind $k
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            pwsh -NoProfile -File $B -Cmd noop-update -Label "after-$k"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          exit 0
+      - name: Assert every repair settled back to a no-op
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --assert idempotent \
+            --expect-idempotent "$EXPECT_IDEMPOTENT"
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-faults
+          path: results/**
+          if-no-files-found: warn
+
+  prefetch:
+    needs: plan
+    if: needs.plan.outputs.has_prefetch == 'true'
+    name: ${{ matrix.os }} prefetch then offline swap
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.prefetch) }}
+    env:
+      # The swap must be served from the cache the prefetch warmed: deny the index hosts only.
+      # Git deps and the torch index stay reachable; they belong to the dependency pass.
+      DENY_HOSTS: pypi.org,files.pythonhosted.org
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-prefetch
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      - name: Second wheel with a bumped version (the prefetch target)
+        shell: bash
+        # `pr2` is the same wheel republished as `<version>.post2`, one post-release above the
+        # `pr` wheel, so "the prefetch fetched the NEW backend" is unambiguous. pr_wheel.py skips
+        # any .postN that PyPI actually publishes.
+        run: |
+          set -o pipefail
+          rm -rf "$PR_WHEEL_DIR2"
+          python scripts/bisect/pr_wheel.py bump --wheel-dir "$PR_WHEEL_DIR" --out-dir "$PR_WHEEL_DIR2" --post 2 | tee "$OUT/pr_wheel2.json"
+      - name: 806 -> PR, prefetch pr2, then swap with PyPI and GitHub refused (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install 806
+          bash "$B" update 806 pr
+          bash "$B" prefetch --target pr2
+          supported=$(python3 -c "import json; print(json.load(open('$OUT/prefetch-pr2/summary.json'))['prefetch_supported'])")
+          if [ "$supported" = True ]; then
+            bash "$B" update pr pr2 --offline-pypi
+          else
+            echo "::warning::the installed CLI has no studio prefetch-update (PR C not present); offline swap skipped"
+          fi
+      - name: 806 -> PR, prefetch pr2, then swap with PyPI and GitHub refused (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N 806
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd update -N 806 -To pr
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd prefetch -Target pr2
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $s = Get-Content (Join-Path $env:OUT "prefetch-pr2/summary.json") -Raw | ConvertFrom-Json
+          if ($s.prefetch_supported) {
+            pwsh -NoProfile -File $B -Cmd update -N pr -To pr2 -OfflinePypi
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          } else {
+            Write-Host "::warning::the installed CLI has no studio prefetch-update (PR C not present); offline swap skipped"
+          }
+          exit 0
+      - name: Assert the prefetch touched only the cache
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --assert prefetch
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-prefetch
+          path: results/**
+          if-no-files-found: warn
+
+  timing:
+    needs: plan
+    if: needs.plan.outputs.has_timing == 'true'
+    name: ${{ matrix.os }} timing regression
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.timing) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-timing
+      BISECT_REAL_HOME: '1'
+      BISECT_DIR: ${{ github.workspace }}/scripts/bisect
+      SOURCE_ROOT: ${{ github.workspace }}
+      PR_WHEEL_DIR: ${{ github.workspace }}/prwheel
+      PR_WHEEL_DIR2: ${{ github.workspace }}/prwheel2
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TIME_BUDGET_JSON: ${{ inputs.time_budget_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner facts
+        shell: bash
+        run: |
+          mkdir -p "$OUT"
+          { echo "os=${{ matrix.os }} image=$ImageOS/$ImageVersion arch=$(uname -m 2>/dev/null || echo $PROCESSOR_ARCHITECTURE)"; uname -a 2>/dev/null || true; df -h . 2>/dev/null || true; } | tee "$OUT/runner.txt"
+      - name: Build the PR wheel from this branch
+        shell: bash
+        # The whole point of the PR jobs: `studio update` must resolve `unsloth` to THIS branch
+        # while still being run by the old installed release's own CLI. pr_wheel.py checks that
+        # the version pyproject declares, the wheel METADATA and the wheel filename agree, then
+        # relabels it `<version>.post1` before layering `unsloth==<version>.post1` over the
+        # release pins. The relabel matters: a PR branches off main while _version.py still holds
+        # the LAST RELEASE's number, so without it `unsloth==<version>` would also be satisfiable
+        # from PyPI and a job could pass having installed the very release it was meant to
+        # replace. `.postN` rather than a local label `+pr`: the installer builds its own floor as
+        # `unsloth>=<version>`, and PEP 440 forbids `>=` against a local segment (observed: both
+        # uv and pip refuse to parse it and the update dies before it starts).
+        run: |
+          set -o pipefail
+          python -m pip install --quiet build
+          rm -rf "$PR_WHEEL_DIR"
+          mkdir -p "$PR_WHEEL_DIR"
+          python -m build --wheel --outdir "$PR_WHEEL_DIR"
+          ls -l "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py verify --source . --wheel-dir "$PR_WHEEL_DIR"
+          python scripts/bisect/pr_wheel.py relabel --wheel-dir "$PR_WHEEL_DIR" --post 1 | tee "$OUT/pr_wheel.json"
+      - name: Plain 806 -> PR update (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          export RUN_ROOT="$RUNNER_TEMP/bisect"
+          B="$BISECT_DIR/run_step.sh"
+          bash "$B" install 806
+          bash "$B" update 806 pr
+          # The upgrade is the settle pass of the new code (it rewrites its own evidence once);
+          # the budget applies to the no-op AFTER it, which is what every later update costs.
+          EXPECT_IDEMPOTENT=0 bash "$B" noop-update after-pr --role noop
+      - name: Plain 806 -> PR update (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $B = Join-Path $env:BISECT_DIR "run_step.ps1"
+          pwsh -NoProfile -File $B -Cmd install -N 806
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh -NoProfile -File $B -Cmd update -N 806 -To pr
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:EXPECT_IDEMPOTENT = "0"
+          pwsh -NoProfile -File $B -Cmd noop-update -Label after-pr -Role noop
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          exit 0
+      - name: Compare against the budget
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --assert timing \
+            --budget "$TIME_BUDGET_JSON" --budget-os "${{ matrix.os }}" --budget-step noop-update-after-pr
+          # The upgrade itself is reported (not budgeted) beside it: see the Summary.
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/bisect/report.py --roots "$OUT" --step-summary >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-timing
+          path: results/**
+          if-no-files-found: warn
+
+  cargo-legacy-tests:
+    needs: plan
+    if: needs.plan.outputs.has_cargo == 'true'
+    name: ${{ matrix.os }} cargo test staged_update
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.cargo) }}
+    env:
+      OUT: ${{ github.workspace }}/results/${{ matrix.os }}-cargo
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Linux native deps for Tauri / WebKit2GTK
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        shell: bash
+        # The same package set studio-tauri-smoke.yml installs; without them the crate does not
+        # link on Linux and `cargo test` reports a build error rather than a test result.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+      - name: Frontend build (npm ci, vite)
+        # The crate's tests are compiled against tauri.conf.json's distDir, so the frontend has to
+        # exist first -- exactly as in studio-tauri-smoke.yml.
+        shell: bash
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+          test -f dist/index.html
+      - name: cargo test staged_update
+        shell: bash
+        # The legacy-state reconciliation itself lives in Rust; the harness only prepares the
+        # fixtures (run_step.* leftover-seed / leftover-check). This is where it is exercised.
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT"
+          if ! command -v cargo > /dev/null 2>&1; then
+            echo "::warning::no Rust toolchain on this runner; the legacy-state tests did not run"
+            echo '{"label": "cargo-legacy-tests", "skipped": "no rust toolchain", "exit_code": 0}' > "$OUT/summary.json"
+            exit 0
+          fi
+          cd studio/src-tauri
+          cargo test staged_update --no-fail-fast 2>&1 | tee "$OUT/cargo.log"
+          rc=${PIPESTATUS[0]}
+          python3 -c "import json,sys; json.dump({'label':'cargo-legacy-tests','exit_code':int(sys.argv[1])}, open(sys.argv[2],'w'))" "$rc" "$OUT/summary.json"
+          exit "$rc"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ matrix.os }}-cargo
+          path: results/**
+          if-no-files-found: warn
