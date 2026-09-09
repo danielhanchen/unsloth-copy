@@ -2232,3 +2232,467 @@ def test_resolver_reports_metal_slim_on_macos(tmp_path, monkeypatch, capsys):
     assert payload["asset"] == MAC_SLIM_ASSET
     assert payload["backend"] == "metal"
     assert payload["requested_backend"] == "metal"
+
+
+# ── the no-network re-check ──
+#
+# install_prebuilt used to fetch the release, its manifest and its checksum index on every
+# update before it could even ask whether the install was already current. These tests hold
+# the check that answers from the marker plus at most one HEAD, and -- because a slim whisper
+# bundle hardlinks llama's ggml libraries -- that it still notices a llama runtime that moved
+# underneath an install whose own release did not.
+def _installed_cpu_tree(
+    tmp_path,
+    monkeypatch,
+    *,
+    backend = "cpu",
+):
+    host = _host("linux", "x64")
+    archive, asset, sha256 = _build_cpu_bundle(tmp_path, host)
+    calls = {"n": 0}
+
+    def fake_download(url, destination):
+        calls["n"] += 1
+        destination.parent.mkdir(parents = True, exist_ok = True)
+        destination.write_bytes(archive.read_bytes())
+
+    monkeypatch.setattr(M, "detect_host", lambda: host)
+    monkeypatch.setattr(M, "download_file", fake_download)
+    _install_env(monkeypatch, tmp_path, host, asset = asset, sha256 = sha256)
+    install_dir = tmp_path / "whisper.cpp"
+    assert M.install_prebuilt(install_dir, backend = backend) == M.EXIT_SUCCESS
+    assert calls["n"] == 1
+    monkeypatch.setattr(
+        M.llama, "_download_host_latest_release_tag", lambda _repo: RELEASE_TAG, raising = False
+    )
+    monkeypatch.delenv("UNSLOTH_PREBUILT_FULL_CHECK", raising = False)
+    return install_dir, host, calls
+
+
+def _whisper_check(install_dir, host, **overrides) -> bool:
+    kwargs = dict(
+        whisper_tag = "latest",
+        published_repo = M.DEFAULT_PUBLISHED_REPO,
+        published_release_tag = None,
+        requested_backend = "cpu",
+    )
+    kwargs.update(overrides)
+    return M.existing_install_current_without_plan(install_dir, host, **kwargs)
+
+
+def test_whisper_current_install_needs_no_release_fetch(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+
+    def boom(*_a, **_k):
+        raise AssertionError("the no-network check must not fetch the release")
+
+    monkeypatch.setattr(M, "fetch_release_for_install", boom)
+    assert _whisper_check(install_dir, host) is True
+
+
+def test_whisper_second_install_run_downloads_and_fetches_nothing(tmp_path, monkeypatch):
+    """The end-to-end shape: a repeat install_prebuilt is now a marker read, not a
+    release fetch followed by a fingerprint comparison."""
+    install_dir, host, calls = _installed_cpu_tree(tmp_path, monkeypatch)
+    fetches = {"n": 0}
+    real_fetch = M.fetch_release_for_install
+
+    def counting(*args, **kwargs):
+        fetches["n"] += 1
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(M, "fetch_release_for_install", counting)
+    assert M.install_prebuilt(install_dir, backend = "cpu") == M.EXIT_SUCCESS
+    assert calls["n"] == 1
+    assert fetches["n"] == 0
+    # --force is still the way to make it do the work anyway.
+    assert M.install_prebuilt(install_dir, backend = "cpu", force = True) == M.EXIT_SUCCESS
+    assert fetches["n"] == 1
+
+
+def test_whisper_newer_release_or_unreachable_lookup_is_not_current(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        M.llama, "_download_host_latest_release_tag", lambda _repo: "v1.9.2-unsloth.1"
+    )
+    assert _whisper_check(install_dir, host) is False
+    monkeypatch.setattr(M.llama, "_download_host_latest_release_tag", lambda _repo: None)
+    assert _whisper_check(install_dir, host) is False
+
+    def raises(_repo):
+        raise OSError("github.com unreachable")
+
+    monkeypatch.setattr(M.llama, "_download_host_latest_release_tag", raises)
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_whisper_pinned_and_upstream_tags_answer_without_a_lookup(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+
+    def boom(_repo):
+        raise AssertionError("a pinned tag names the answer outright")
+
+    monkeypatch.setattr(M.llama, "_download_host_latest_release_tag", boom)
+    assert _whisper_check(install_dir, host, published_release_tag = RELEASE_TAG) is True
+    assert _whisper_check(install_dir, host, published_release_tag = "v9.9.9") is False
+    assert _whisper_check(install_dir, host, whisper_tag = UPSTREAM_TAG) is True
+    assert _whisper_check(install_dir, host, whisper_tag = "v1.0.0") is False
+
+
+def test_whisper_a_different_repo_or_backend_is_not_current(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    assert _whisper_check(install_dir, host, published_repo = "someone/else") is False
+    assert _whisper_check(install_dir, host, requested_backend = "cuda") is False
+
+
+def test_whisper_full_check_request_declines_the_fast_path(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    monkeypatch.setenv("UNSLOTH_PREBUILT_FULL_CHECK", "1")
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_whisper_a_damaged_tree_is_not_current(tmp_path, monkeypatch):
+    """installed_tree_is_intact is the shared on-disk half, so the fast path refuses
+    exactly what the slow path would have repaired."""
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    server = M.installed_server_path(install_dir, host)
+    assert _whisper_check(install_dir, host) is True
+    server.chmod(0o644)
+    assert _whisper_check(install_dir, host) is False
+    server.chmod(0o755)
+    assert _whisper_check(install_dir, host) is True
+    server.unlink()
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_whisper_no_marker_is_not_current(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    (install_dir / M.METADATA_FILENAME).unlink()
+    assert _whisper_check(install_dir, host) is False
+
+
+def _slim_marker(install_dir: Path, **overrides) -> None:
+    marker_path = install_dir / M.METADATA_FILENAME
+    payload = json.loads(marker_path.read_text(encoding = "utf-8"))
+    payload["install_kind"] = "slim"
+    payload["runtime_wiring_version"] = M.SLIM_RUNTIME_WIRING_VERSION
+    payload["linked_libraries"] = ["libggml-base.so"]
+    payload["paired_llama_tag"] = "b9001"
+    payload["paired_llama_ggml_tree"] = "ggml-abc"
+    for key, value in overrides.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    marker_path.write_text(json.dumps(payload, indent = 2), encoding = "utf-8")
+
+
+def test_a_slim_install_whose_llama_runtime_moved_is_not_current(tmp_path, monkeypatch):
+    """The reason this check cannot just be the llama one: whisper's slim bundle
+    hardlinks llama's ggml libraries, so a llama update invalidates a whisper install
+    at an unchanged whisper release. selection_from_artifact is what normally notices,
+    and it does not run on this path."""
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    assert _whisper_check(install_dir, host) is True
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-def")
+    assert _whisper_check(install_dir, host) is False
+    # A llama install that vanished entirely reads as no tree at all.
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: None)
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_a_slim_marker_written_before_the_tree_was_recorded_takes_the_full_path(
+    tmp_path, monkeypatch
+):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir, paired_llama_ggml_tree = None)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_a_slim_install_missing_a_wired_library_is_not_current(tmp_path, monkeypatch):
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    assert _whisper_check(install_dir, host) is True
+    (M.installed_server_path(install_dir, host).parent / "libggml-base.so").unlink()
+    assert _whisper_check(install_dir, host) is False
+
+
+def test_installed_paired_runtime_tree_reads_the_live_llama_marker(monkeypatch):
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    assert M.installed_paired_runtime_tree() == "ggml-abc"
+    for empty in (None, "", 7):
+        monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: empty)
+        assert M.installed_paired_runtime_tree() is None
+
+
+def test_the_whisper_reuse_path_backfills_the_paired_ggml_tree(tmp_path, monkeypatch):
+    """A slim install made before the tree was recorded would otherwise fetch the
+    release, its manifest and its checksum index on EVERY update rather than once.
+
+    The reuse path is the only place that re-examines a slim install without
+    reinstalling it, and it gets there having just confirmed the fingerprint and the
+    wiring, so it is where the record is caught up."""
+    install_dir, host, calls = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir, paired_llama_ggml_tree = None)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    assert _whisper_check(install_dir, host) is False
+    assert M.install_prebuilt(install_dir, backend = "cpu") == M.EXIT_SUCCESS
+    # Reused, not reinstalled: the archive is downloaded exactly once, at install time.
+    assert calls["n"] == 1
+    marker = json.loads((install_dir / M.METADATA_FILENAME).read_text(encoding = "utf-8"))
+    assert marker["paired_llama_ggml_tree"] == "ggml-abc"
+    assert _whisper_check(install_dir, host) is True
+
+
+def test_the_whisper_backfill_never_rewrites_a_recorded_tree(tmp_path, monkeypatch):
+    """Added, never corrected: a marker that already names a tree was written by the run
+    that installed against it, and a llama runtime that moved since is exactly what the
+    pre-check is supposed to notice."""
+    install_dir, _host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-def")
+    M._backfill_slim_pairing_record(install_dir)
+    marker = json.loads((install_dir / M.METADATA_FILENAME).read_text(encoding = "utf-8"))
+    assert marker["paired_llama_ggml_tree"] == "ggml-abc"
+
+
+def test_a_fat_install_gains_no_pairing_record(tmp_path, monkeypatch):
+    """Only slim bundles hardlink anything, so a fat marker must stay a fat marker."""
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    M._backfill_slim_pairing_record(install_dir)
+    marker = json.loads((install_dir / M.METADATA_FILENAME).read_text(encoding = "utf-8"))
+    assert "paired_llama_ggml_tree" not in marker
+
+
+# ── A release lookup that could not answer, over an install that is fine ──
+# Observed on a strict offline update (UV_OFFLINE plus a CONNECT proxy refusing every
+# connection): the run exited 0 and changed not a byte, yet setup printed "whisper.cpp
+# prebuilt install failed; curated whisper.cpp dictation is unavailable" while llama.cpp
+# beside it printed "update unavailable, existing prebuilt kept". These hold the fix that
+# a lookup nothing could answer is not evidence that the install stopped working, and --
+# just as important -- that it is still only the EVIDENCE on disk that decides.
+KEPT_LINE = "whisper.cpp update unavailable, existing prebuilt kept"
+# The substring setup.sh and setup.ps1 already grep to choose that wording for llama.cpp.
+KEPT_GREP = "keeping the existing complete install"
+FAILED_LINE = "prebuilt install failed"
+
+
+def _no_network(monkeypatch, *, release_error = None):
+    """No answer from anywhere: not the pre-check HEAD, not the release, not the listing.
+
+    The environment variables are cleared because main() reads its tag defaults from them,
+    and a pin is exactly what must NOT be answered by keeping a tree.
+    """
+
+    def no_head(_repo):
+        raise OSError("github.com unreachable")
+
+    def no_release(*_args, **_kwargs):
+        raise release_error or PrebuiltFallback(
+            "could not fetch release unslothai/whisper.cpp@latest: <urlopen error refused>"
+        )
+
+    def no_listing(_repo):
+        raise PrebuiltFallback("unexpected releases payload: <urlopen error refused>")
+
+    for name in ("UNSLOTH_WHISPER_TAG", "UNSLOTH_WHISPER_RELEASE_TAG", "UNSLOTH_WHISPER_BACKEND"):
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setattr(M.llama, "_download_host_latest_release_tag", no_head)
+    monkeypatch.setattr(M, "fetch_release_for_install", no_release)
+    monkeypatch.setattr(M, "_published_release_tags", no_listing)
+
+
+def _cli_install(capsys, install_dir, *extra) -> tuple[int, str]:
+    """Through main(), so the exit status the setup scripts branch on is what is asserted:
+    the false failure line is printed by setup.sh for any status that is not 0, 2 or 3."""
+    rc = M.main(["--install-dir", str(install_dir), "--backend", "cpu", *extra])
+    captured = capsys.readouterr()
+    return rc, captured.out + captured.err
+
+
+def test_an_unreachable_lookup_keeps_a_validated_install(tmp_path, monkeypatch, capsys):
+    install_dir, host, calls = _installed_cpu_tree(tmp_path, monkeypatch)
+    marker_path = install_dir / M.METADATA_FILENAME
+    server = M.installed_server_path(install_dir, host)
+    before = (marker_path.read_bytes(), server.read_bytes(), server.stat().st_mtime_ns)
+    _no_network(monkeypatch)
+
+    rc, output = _cli_install(capsys, install_dir)
+
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+    assert KEPT_GREP in output
+    # llama.cpp's wording for WHY, so update_flow reads both installers the same way.
+    assert "prebuilt update reason: could not fetch release" in output
+    assert FAILED_LINE not in output
+    # Kept, not reinstalled: the archive was downloaded once, at install time, and the
+    # marker is byte for byte the one that run wrote.
+    assert calls["n"] == 1
+    assert (marker_path.read_bytes(), server.read_bytes(), server.stat().st_mtime_ns) == before
+
+
+def test_a_raw_network_error_from_the_release_fetch_still_keeps_the_install(
+    tmp_path, monkeypatch, capsys
+):
+    """The real fetch raises URLError, not PrebuiltFallback: a refused connection or a
+    proxy answering 403 reached install_prebuilt as "unexpected error" and the keep path
+    never ran. Patched at the shared core seam, so the wrapper in this module is what is
+    under test rather than a stand-in that already speaks PrebuiltFallback."""
+    import urllib.error
+
+    install_dir, host, calls = _installed_cpu_tree(tmp_path, monkeypatch)
+    marker_path = install_dir / M.METADATA_FILENAME
+    before = marker_path.read_bytes()
+    _no_network(monkeypatch)
+
+    def refused(*_args, **_kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(M, "fetch_release_for_install", M.fetch_release_for_install)
+    monkeypatch.setattr(M.core, "fetch_release_for_install", refused)
+
+    rc, output = _cli_install(capsys, install_dir)
+
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+    assert "prebuilt update reason: could not fetch release" in output
+    assert "unexpected error" not in output
+    assert FAILED_LINE not in output
+    assert calls["n"] == 1
+    assert marker_path.read_bytes() == before
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason = "os.access(X_OK) is always true on Windows, so the unusable-tree half is POSIX only",
+)
+def test_an_unreachable_lookup_still_fails_on_a_broken_install(tmp_path, monkeypatch, capsys):
+    """Fail-open is the right answer for a tree that cannot serve dictation, and the
+    message that says so sends the user to browser and Transformers STT. Only the
+    evidence a previous run left behind may replace it."""
+    install_dir, host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    marker_path = install_dir / M.METADATA_FILENAME
+    recorded = marker_path.read_bytes()
+    server = M.installed_server_path(install_dir, host)
+    _no_network(monkeypatch)
+
+    # (1) No marker: nothing on disk says this tree was ever installed and validated here.
+    marker_path.unlink()
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_ERROR
+    assert FAILED_LINE in output
+    assert KEPT_LINE not in output
+
+    # (2) Marker back, but the server the sidecar would run is not executable, which is
+    # the exact shape the sidecar refuses.
+    marker_path.write_bytes(recorded)
+    server.chmod(0o644)
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_ERROR
+    assert FAILED_LINE in output
+    assert KEPT_LINE not in output
+
+    # (3) Both repaired, same unreachable lookup: now the tree answers for itself.
+    server.chmod(0o755)
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+
+
+def test_the_kept_path_refuses_a_mismatched_ggml_pairing(tmp_path, monkeypatch, capsys):
+    """A slim whisper tree hardlinks llama's ggml libraries, so a llama runtime that moved
+    underneath it is broken with every whisper byte still in place. The keep path has no
+    release in hand, so the paired tree this branch records on the whisper marker is the
+    only thing that can notice; a weaker "the wired files are present" check would keep a
+    pairing that no longer exists."""
+    install_dir, _host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _slim_marker(install_dir)
+    _no_network(monkeypatch)
+
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-def")
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_ERROR
+    assert FAILED_LINE in output
+    assert KEPT_LINE not in output
+
+    # A slim marker written before the pairing was recorded cannot claim one either.
+    _slim_marker(install_dir, paired_llama_ggml_tree = None)
+    monkeypatch.setattr(M, "installed_llama_ggml_tree", lambda: "ggml-abc")
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_ERROR
+    assert KEPT_LINE not in output
+
+
+def test_a_pairing_gap_still_reports_itself(tmp_path, monkeypatch, capsys):
+    """The one lookup failure that ANSWERED. Exit 2 is how setup learns to print the
+    installed-versus-required tags and tell the user to publish the paired releases; a
+    keep would replace a release skew nobody would then fix with a soothing warning."""
+    install_dir, _host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _no_network(monkeypatch)
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+
+    _no_network(
+        monkeypatch,
+        release_error = ReleaseCompatibilityError(
+            "slim bundle requires llama.cpp b9002, installed b9001"
+        ),
+    )
+    rc, output = _cli_install(capsys, install_dir)
+    assert rc == M.EXIT_INCOMPATIBLE
+    assert "slim bundle requires llama.cpp b9002" in output
+    assert KEPT_LINE not in output
+
+
+def test_an_explicit_release_request_is_never_answered_by_keeping(tmp_path, monkeypatch, capsys):
+    """Keeping the tree silently ignores whatever this run asked for, so anything that
+    names a release -- or demands the work be done anyway -- takes the failure instead.
+    --has-rocm and --rocm-gfx are deliberately not on that list: both entrypoints forward
+    DETECTED hardware on every AMD host, and the observed failure was on one."""
+    install_dir, _host, _ = _installed_cpu_tree(tmp_path, monkeypatch)
+    _no_network(monkeypatch)
+    rc, output = _cli_install(capsys, install_dir, "--rocm-gfx", "gfx1151")
+    assert rc == M.EXIT_SUCCESS
+    assert KEPT_LINE in output
+
+    for extra in (
+        ["--published-release-tag", "v9.9.9"],
+        ["--whisper-tag", "v1.9.9"],
+        ["--force"],
+    ):
+        rc, output = _cli_install(capsys, install_dir, *extra)
+        assert rc == M.EXIT_ERROR, extra
+        assert KEPT_LINE not in output, extra
+
+
+def test_both_setup_scripts_report_the_kept_install_as_kept():
+    """The installer's exit status is 0 on the kept path, and a non-verbose run discards
+    its log, so without an arm of their own the shells print "prebuilt installed" for a
+    release nothing fetched. Wording and grep token are the llama arm's, verbatim, so a
+    strictly offline update reads the same for both components and one step matcher
+    covers them."""
+    kept = "update unavailable, existing prebuilt kept"
+    token = "keeping the existing complete install"
+    sh = (PACKAGE_ROOT / "studio" / "setup.sh").read_text(encoding = "utf-8")
+    ps1 = (PACKAGE_ROOT / "studio" / "setup.ps1").read_text(encoding = "utf-8")
+    # Two arms each now: llama's and whisper's.
+    assert sh.count(f'step "llama.cpp" "{kept}"') == 1
+    assert sh.count(f'step "whisper.cpp" "{kept}"') == 1
+    assert sh.count(f'grep -Fq "{token}" "$_WHISPER_LOG"') == 1
+    assert ps1.count(f'step "whisper.cpp" "{kept}"') == 1
+    assert ps1.count(f'$whisperOutput -match "{token}"') == 1
+    # ...and the installer really emits the token the shells select on.
+    source = MODULE_PATH.read_text(encoding = "utf-8")
+    assert token in source
+    assert kept in source

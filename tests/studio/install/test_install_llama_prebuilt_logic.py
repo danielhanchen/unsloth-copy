@@ -5911,3 +5911,560 @@ def test_a_fresh_windows_install_is_payload_checked_not_just_vulkan():
         'choice.install_kind.startswith("windows-")' in gate
     ), "fresh Windows installs are not payload checked"
     assert "VULKAN_INSTALL_KINDS" in gate, "the Vulkan check must not be dropped"
+
+
+# ── the no-network re-check ──
+#
+# An update of an already-current install used to list the release, fetch its manifest
+# and checksum index, re-derive the same bundle, and then re-validate the tree by
+# STARTING llama-server -- which loads the CUDA runtime. 13-63 s per macOS update and
+# ~5 s per Windows one, to arrive back where it started. This check does the same job
+# from the marker plus one HEAD, so every case below that cannot prove the install is
+# current has to fall through to the full path.
+existing_install_current_without_plan = INSTALL_LLAMA_PREBUILT.existing_install_current_without_plan
+runtime_file_records = INSTALL_LLAMA_PREBUILT.runtime_file_records
+host_profile = INSTALL_LLAMA_PREBUILT.host_profile
+sync_marker_selection = INSTALL_LLAMA_PREBUILT.sync_marker_selection
+
+# A CUDA box, as detect_host would report it: a usable driver, its CUDA version, and
+# one compute capability per card.
+_CUDA_HOST_FIELDS = dict(
+    nvidia_smi = "nvidia-smi",
+    has_physical_nvidia = True,
+    has_usable_nvidia = True,
+    driver_cuda_version = (12, 8),
+    compute_caps = ["8.9"],
+)
+
+
+def _detects(monkeypatch, host: HostInfo) -> None:
+    """What the hardware probes say on THIS run, whatever the install recorded."""
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "detect_host", lambda **_k: host)
+
+
+def _current_install(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    install_host: HostInfo | None = None,
+    **marker_overrides,
+) -> Path:
+    install_dir = tmp_path / "llama.cpp"
+    install_dir.mkdir(parents = True)
+    write_linux_install_shape(install_dir)
+    for name in ("llama-server", "llama-quantize"):
+        for parent in (install_dir, install_dir / "build" / "bin"):
+            (parent / name).chmod(0o755)
+    choice = asset_choice()
+    checksums = release_checksums((choice.name, choice.expected_sha256, UPSTREAM))
+    host = install_host if install_host is not None else linux_host()
+    write_prebuilt_metadata(
+        install_dir,
+        host = host,
+        requested_tag = "latest",
+        llama_tag = "b9001",
+        release_tag = "release-1",
+        choice = choice,
+        approved_checksums = checksums,
+        prebuilt_fallback_used = False,
+        backend_request = "auto",
+    )
+    if marker_overrides:
+        marker_path = install_dir / "UNSLOTH_PREBUILT_INFO.json"
+        payload = json.loads(marker_path.read_text(encoding = "utf-8"))
+        for key, value in marker_overrides.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        marker_path.write_text(json.dumps(payload, indent = 2), encoding = "utf-8")
+    _detects(monkeypatch, host)
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", lambda _repo: "release-1"
+    )
+    monkeypatch.delenv("UNSLOTH_PREBUILT_FULL_CHECK", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE", raising = False)
+    monkeypatch.delenv("UNSLOTH_ROCM_GFX_ARCH", raising = False)
+    monkeypatch.delenv("UNSLOTH_ROCM_GFX_REMEMBERED", raising = False)
+    return install_dir
+
+
+def _check(install_dir: Path, **overrides) -> bool:
+    kwargs = dict(
+        llama_tag = "latest",
+        published_repo = "unslothai/llama.cpp",
+        published_release_tag = "",
+        backend_request = "auto",
+        force_cpu = False,
+    )
+    kwargs.update(overrides)
+    return existing_install_current_without_plan(install_dir, **kwargs)
+
+
+def test_a_current_install_is_recognised_without_listing_the_release(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+
+    def boom(*_a, **_k):
+        raise AssertionError("the no-network check must not reach the GitHub API")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "fetch_release_bundle", boom, raising = False)
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "resolve_release_tag", boom, raising = False)
+    assert _check(install_dir) is True
+
+
+def test_the_latest_lookup_is_one_head_on_the_download_host(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "_download_host_latest_release_tag",
+        lambda repo: (calls.append(repo), "release-1")[1],
+    )
+    assert _check(install_dir) is True
+    assert calls == ["unslothai/llama.cpp"]
+
+
+def test_a_newer_release_upstream_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", lambda _repo: "release-2"
+    )
+    assert _check(install_dir) is False
+
+
+def test_a_lookup_that_cannot_answer_takes_the_full_path(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    for answer in (None, ""):
+        monkeypatch.setattr(
+            INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", lambda _repo: answer
+        )
+        assert _check(install_dir) is False
+
+    def raises(_repo):
+        raise OSError("github.com unreachable")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", raises)
+    assert _check(install_dir) is False
+
+
+def _release(
+    tag: str,
+    published_at: str,
+    release_id: int = 1,
+    **extra,
+) -> dict:
+    payload = {
+        "tag_name": tag,
+        "published_at": published_at,
+        "created_at": published_at,
+        "id": release_id,
+        "draft": False,
+        "prerelease": False,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_the_api_only_escape_hatch_uses_the_api_notion_of_latest(tmp_path, monkeypatch):
+    """UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE asks for the API path.
+
+    Declining outright would make the escape hatch mean "never skip", which is not what
+    it says: it asks for the API's answer, so give it the API's answer -- ordered by
+    published_at, exactly as iter_release_payloads_by_time orders it.
+    """
+    install_dir = _current_install(tmp_path, monkeypatch)
+    monkeypatch.setenv("UNSLOTH_LLAMA_DISABLE_DOWNLOAD_HOST_RESOLVE", "1")
+
+    def boom(_repo):
+        raise AssertionError("the download-host HEAD is exactly what was turned off")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", boom)
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "github_releases",
+        lambda _repo, **_k: [
+            _release("release-0", "2026-01-01T00:00:00Z", 1),
+            _release("release-1", "2026-02-01T00:00:00Z", 2),
+        ],
+    )
+    assert _check(install_dir) is True
+    # Newest by published_at, not by position or creation order.
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "github_releases",
+        lambda _repo, **_k: [
+            _release("release-2", "2026-03-01T00:00:00Z", 3),
+            _release("release-1", "2026-02-01T00:00:00Z", 2),
+        ],
+    )
+    assert _check(install_dir) is False
+    # Drafts and prereleases are not the answer, and an API that cannot answer at all
+    # is a reason to do the work rather than to skip it.
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "github_releases",
+        lambda _repo, **_k: [_release("release-9", "2026-04-01T00:00:00Z", 4, draft = True)],
+    )
+    assert _check(install_dir) is False
+
+    def raises(_repo, **_k):
+        raise OSError("api.github.com unreachable")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "github_releases", raises)
+    assert _check(install_dir) is False
+
+
+def test_a_release_payload_this_run_already_has_overrides_the_latest_pointer(tmp_path, monkeypatch):
+    """/releases/latest resolves by make_latest/created_at; the macOS path orders by
+    published_at. When a payload already in hand disagrees with the pointer, the
+    published_at answer wins -- for free, because it costs no request."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", lambda _repo: "release-1"
+    )
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "_METADATA_MEMO",
+        {
+            (
+                "json",
+                "https://api.github.com/repos/unslothai/llama.cpp/releases?per_page=100&page=1",
+            ): [
+                _release("release-1", "2026-02-01T00:00:00Z", 2),
+                _release("release-2", "2026-03-01T00:00:00Z", 3),
+            ]
+        },
+    )
+    assert _check(install_dir) is False
+    # Agreeing costs nothing and changes nothing.
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "_METADATA_MEMO",
+        {
+            (
+                "json",
+                "https://api.github.com/repos/unslothai/llama.cpp/releases?per_page=100&page=1",
+            ): [
+                _release("release-1", "2026-02-01T00:00:00Z", 2),
+            ]
+        },
+    )
+    assert _check(install_dir) is True
+
+
+def test_an_empty_metadata_memo_never_reaches_the_api(tmp_path, monkeypatch):
+    """The install path leaves _METADATA_MEMO at None; only --resolve-backends fills it,
+    so the cross-check must never turn into a request of its own."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+
+    def boom(_repo, **_k):
+        raise AssertionError("the memo cross-check must not fetch anything")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "github_releases", boom)
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "_METADATA_MEMO", None)
+    assert _check(install_dir) is True
+
+
+def test_a_pinned_release_tag_needs_no_lookup_at_all(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+
+    def boom(_repo):
+        raise AssertionError("a pinned release tag names the answer outright")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", boom)
+    assert _check(install_dir, published_release_tag = "release-1") is True
+    assert _check(install_dir, published_release_tag = "release-9") is False
+
+
+def test_an_upstream_pin_is_answered_by_the_recorded_upstream_tag(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+
+    def boom(_repo):
+        raise AssertionError("an upstream pin needs no release listing")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "_download_host_latest_release_tag", boom)
+    assert _check(install_dir, llama_tag = "b9001") is True
+    assert _check(install_dir, llama_tag = "b9999") is False
+
+
+def test_a_full_check_request_always_does_the_work(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("UNSLOTH_PREBUILT_FULL_CHECK", value)
+        assert _check(install_dir) is False
+    for value in ("0", "false", "", "maybe"):
+        monkeypatch.setenv("UNSLOTH_PREBUILT_FULL_CHECK", value)
+        assert _check(install_dir) is True
+
+
+def test_a_different_repo_or_backend_request_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    assert _check(install_dir, published_repo = "someone/else") is False
+    # An explicit --llama-backend naming something else is a request to CHANGE the
+    # install, so it must reach the selector.
+    assert _check(install_dir, backend_request = "vulkan") is False
+    assert _check(install_dir, force_cpu = True) is False
+
+
+def test_a_marker_written_before_this_existed_takes_the_full_path_once(tmp_path, monkeypatch):
+    """runtime_sha256, runtime_files and host_profile are new keys; without them the
+    marker cannot be verified against itself, against the disk, or against the box it
+    is running on, and guessing yes would keep an install nobody has checked."""
+    for missing in ("runtime_sha256", "runtime_files", "install_fingerprint", "host_profile"):
+        install_dir = _current_install(tmp_path / missing, monkeypatch, **{missing: None})
+        assert _check(install_dir) is False, missing
+
+
+# ── the hardware half ──
+#
+# backend_request is "auto" on every automatic install, and the release tag does not
+# move when the hardware does. So without a recorded host profile each of these boxes
+# would keep the bundle it was given until the fork happened to publish a new release.
+
+
+def test_a_gpu_added_since_the_install_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    assert _check(install_dir) is True
+    _detects(monkeypatch, linux_host(**_CUDA_HOST_FIELDS))
+    assert _check(install_dir) is False
+
+
+def test_a_gpu_removed_since_the_install_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(
+        tmp_path, monkeypatch, install_host = linux_host(**_CUDA_HOST_FIELDS)
+    )
+    assert _check(install_dir) is True
+    # The card is gone, or the driver is: either way the CUDA bundle cannot run.
+    _detects(monkeypatch, linux_host())
+    assert _check(install_dir) is False
+    # A driver downgrade with the card still present is the same question.
+    _detects(monkeypatch, linux_host(**{**_CUDA_HOST_FIELDS, "driver_cuda_version": (12, 4)}))
+    assert _check(install_dir) is False
+
+
+def test_a_new_gpu_outside_the_recorded_coverage_is_not_current(tmp_path, monkeypatch):
+    """A bundle carries kernels for a fixed set of SMs (supported_sms). Swapping the
+    card for one outside that set leaves an install that starts and then cannot run a
+    model, which is worse than a reinstall."""
+    install_dir = _current_install(
+        tmp_path, monkeypatch, install_host = linux_host(**_CUDA_HOST_FIELDS)
+    )
+    _detects(monkeypatch, linux_host(**{**_CUDA_HOST_FIELDS, "compute_caps": ["12.0"]}))
+    assert _check(install_dir) is False
+    # Order and duplicates across cards are not a hardware change.
+    _detects(
+        monkeypatch, linux_host(**{**_CUDA_HOST_FIELDS, "compute_caps": ["8.9", "8.9", " 8.9 "]})
+    )
+    assert _check(install_dir) is True
+
+
+def test_a_rocm_gfx_change_is_not_current(tmp_path, monkeypatch):
+    rocm = dict(has_rocm = True, rocm_gfx_target = "gfx1100", rocm_gfx_targets = ["gfx1100"])
+    install_dir = _current_install(tmp_path, monkeypatch, install_host = linux_host(**rocm))
+    assert _check(install_dir) is True
+    _detects(
+        monkeypatch,
+        linux_host(has_rocm = True, rocm_gfx_target = "gfx1030", rocm_gfx_targets = ["gfx1030"]),
+    )
+    assert _check(install_dir) is False
+    # A second AMD card the ROCm bundle has no kernels for is a change too.
+    _detects(
+        monkeypatch,
+        linux_host(
+            has_rocm = True,
+            rocm_gfx_target = "gfx1100",
+            rocm_gfx_targets = ["gfx1100", "gfx1030"],
+        ),
+    )
+    assert _check(install_dir) is False
+
+
+def test_the_recorded_profile_is_the_routed_host_not_the_raw_one(tmp_path, monkeypatch):
+    """The check re-derives the host through route_backend_request, the same no-network
+    routing _select uses. Comparing a raw detect_host against a routed profile would
+    never match and would take the slow path forever."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    marker = json.loads((install_dir / "UNSLOTH_PREBUILT_INFO.json").read_text(encoding = "utf-8"))
+    route = INSTALL_LLAMA_PREBUILT.route_backend_request(
+        backend = "auto",
+        published_repo = "unslothai/llama.cpp",
+        published_release_tag = "",
+    )
+    assert marker["host_profile"] == host_profile(route.host)
+
+
+def test_a_marker_naming_a_backend_this_platform_cannot_hold_is_not_current(tmp_path, monkeypatch):
+    """A directory copied off another machine keeps its marker. backend "metal" has no
+    Linux install kind, so _kept_install_payload_is_healthy has no shared payload to
+    require and answers yes to a tree it has never seen."""
+    install_dir = _current_install(tmp_path, monkeypatch, backend = "metal")
+    assert _check(install_dir) is False
+
+
+def test_a_marker_whose_request_and_backend_disagree_is_not_current(tmp_path, monkeypatch):
+    """persisted_marker_backend_request stores "auto" whenever the request and the
+    bundle that landed disagree, so a concrete request must name the bundle's own
+    backend. Anything else was not written by this installer."""
+    install_dir = _current_install(tmp_path, monkeypatch, backend_request = "vulkan")
+    assert _check(install_dir, backend_request = "vulkan") is False
+
+
+def test_a_truncated_shared_library_is_not_current(tmp_path, monkeypatch):
+    """The payload scan only globs for existence, so a half-written libggml-*.so keeps
+    its name and passes it. Most of a CUDA bundle's bytes live in those libraries, and a
+    full disk or an interrupted extract leaves exactly this shape."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    library = install_dir / "build" / "bin" / "libggml-cpu-x64.so.0"
+    assert library.is_file()
+    library.write_bytes(b"")
+    assert _check(install_dir) is False
+
+
+def test_the_payload_records_cover_the_bundles_own_allowlist(tmp_path):
+    """Not just the three binaries: every file runtime_patterns_for_install_kind names."""
+    install_dir = tmp_path / "llama.cpp"
+    install_dir.mkdir()
+    write_linux_install_shape(install_dir)
+    patterns = INSTALL_LLAMA_PREBUILT.runtime_patterns_for_install_kind("linux-cpu")
+    records = runtime_file_records(install_dir, linux_host(), patterns)
+    assert "build/bin/libggml-base.so.0" in records
+    assert records["build/bin/libggml-base.so.0"]["size"] == 3
+    # Size and mtime only for the payload; the binaries keep their digest.
+    assert "sha256" not in records["build/bin/libggml-base.so.0"]
+    assert len(records["build/bin/llama-server"]["sha256"]) == 64
+
+
+def test_the_reuse_path_backfills_what_the_no_network_check_needs(tmp_path, monkeypatch):
+    """An install made before this PR carries none of the new evidence, so it would take
+    the slow path on EVERY update. The reuse path is the only place that sees the bundle
+    again without reinstalling it, so it is where the record gets caught up -- once."""
+    install_dir = _current_install(
+        tmp_path,
+        monkeypatch,
+        runtime_sha256 = None,
+        runtime_files = None,
+        host_profile = None,
+    )
+    assert _check(install_dir) is False
+    sync_marker_selection(
+        install_dir,
+        choice = asset_choice(),
+        backend_request = "auto",
+        host = linux_host(),
+    )
+    marker = json.loads((install_dir / "UNSLOTH_PREBUILT_INFO.json").read_text(encoding = "utf-8"))
+    assert "runtime_sha256" in marker
+    assert marker["host_profile"] == host_profile(linux_host())
+    assert "build/bin/libggml-base.so.0" in marker["runtime_files"]
+    assert _check(install_dir) is True
+
+
+def test_the_backfill_never_overwrites_evidence_a_run_already_recorded(tmp_path, monkeypatch):
+    """Added only. A key already present was written by a run that hashed the bytes; a
+    reuse decision must not re-bless a tree from a different host's profile."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    before = json.loads((install_dir / "UNSLOTH_PREBUILT_INFO.json").read_text(encoding = "utf-8"))
+    sync_marker_selection(
+        install_dir,
+        choice = asset_choice(),
+        backend_request = "auto",
+        host = linux_host(**_CUDA_HOST_FIELDS),
+    )
+    after = json.loads((install_dir / "UNSLOTH_PREBUILT_INFO.json").read_text(encoding = "utf-8"))
+    assert after["host_profile"] == before["host_profile"]
+    assert after["runtime_files"] == before["runtime_files"]
+
+
+def test_a_hand_edited_marker_is_not_trusted(tmp_path, monkeypatch):
+    """The fingerprint is recomputed from the marker's own fields, so a field changed
+    without the fingerprint no longer adds up."""
+    install_dir = _current_install(tmp_path, monkeypatch, asset = "some-other-bundle.tar.gz")
+    assert _check(install_dir) is False
+
+
+def test_a_truncated_binary_is_not_current(tmp_path, monkeypatch):
+    """The check this replaces started llama-server. Hashing the recorded binaries
+    answers the same question in ~100 ms."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    assert _check(install_dir) is True
+    (install_dir / "build" / "bin" / "llama-server").write_text("", encoding = "utf-8")
+    assert _check(install_dir) is False
+
+
+def test_a_swapped_binary_of_the_same_size_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    target = install_dir / "build" / "bin" / "llama-quantize"
+    original = target.read_text(encoding = "utf-8")
+    target.write_text("X" * len(original), encoding = "utf-8")
+    target.chmod(0o755)
+    assert _check(install_dir) is False
+
+
+def test_a_deleted_binary_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    (install_dir / "llama-server").unlink()
+    assert _check(install_dir) is False
+
+
+def test_a_gutted_runtime_payload_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    (install_dir / "build" / "bin" / "libggml-base.so.0").unlink()
+    assert _check(install_dir) is False
+
+
+def test_a_non_executable_binary_is_not_current(tmp_path, monkeypatch):
+    install_dir = _current_install(tmp_path, monkeypatch)
+    (install_dir / "build" / "bin" / "llama-server").chmod(0o644)
+    assert _check(install_dir) is False
+
+
+def test_no_marker_at_all_is_not_current(tmp_path, monkeypatch):
+    install_dir = tmp_path / "llama.cpp"
+    install_dir.mkdir()
+    write_linux_install_shape(install_dir)
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "detect_host", lambda **_k: linux_host())
+    assert _check(install_dir) is False
+
+
+def test_the_records_cover_both_copies_of_each_binary(tmp_path):
+    """_find_llama_server_binary reaches the root copy first and, without a symlink,
+    the two can rot independently."""
+    install_dir = tmp_path / "llama.cpp"
+    install_dir.mkdir()
+    write_linux_install_shape(install_dir)
+    records = runtime_file_records(install_dir, linux_host())
+    assert set(records) == {
+        "llama-server",
+        "llama-quantize",
+        "build/bin/llama-server",
+        "build/bin/llama-quantize",
+    }
+    for record in records.values():
+        assert record["size"] > 0 and len(record["sha256"]) == 64
+
+
+def test_the_skip_log_carries_the_string_the_setup_scripts_grep_for(tmp_path, monkeypatch, capsys):
+    """setup.sh and setup.ps1 both match the loose substring "already matches" to
+    report "prebuilt up to date and validated" rather than "installed and validated"."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    assert _check(install_dir) is True
+    captured = capsys.readouterr()
+    assert "already matches" in captured.out + captured.err
+
+
+def test_a_route_the_caller_already_made_is_not_recomputed(tmp_path, monkeypatch):
+    """Routing runs nvidia-smi and the ROCm probes. install_prebuilt routes once and
+    hands the same answer to this check and to the selector, so an update that does find
+    a new release does not probe the host twice."""
+    install_dir = _current_install(tmp_path, monkeypatch)
+    route = INSTALL_LLAMA_PREBUILT.route_backend_request(
+        backend = "auto",
+        published_repo = "unslothai/llama.cpp",
+        published_release_tag = "",
+    )
+
+    def boom(**_kwargs):
+        raise AssertionError("the caller already routed this host")
+
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "route_backend_request", boom)
+    assert _check(install_dir, route = route) is True

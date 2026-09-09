@@ -658,6 +658,49 @@ def metadata_path(install_dir: Path) -> Path:
     return install_dir / METADATA_FILENAME
 
 
+def _write_metadata_payload(install_dir: Path, payload: dict) -> None:
+    """Replace the marker atomically, or leave the previous one exactly as it was.
+
+    load_metadata reads a truncated or unparseable file as "no install", so a crash,
+    a full disk or a killed installer partway through a plain write_text retires the
+    install the marker described: the next run refetches ~110 MB of Node. Same shape as
+    download_file -- a sibling temp file, flushed and fsynced, then os.replace, which is
+    atomic within a directory on POSIX and Windows alike.
+
+    The temp file is removed on every failure path. A stranded `.tmp-` sibling would sit
+    inside the install directory forever, and _swap_into_place would carry one written
+    here into the live tree.
+
+    Raises: the caller decides. write_metadata is writing into a staging tree that is
+    discarded on failure, so a raise there aborts an install that never landed.
+    """
+    destination = metadata_path(install_dir)
+    destination.parent.mkdir(parents = True, exist_ok = True)
+    # newline left at the default, as write_text had it: the marker's bytes must not
+    # change spelling on Windows just because the writer moved.
+    handle = tempfile.NamedTemporaryFile(
+        prefix = destination.name + ".tmp-",
+        dir = destination.parent,
+        delete = False,
+        mode = "w",
+        encoding = "utf-8",
+    )
+    tmp_path: Path | None = Path(handle.name)
+    try:
+        with handle:
+            handle.write(json.dumps(payload, indent = 2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace_from_tempfile(tmp_path, destination)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok = True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def write_metadata(install_dir: Path, *, version: str, asset: str, sha256: str) -> None:
     payload = {
         "schema_version": METADATA_SCHEMA_VERSION,
@@ -666,7 +709,7 @@ def write_metadata(install_dir: Path, *, version: str, asset: str, sha256: str) 
         "asset": asset,
         "sha256": sha256,
     }
-    metadata_path(install_dir).write_text(json.dumps(payload, indent = 2) + "\n", encoding = "utf-8")
+    _write_metadata_payload(install_dir, payload)
 
 
 def load_metadata(install_dir: Path) -> dict | None:
@@ -678,6 +721,104 @@ def load_metadata(install_dir: Path) -> dict | None:
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _file_record(path: Path) -> dict | None:
+    """size, mtime_ns and sha256 for one file, or None when it cannot be read."""
+    try:
+        info = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return {"size": info.st_size, "mtime_ns": info.st_mtime_ns, "sha256": digest}
+
+
+def _file_record_matches(path: Path, recorded: object) -> bool:
+    """Whether *path* is still the file *recorded* describes.
+
+    size and mtime_ns only. The digest is recorded too, and deliberately not compared
+    here: this runs on every launch of the installer, node is ~110 MB, and a rewrite
+    that preserved both the byte count and the nanosecond timestamp is not a failure
+    mode a re-download would fix anyway. The digest is there so a support log can say
+    which binary this is.
+    """
+    if not isinstance(recorded, dict):
+        return False
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    return info.st_size == recorded.get("size") and info.st_mtime_ns == recorded.get("mtime_ns")
+
+
+def record_runtime_verification(
+    install_dir: Path, host: HostInfo, *, version: str, npm_major: int
+) -> None:
+    """Remember that THESE bytes answered `node -v` and `npm --version`.
+
+    Only the node half is later trusted in place of a spawn: npm_major_checked records that
+    the npm probe cleared the floor at the time, not that it still would. See
+    _recorded_runtime_matches.
+
+    Read-modify-write, never raises, and never leaves a half-written marker: this
+    rewrites a file that already describes a good install, so a torn write here is
+    strictly worse than not writing at all.
+    """
+    meta = load_metadata(install_dir)
+    if meta is None:
+        return
+    node_record = _file_record(node_binary_path(install_dir, host))
+    npm_record = _file_record(npm_cli_path(install_dir, host))
+    if node_record is None or npm_record is None:
+        return
+    meta.update(
+        {
+            "node_binary": node_record,
+            "npm_cli": npm_record,
+            "node_version_checked": version,
+            "npm_major_checked": npm_major,
+        }
+    )
+    try:
+        _write_metadata_payload(install_dir, meta)
+    except Exception:  # noqa: BLE001
+        # A marker that cannot be refreshed costs the two spawns again next time; the
+        # atomic replace is what makes sure that is the ONLY cost, rather than a torn
+        # marker that reads as "nothing installed" and buys a full re-download.
+        pass
+
+
+def _recorded_runtime_matches(install_dir: Path, host: HostInfo, meta: dict, version: str) -> bool:
+    """Whether a previous run already proved this exact node binary reports this version.
+
+    `node -v` is an interpreter start of a 110 MB runtime, re-run on every install and
+    every update to re-derive an answer that cannot have changed while the binary has not.
+    Absent records mean an install made before this existed, so it pays the spawn once and
+    then records it.
+
+    What this deliberately does NOT prove is npm. The npm record covers npm-cli.js alone,
+    a launcher that bootstraps thousands of files under npm/lib: deleting npm/lib/cli.js
+    leaves the recorded launcher byte-identical while `npm --version` fails. So the npm
+    record is only used as "this file is still the one the last probe ran", and
+    npm_major_checked only as "that probe cleared the floor" -- the caller still pays the
+    npm probe, because only npm can show npm's own module tree still loads.
+    """
+    if meta.get("node_version_checked") != version:
+        return False
+    npm_major = meta.get("npm_major_checked")
+    if not isinstance(npm_major, int) or npm_major < NPM_MIN_MAJOR:
+        return False
+    if not _file_record_matches(node_binary_path(install_dir, host), meta.get("node_binary")):
+        return False
+    if not _file_record_matches(npm_cli_path(install_dir, host), meta.get("npm_cli")):
+        return False
+    # chmod -x moves ctime only: size and mtime_ns both survive it, so the records above
+    # still match a node that can no longer be executed. The spawn this record stands in for
+    # would have failed on it and the install would have been repaired, so re-derive that
+    # answer rather than trusting bytes that are no longer reachable. npm-cli.js is read by
+    # node, not executed, so it needs no execute bit; Windows has none at all (os.access
+    # answers X_OK there from little more than existence).
+    return host.is_windows or os.access(node_binary_path(install_dir, host), os.X_OK)
 
 
 def existing_install_matches(
@@ -695,10 +836,21 @@ def existing_install_matches(
         return False
     if expected_sha is not None and meta.get("sha256") != expected_sha:
         return False
+    if _recorded_runtime_matches(install_dir, host, meta, version):
+        # The record stands in for `node -v` only. npm is a tree of thousands of files that
+        # npm-cli.js merely bootstraps, and no cheap record of the launcher can show the tree
+        # behind it is intact, so the npm probe is paid on every run: one interpreter start
+        # saved out of two, and a damaged npm still fails the check instead of being kept.
+        npm_major = installed_npm_major(install_dir, host)
+        return npm_major is not None and npm_major >= NPM_MIN_MAJOR
     if installed_node_version(install_dir, host) != version:
         return False
     npm_major = installed_npm_major(install_dir, host)
-    return npm_major is not None and npm_major >= NPM_MIN_MAJOR
+    if npm_major is None or npm_major < NPM_MIN_MAJOR:
+        return False
+    # The spawns just answered, so the next run does not have to ask again.
+    record_runtime_verification(install_dir, host, version = version, npm_major = npm_major)
+    return True
 
 
 def existing_install_usable(install_dir: Path, host: HostInfo) -> bool:
@@ -892,6 +1044,9 @@ def install_prebuilt(install_dir: Path, *, channel: str, min_major: int, force: 
         raise PrebuiltFallback(
             f"post-install verification failed: node={final_version} npm_major={npm_major}"
         )
+    # After the swap, not before: _ensure_npm_floor rewrites npm inside the staged tree,
+    # and the records have to describe the bytes that are live.
+    record_runtime_verification(install_dir, host, version = final_version, npm_major = npm_major)
     log(f"installed isolated Node v{final_version} (npm {npm_major}.x) at {install_dir}")
     return EXIT_SUCCESS
 
