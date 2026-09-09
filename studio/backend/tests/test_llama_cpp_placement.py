@@ -71,6 +71,7 @@ if "httpx" not in sys.modules:
 from core.inference.llama_cpp import GgufLoadIntent, LlamaCppBackend, _loader_path_var
 
 _REAL_POPEN = subprocess.Popen
+VISION_MMPROJ_MIN_BATCH = "2048"
 
 
 def _write_gguf(path: Path, architecture: str = "llama") -> Path:
@@ -212,6 +213,206 @@ def test_vulkan_selection_uses_ordinals_and_owns_device_flags(tmp_path):
     assert cmd[cmd.index("--top-k") + 1] == "5"
     assert backend.requested_gpu_ids == [0, 1]
     assert backend.gpu_ids == [1]
+
+
+def test_vision_mmproj_defaults_batch_and_ubatch_above_image_tokens(tmp_path):
+    """A projector encodes non-causally, so llama.cpp aborts when the micro-batch
+    cannot hold one whole image chunk (#10559). At llama.cpp's 512 default that is
+    every Gemma 4 image, so the launch has to carry its own floor."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+    mmproj = _write_gguf(tmp_path / "mmproj-F16.gguf", architecture = "clip")
+    backend._resolve_launch_mmproj_path = lambda **_kwargs: str(mmproj)
+
+    result = _launch(
+        backend,
+        gguf,
+        is_vision = True,
+        mmproj_path = str(mmproj),
+    )
+
+    cmd = result["cmd"]
+    assert cmd[cmd.index("--mmproj") + 1] == str(mmproj)
+    assert cmd[cmd.index("--batch-size") + 1] == VISION_MMPROJ_MIN_BATCH
+    assert cmd[cmd.index("--ubatch-size") + 1] == VISION_MMPROJ_MIN_BATCH
+
+
+def test_a_projector_named_only_in_advanced_arguments_still_gets_the_floor(tmp_path):
+    """_resolve_launch_mmproj_path reads intent.mmproj_path and nothing else, so a
+    --mmproj typed into Advanced Arguments leaves effective_is_vision False while the
+    extras, appended last, still hand the child a projector. That launch emitted no
+    batch flags at all and hit the same non-causal assert #10559 is about."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+    mmproj = _write_gguf(tmp_path / "mmproj-F16.gguf", architecture = "clip")
+    # Studio's own resolution finds nothing: the projector exists only in the extras.
+    backend._resolve_launch_mmproj_path = lambda **_kwargs: None
+
+    cmd = _launch(
+        backend,
+        gguf,
+        is_vision = True,
+        extra_args = ["--mmproj", str(mmproj)],
+    )["cmd"]
+
+    assert cmd[cmd.index("--mmproj") + 1] == str(mmproj)
+    assert cmd[cmd.index("--batch-size") + 1] == VISION_MMPROJ_MIN_BATCH
+    assert cmd[cmd.index("--ubatch-size") + 1] == VISION_MMPROJ_MIN_BATCH
+
+
+def test_no_mmproj_in_the_extras_beats_an_extras_projector(tmp_path):
+    """--no-mmproj is the opt-out, so nothing loads and nothing is floored."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+    mmproj = _write_gguf(tmp_path / "mmproj-F16.gguf", architecture = "clip")
+    backend._resolve_launch_mmproj_path = lambda **_kwargs: None
+
+    cmd = _launch(
+        backend,
+        gguf,
+        is_vision = True,
+        extra_args = ["--mmproj", str(mmproj), "--no-mmproj"],
+    )["cmd"]
+
+    assert "--batch-size" not in cmd
+    assert "--ubatch-size" not in cmd
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        # Nothing was asked for, so nothing is emitted and llama.cpp keeps its own
+        # defaults -- pinning 2048 here is the 4x compute buffer the retry is trying
+        # to give back.
+        ((None, None), None),
+        ((1024, 1024), ("1024", "1024")),
+    ],
+)
+def test_the_text_only_retry_gives_back_the_projector_batch_floor(requested, expected):
+    """The retry has just dropped the projector, so nothing on that child encodes
+    non-causally. Carrying the floor into it keeps 1.8-2.3 GB of compute buffers in
+    precisely the recovery meant to rescue a load that ran out of memory."""
+    vision_cmd = [
+        "/fake/llama-server",
+        "-m", "model.gguf",
+        "--batch-size", "2048",
+        "--mmproj", "mmproj-F16.gguf",
+        "--ubatch-size", "2048",
+        "--jinja",
+    ]
+
+    retried = LlamaCppBackend._restore_batch_args(
+        LlamaCppBackend._strip_mmproj_args(vision_cmd), *requested, 1
+    )
+
+    assert "--mmproj" not in retried
+    # Everything the retry is not about survives the rewrite.
+    assert retried[:3] == ["/fake/llama-server", "-m", "model.gguf"]
+    assert "--jinja" in retried
+    if expected is None:
+        assert "--batch-size" not in retried
+        assert "--ubatch-size" not in retried
+    else:
+        assert retried[retried.index("--batch-size") + 1] == expected[0]
+        assert retried[retried.index("--ubatch-size") + 1] == expected[1]
+
+
+def test_the_text_only_retry_keeps_the_slot_floor_on_the_batch():
+    """--batch-size below the slot count aborts llama-server, so the restored value
+    goes back through the same emitted-batch floor the launch used."""
+    retried = LlamaCppBackend._restore_batch_args(
+        ["/fake/llama-server", "--batch-size", "2048", "--ubatch-size", "2048"],
+        4,
+        None,
+        8,
+    )
+
+    assert retried[retried.index("--batch-size") + 1] == "8"
+    assert "--ubatch-size" not in retried
+
+
+def test_a_text_only_load_keeps_the_llama_cpp_batch_defaults(tmp_path):
+    """The floor is bought with compute buffers four times the size, so it has to stop
+    at the launches that need it. No projector, no non-causal encode, no flags."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+
+    cmd = _launch(backend, gguf)["cmd"]
+
+    assert "--mmproj" not in cmd
+    assert "--batch-size" not in cmd
+    assert "--ubatch-size" not in cmd
+
+
+@pytest.mark.parametrize(
+    "env,expected_batch,expected_ubatch",
+    [
+        # Both above the floor: the emitted flags beat the environment in llama.cpp, so
+        # writing 2048 here would downgrade the user and reinstate the assert.
+        ({"LLAMA_ARG_BATCH": "4096", "LLAMA_ARG_UBATCH": "4096"}, "4096", "4096"),
+        # A micro-batch alone still carries the batch up with it: llama.cpp derives
+        # n_ubatch = min(n_batch, n_ubatch), so 2048/4096 would clamp straight back.
+        ({"LLAMA_ARG_UBATCH": "4096"}, "4096", "4096"),
+        # Below the floor is what the floor is for.
+        ({"LLAMA_ARG_BATCH": "128", "LLAMA_ARG_UBATCH": "128"}, "2048", "2048"),
+        # Unparseable is what llama.cpp itself ignores.
+        ({"LLAMA_ARG_UBATCH": "not-a-number"}, "2048", "2048"),
+    ],
+)
+def test_the_projector_floor_keeps_a_larger_inherited_batch(
+    tmp_path, monkeypatch, env, expected_batch, expected_ubatch
+):
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+    mmproj = _write_gguf(tmp_path / "mmproj-F16.gguf", architecture = "clip")
+    backend._resolve_launch_mmproj_path = lambda **_kwargs: str(mmproj)
+    for name in ("LLAMA_ARG_BATCH", "LLAMA_ARG_UBATCH"):
+        monkeypatch.delenv(name, raising = False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    cmd = _launch(backend, gguf, is_vision = True, mmproj_path = str(mmproj))["cmd"]
+
+    assert cmd[cmd.index("--batch-size") + 1] == expected_batch
+    assert cmd[cmd.index("--ubatch-size") + 1] == expected_ubatch
+
+
+def test_an_explicitly_larger_batch_field_survives_the_projector_floor(tmp_path):
+    """The floor is a minimum, not a setting. A user asking for 8192 gets 8192."""
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = True,
+        memory = [(0, 24_000, 24_000)],
+    )
+    mmproj = _write_gguf(tmp_path / "mmproj-F16.gguf", architecture = "clip")
+    backend._resolve_launch_mmproj_path = lambda **_kwargs: str(mmproj)
+
+    cmd = _launch(
+        backend,
+        gguf,
+        is_vision = True,
+        mmproj_path = str(mmproj),
+        n_batch = 8192,
+        n_ubatch = 8192,
+    )["cmd"]
+
+    assert cmd[cmd.index("--batch-size") + 1] == "8192"
+    assert cmd[cmd.index("--ubatch-size") + 1] == "8192"
 
 
 @pytest.mark.parametrize(
