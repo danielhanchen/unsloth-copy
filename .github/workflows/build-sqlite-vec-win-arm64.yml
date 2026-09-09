@@ -1,0 +1,128 @@
+# Staging-only: the sqlite-vec win_arm64 wheel for the WoA wheelhouse. PyPI publishes
+# py3-none-win_amd64 only (one DLL plus pure Python, packed by sqlite-dist), so the port is
+# the DLL built by MSVC for ARM64 and the same wheel repacked under the win_arm64 tag.
+# Built on GitHub's hosted windows-11-arm runner, from the release tag matching the pin in
+# pyproject.toml, and loaded through sqlite3.load_extension before it is uploaded.
+name: Build sqlite-vec win_arm64
+
+on:
+  push:
+    branches: [woa-wheelhouse-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SQLITE_VEC_TAG: v0.1.9
+  SQLITE_VEC_VERSION: 0.1.9
+  # scripts/vendor.sh at the tag pins this amalgamation.
+  SQLITE_AMALGAMATION: https://www.sqlite.org/2024/sqlite-amalgamation-3450300.zip
+
+jobs:
+  build:
+    name: sqlite-vec win_arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: asg017/sqlite-vec
+          ref: ${{ env.SQLITE_VEC_TAG }}
+          path: sv
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+          sparse-checkout: |
+            .github/tools
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: arm64
+
+      - name: Vendor the sqlite amalgamation (scripts/vendor.sh, without unzip)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:SQLITE_AMALGAMATION -OutFile amalgamation.zip -UseBasicParsing
+          Expand-Archive amalgamation.zip -DestinationPath amalgamation
+          New-Item -ItemType Directory -Force -Path sv/vendor | Out-Null
+          Get-ChildItem amalgamation/*/* | Move-Item -Destination sv/vendor
+          Get-ChildItem sv/vendor
+
+      - name: Generate sqlite-vec.h from its template (the Makefile's envsubst target)
+        shell: pwsh
+        run: |
+          Set-Location sv
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne $env:SQLITE_VEC_VERSION) { throw "VERSION is $version, expected $env:SQLITE_VEC_VERSION" }
+          $parts = $version.Split('.')
+          $source = (git log -n 1 --pretty=format:%H -- VERSION)
+          $date = (git log -n 1 --pretty=format:%cI -- VERSION)
+          $h = Get-Content sqlite-vec.h.tmpl -Raw
+          $h = $h.Replace('${VERSION}', $version).Replace('${DATE}', $date).Replace('${SOURCE}', $source)
+          $h = $h.Replace('${VERSION_MAJOR}', $parts[0]).Replace('${VERSION_MINOR}', $parts[1]).Replace('${VERSION_PATCH}', ($parts[2] -split '-')[0])
+          if ($h -match '\$\{') { throw "unreplaced placeholder in sqlite-vec.h" }
+          Set-Content sqlite-vec.h -Value $h -Encoding ascii
+          Select-String -Path sqlite-vec.h -Pattern 'SQLITE_VEC_VERSION' | ForEach-Object { $_.Line }
+
+      - name: Locate the ARM64 MSVC environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vs) { $vs = & $vswhere -latest -products * -property installationPath }
+          $bat = Join-Path $vs 'VC\Auxiliary\Build\vcvarsarm64.bat'
+          if (-not (Test-Path $bat)) { throw "no vcvarsarm64.bat under $vs" }
+          Write-Host "vcvars: $bat"
+          "VCVARS_BAT=$bat" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Compile vec0.dll for ARM64 (the release workflow's cl line, native arm64)
+        shell: cmd
+        run: |
+          call "%VCVARS_BAT%" || exit /B 1
+          cd sv
+          mkdir dist
+          cl.exe /nologo /W4 /O2 /LD /Ivendor sqlite-vec.c /Fe:dist\vec0.dll || exit /B 1
+          dir dist
+
+      - name: Repack the PyPI wheel with the ARM64 DLL
+        shell: pwsh
+        run: |
+          python -m pip download --quiet --no-deps --only-binary=:all: --platform win_amd64 --python-version 3.13 -d amd64 "sqlite-vec==$env:SQLITE_VEC_VERSION"
+          $src = Get-ChildItem amd64/*.whl | Select-Object -First 1
+          python tools/.github/tools/repack_sqlite_vec.py $src.FullName sv/dist/vec0.dll wheel
+          Get-ChildItem wheel
+
+      - name: Load it through sqlite3 in a fresh venv and run a vec0 query
+        shell: pwsh
+        run: |
+          $whl = Get-ChildItem wheel/*.whl | Select-Object -First 1
+          python -m venv smoke
+          smoke\Scripts\python.exe -m pip install --quiet $whl.FullName
+          smoke\Scripts\python.exe -c @"
+          import sqlite3, sqlite_vec, sysconfig
+          print('platform', sysconfig.get_platform(), 'sqlite', sqlite3.sqlite_version)
+          db = sqlite3.connect(':memory:')
+          db.enable_load_extension(True)
+          sqlite_vec.load(db)
+          db.enable_load_extension(False)
+          print('vec_version', db.execute('select vec_version()').fetchone()[0])
+          db.execute('create virtual table v using vec0(embedding float[4])')
+          rows = [(1, [1, 0, 0, 0]), (2, [0, 1, 0, 0]), (3, [0.9, 0.1, 0, 0])]
+          for rid, vec in rows:
+              db.execute('insert into v(rowid, embedding) values (?, ?)', (rid, sqlite_vec.serialize_float32(vec)))
+          got = db.execute('select rowid, distance from v where embedding match ? order by distance limit 2', (sqlite_vec.serialize_float32([1, 0, 0, 0]),)).fetchall()
+          print('knn', got)
+          assert [r[0] for r in got] == [1, 3], got
+          "@
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-vec-win_arm64
+          path: wheel/*.whl
+          if-no-files-found: error
