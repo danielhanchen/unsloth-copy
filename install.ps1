@@ -268,7 +268,10 @@ function Install-UnslothStudio {
     function Get-HostMachineArch {
         $osArch = ""
         try { $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $osArch = "" }
-        $signals = @([string]$env:PROCESSOR_ARCHITEW6432, [string]$env:PROCESSOR_ARCHITECTURE, $osArch)
+        # Machine scope first: emulated x64 says AMD64 per-process (ARCHITEW6432 is WOW64-only).
+        $machineArch = ""
+        try { $machineArch = [string][Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE", "Machine") } catch { $machineArch = "" }
+        $signals = @($machineArch, [string]$env:PROCESSOR_ARCHITEW6432, [string]$env:PROCESSOR_ARCHITECTURE, $osArch)
         foreach ($s in $signals) {
             if ($s.ToLowerInvariant() -eq "arm64") { return "arm64" }
         }
@@ -281,6 +284,1008 @@ function Install-UnslothStudio {
             }
         }
         return "unknown"
+    }
+
+    # WoA + NVIDIA: emulated triton cannot target the Blackwell SM. Probed for a win_arm64 CUDA wheel, never by arch.
+    $script:WoaNativeCudaTorch = $false
+    $script:WoaTorchIndexUrl = $null
+
+    $script:WoaNvidiaTorchIndexUrls = if ($env:UNSLOTH_WOA_TORCH_INDEX_URL) {
+        @($env:UNSLOTH_WOA_TORCH_INDEX_URL.Trim().TrimEnd('/'))
+    } else {
+        @(
+            "https://pypi.nvidia.com/nvtorch_oot",
+            "https://pypi.nvidia.com/nvtorch_oot_nightly"
+        )
+    }
+    $script:WoaTorchAudio = $false
+
+    # Wheels PyPI has no win_arm64 build of; anything it does build is taken from PyPI instead.
+    $script:WoaWheelhouse = if ($env:UNSLOTH_WOA_WHEELHOUSE) {
+        $env:UNSLOTH_WOA_WHEELHOUSE.Trim().TrimEnd('/')
+    } else {
+        "https://huggingface.co/unsloth/windows-arm64-wheels/resolve/main"
+    }
+    # AVAILABLE, not missing: a name absent here is EXCLUDED on ARM64 by the drop list below.
+    $script:WoaPyPIProvided = @{}
+    $script:WoaPyPIMatchedVersion = $null
+    $script:WoaPyarrowWheel = $null
+    $script:WoaPyarrowSource = $null     # "pypi" | "wheelhouse" | "local"
+    $script:WoaPyarrowWheelName = $null  # the wheel the pin is written from
+
+    function Test-ZipArchiveReadable {
+        param([string]$Path)
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        } catch { return $false }
+        try { return ($zip.Entries.Count -gt 0) } catch { return $false } finally { $zip.Dispose() }
+    }
+
+    # NVIDIA ships bare .bin artifacts; uv/pip need the tags in the filename, so rebuild it.
+    function Get-WheelFileNameFromArchive {
+        param([string]$Path)
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        } catch { return $null }
+        try {
+            $wheelEntry = $zip.Entries | Where-Object { $_.FullName -match '^[^/]+\.dist-info/WHEEL$' } | Select-Object -First 1
+            if (-not $wheelEntry) { return $null }
+            $distInfo = ($wheelEntry.FullName -split '/')[0] -replace '\.dist-info$', ''
+            $reader = New-Object System.IO.StreamReader($wheelEntry.Open())
+            try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            if ($content -notmatch '(?m)^Tag:\s*(\S+)\s*$') { return $null }
+            return "$distInfo-$($Matches[1]).whl"
+        } catch {
+            return $null
+        } finally {
+            $zip.Dispose()
+        }
+    }
+
+    # "$base/$leaf" would put the leaf inside a mirror's ?token=.
+    function Join-UrlPath {
+        param([string]$Base, [string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Base)) { return $Path }
+        $cut = $Base.IndexOfAny([char[]]('?', '#'))
+        if ($cut -lt 0) { return "$($Base.TrimEnd('/'))/$Path" }
+        $head = $Base.Substring(0, $cut).TrimEnd('/')
+        $tail = $Base.Substring($cut)
+        return "$head/$Path$tail"
+    }
+
+    # Userinfo AND query/fragment, so an authenticated pin never leaks. Mirrors the Python side.
+    function Remove-IndexUrlCredentials {
+        param([string]$Url)
+        # Ordinal, not culture-aware: th-TH treats "://" as ignorable and crashes Substring (#7279).
+        $sep = $Url.IndexOf('://', [System.StringComparison]::Ordinal)
+        if ($sep -lt 0) { return $Url }
+        $scheme = $Url.Substring(0, $sep)
+        $rest = $Url.Substring($sep + 3)
+        $q = $rest.IndexOfAny([char[]]('?', '#'))
+        if ($q -ge 0) { $rest = $rest.Substring(0, $q) }
+        $slash = $rest.IndexOf('/', [System.StringComparison]::Ordinal)
+        $authority = if ($slash -ge 0) { $rest.Substring(0, $slash) } else { $rest }
+        $at = $authority.LastIndexOf('@', [System.StringComparison]::Ordinal)
+        $host_ = if ($at -ge 0) { $authority.Substring($at + 1) } else { $authority }
+        if ($slash -ge 0) { return "${scheme}://${host_}$($rest.Substring($slash))" }
+        return "${scheme}://${host_}"
+    }
+
+    # Ask the filesystem, not a regex: C:/wheels and .\wheels are directories too.
+    function Test-WoaWheelhouseIsLocal {
+        param([string]$Value)
+        if (-not $Value) { return $false }
+        if ($Value -match '^[A-Za-z][A-Za-z0-9+.-]*://') { return $false }
+        try { return (Test-Path -LiteralPath $Value -PathType Container) } catch { return $false }
+    }
+
+    # uv splits UV_OVERRIDE on whitespace, so a spaced path breaks every later uv call (#6503).
+    function Get-UvSafePath {
+        param([string]$Path)
+        if (-not $Path -or -not $Path.Contains(" ")) { return $Path }
+        try {
+            $fso = New-Object -ComObject Scripting.FileSystemObject
+            $short = if (Test-Path -LiteralPath $Path -PathType Container) {
+                $fso.GetFolder($Path).ShortPath
+            } else {
+                $fso.GetFile($Path).ShortPath
+            }
+            if ($short -and -not $short.Contains(" ")) { return $short }
+        } catch {}
+        return $Path
+    }
+
+    # uv accepts no quoting in UV_OVERRIDE (0.10.7), so 8.3 is the only mitigation, and a volume can disable it.
+    $script:WoaResolverPathsOk = $null
+    function Test-WoaResolverPathsUsable {
+        if ($null -ne $script:WoaResolverPathsOk) { return $script:WoaResolverPathsOk }
+        try { New-Item -ItemType Directory -Force -Path $StudioHome -ErrorAction Stop | Out-Null } catch {}
+        $script:WoaResolverPathsOk = -not ((Get-UvSafePath $StudioHome) -match '\s')
+        if (-not $script:WoaResolverPathsOk) {
+            substep "windows on arm: $StudioHome contains a space and this volume has no 8.3" "Yellow"
+            substep "short name for it, which uv cannot read -- using the x64 stack instead." "Yellow"
+            substep "Set UNSLOTH_STUDIO_HOME to a path without spaces for the native install." "Yellow"
+        }
+        return $script:WoaResolverPathsOk
+    }
+
+    # PEP 425 fields, not a substring: "*cp313-cp313*" also matches cp313-cp313t. Fields are "."-sets.
+    function Test-WoaWheelTags {
+        param([string]$Name, [string]$PyTag, [string]$AbiTag)
+        if (-not $Name) { return $false }
+        $stem = $Name -replace '(?i)\.whl$', ''
+        $fields = $stem -split '-'
+        if ($fields.Count -lt 5) { return $false }
+        $pyTags = $fields[$fields.Count - 3] -split '\.'
+        $abiTags = $fields[$fields.Count - 2] -split '\.'
+        return (($pyTags -contains $PyTag) -and ($abiTags -contains $AbiTag))
+    }
+
+    # PEP 440 to the depth these floors use; a pre-release sorts BELOW its release (21.0.0rc1 fails >=21.0.0).
+    function Test-WoaVersionAtLeast {
+        param([string]$Version, [string]$Floor)
+        $parse = {
+            param([string]$v)
+            if ($v -notmatch '^\s*v?(\d+(\.\d+)*)') { return $null }
+            $release = $Matches[1] -split '\.' | ForEach-Object { [int]$_ }
+            $post = 0
+            if ($v -match '\.post(\d+)') { $post = [int]$Matches[1] }
+            # a/b/rc only, and only off the release, so ".post1rc1" is not a pre-release of it.
+            $pre = [bool]($v -match '(?i)^\s*v?\d+(\.\d+)*(a|b|rc)\d')
+            # PEP 440 hangs .devN off what precedes it, so 0.0.22.post7.dev0 is below 0.0.22.post7.
+            $dev = [int]::MaxValue
+            if ($v -match '(?i)\.dev(\d+)') { $dev = [int]$Matches[1] }
+            return @{ Release = @($release); Post = $post; Pre = $pre; Dev = $dev }
+        }
+        $a = & $parse $Version
+        $b = & $parse $Floor
+        if ($null -eq $a -or $null -eq $b) { return $false }
+        $width = [Math]::Max($a.Release.Count, $b.Release.Count)
+        for ($i = 0; $i -lt $width; $i++) {
+            $x = if ($i -lt $a.Release.Count) { $a.Release[$i] } else { 0 }
+            $y = if ($i -lt $b.Release.Count) { $b.Release[$i] } else { 0 }
+            if ($x -ne $y) { return ($x -gt $y) }
+        }
+        if ($a.Pre -ne $b.Pre) { return $b.Pre }
+        if ($a.Post -ne $b.Post) { return ($a.Post -gt $b.Post) }
+        if ($a.Dev -ne $b.Dev) { return ($a.Dev -gt $b.Dev) }
+        return $true
+    }
+
+    # The wheelhouse may BE the managed directory (offline reuse), and Copy-Item refuses a self-copy.
+    function Test-WoaSamePath {
+        param([string]$A, [string]$B)
+        if (-not $A -or -not $B) { return $false }
+        try {
+            $a = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
+            $b = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
+        } catch { return $false }
+        return $a.Equals($b, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    # uv and pip resolve -r/-c/-f against the file CONTAINING the line, so a moved line must rebase.
+    function Resolve-WoaOverrideLine {
+        param([string]$Line, [string]$BaseDir)
+        if (-not $BaseDir -or $Line -match '^\s*(#|$)') { return $Line }
+        $abs = {
+            param([string]$p)
+            if (-not $p -or $p -match '^[A-Za-z][A-Za-z0-9+.-]*://' -or [System.IO.Path]::IsPathRooted($p)) { return $p }
+            try { return [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($BaseDir, $p)) } catch { return $p }
+        }
+        if ($Line -match '^(\s*)(-r|--requirement|-c|--constraint|-f|--find-links)([=\s]+)(.+?)(\s*)$') {
+            # Copied out FIRST: the -match below replaces $Matches, dropping the option token.
+            $lead = $Matches[1]; $opt = $Matches[2]; $sep = $Matches[3]
+            $bare = $Matches[4].Trim('"').Trim("'"); $tail = $Matches[5]
+            $rebased = & $abs $bare
+            # Re-quoted when needed: these options take ONE file argument.
+            if ($rebased -match '\s') { $rebased = '"' + $rebased + '"' }
+            return "$lead$opt$sep$rebased$tail"
+        }
+        # -e / --editable names a path too. Extras split off first: GetFullPath would fold
+        # ".[dev]" into the parent and leave a directory nobody has.
+        if ($Line -match '^(\s*)(-e|--editable)([=\s]+)(.+?)(\s*)$') {
+            $lead = $Matches[1]; $opt = $Matches[2]; $sep = $Matches[3]
+            $bare = $Matches[4].Trim('"').Trim("'"); $tail = $Matches[5]
+            $extras = ""
+            if ($bare -match '^(.*?)(\[[^\]]*\])$') { $bare = $Matches[1]; $extras = $Matches[2] }
+            $rebased = (& $abs $bare) + $extras
+            if ($rebased -match '\s') { $rebased = '"' + $rebased + '"' }
+            return "$lead$opt$sep$rebased$tail"
+        }
+        if ($Line -match '^(\s*[^\s@]+\s*@\s*)(.+?)(\s*)$') {
+            $head = $Matches[1]; $target = $Matches[2]; $tail = $Matches[3]
+            # PEP 508 separates a marker from a URL with whitespace before the ";": kept aside, or it
+            # would be rebased as part of the path.
+            $marker = ""
+            if ($target -match '^(.*?)(\s+;.*)$') { $target = $Matches[1]; $marker = $Matches[2] }
+            if ($target -match '^file:(?!//)(.*)$') {
+                # A URI, not "file:" plus a raw path: a space in the profile would otherwise end the URL early.
+                $rebasedPath = & $abs $Matches[1]
+                $uri = try { (New-Object System.Uri -ArgumentList @($rebasedPath, [System.UriKind]::Absolute)).AbsoluteUri } catch { "file:" + $rebasedPath }
+                return "$head$uri$marker$tail"
+            }
+            return $Line
+        }
+        if ($Line -match '^(\s*)([^\s#;]+\.(?:whl|tar\.gz|zip))(\s*.*)$') {
+            $lead = $Matches[1]; $path = $Matches[2]; $rest = $Matches[3]
+            if ($path -match '[\\/]') { return "$lead" + (& $abs $path) + "$rest" }
+        }
+        # A bare local directory: pip and uv both take one as a requirement, and a leading dot
+        # segment is what tells it from a package name, which may not start with one.
+        if ($Line -match '^(\s*)(\.{1,2}[^\s#;]*)(\s*(?:[;#].*)?)$') {
+            $lead = $Matches[1]; $path = $Matches[2]; $rest = $Matches[3]
+            $extras = ""
+            if ($path -match '^(.*?)(\[[^\]]*\])$') { $path = $Matches[1]; $extras = $Matches[2] }
+            return "$lead" + (& $abs $path) + "$extras$rest"
+        }
+        return $Line
+    }
+
+    # Which index a uv resolve uses, from uv.toml / pyproject.toml. Quote-aware, and a subset
+    # parser because PS 5.1 has no TOML reader.
+    function Remove-WoaTomlComment {
+        param([string]$Line)
+        $inD = $false; $inS = $false
+        for ($i = 0; $i -lt $Line.Length; $i++) {
+            $c = $Line[$i]
+            if ($inD) {
+                if ($c -eq '\') { $i++; continue }
+                if ($c -eq '"') { $inD = $false }
+                continue
+            }
+            if ($inS) { if ($c -eq "'") { $inS = $false }; continue }
+            if ($c -eq '"') { $inD = $true; continue }
+            if ($c -eq "'") { $inS = $true; continue }
+            if ($c -eq '#') { return $Line.Substring(0, $i) }
+        }
+        return $Line
+    }
+
+    # The key half of a TOML assignment, dot-split and unquoted: `pip.no-index` is [pip]'s no-index, not one atom.
+    function Split-WoaTomlKey {
+        param([string]$Text)
+        $parts = @()
+        $i = 0
+        while ($i -lt $Text.Length) {
+            while ($i -lt $Text.Length -and [char]::IsWhiteSpace($Text[$i])) { $i++ }
+            if ($i -ge $Text.Length) { return $null }
+            $c = $Text[$i]
+            if ($c -eq '"' -or $c -eq "'") {
+                $q = $c; $i++; $sb = ""
+                while ($i -lt $Text.Length -and $Text[$i] -ne $q) {
+                    # Basic strings escape; literal (single-quoted) ones do not.
+                    if ($q -eq '"' -and $Text[$i] -eq '\' -and ($i + 1) -lt $Text.Length) { $i++ }
+                    $sb += $Text[$i]; $i++
+                }
+                if ($i -ge $Text.Length) { return $null }
+                $i++
+                $parts += $sb
+            } else {
+                $sb = ""
+                while ($i -lt $Text.Length -and ([string]$Text[$i]) -match '[A-Za-z0-9_-]') { $sb += $Text[$i]; $i++ }
+                if (-not $sb) { return $null }
+                $parts += $sb
+            }
+            while ($i -lt $Text.Length -and [char]::IsWhiteSpace($Text[$i])) { $i++ }
+            if ($i -lt $Text.Length) {
+                if ($Text[$i] -ne '.') { return $null }
+                $i++
+            }
+        }
+        if ($parts.Count -eq 0) { return $null }
+        return ,$parts
+    }
+
+    function Read-WoaUvTomlIndexKeys {
+        param([string]$Path, [string]$Top)
+        try { $lines = [System.IO.File]::ReadAllLines($Path) } catch { return $null }
+        # uv pip (0.10.7): [pip] scalars beat top-level, [[index]] default = true beats both. Ranked at the end.
+        $topScope = @{ NoIndex = $null; IndexUrl = $null; Extras = @() }
+        $pipScope = @{ NoIndex = $null; IndexUrl = $null; Extras = @() }
+        $section = ""
+        # A hashtable, because an assignment inside the $flush script block would be local to it.
+        $inIndex = $false; $idxUrl = $null; $idxDefault = $false; $entry = @{ DefaultUrl = $null; Extras = @() }
+        $indexTable = if ($Top) { "$Top.index" } else { "index" }
+        $pipTable = if ($Top) { "$Top.pip" } else { "pip" }
+        $flush = {
+            if ($inIndex -and $idxUrl) {
+                if ($idxDefault) { if (-not $entry.DefaultUrl) { $entry.DefaultUrl = $idxUrl } }
+                else { $entry.Extras += $idxUrl }
+            }
+        }
+        foreach ($raw in $lines) {
+            $line = (Remove-WoaTomlComment $raw).Trim()
+            if (-not $line) { continue }
+            if ($line -match '^\[\[(.+?)\]\]$') {
+                & $flush
+                $section = $Matches[1].Trim(); $inIndex = ($section -eq $indexTable); $idxUrl = $null; $idxDefault = $false
+                continue
+            }
+            if ($line -match '^\[(.+?)\]$') { & $flush; $section = $Matches[1].Trim(); $inIndex = $false; continue }
+            $eq = -1; $inD = $false; $inS = $false
+            for ($i = 0; $i -lt $line.Length; $i++) {
+                $c = $line[$i]
+                if ($inD) { if ($c -eq '\') { $i++ } elseif ($c -eq '"') { $inD = $false }; continue }
+                if ($inS) { if ($c -eq "'") { $inS = $false }; continue }
+                if ($c -eq '"') { $inD = $true; continue }
+                if ($c -eq "'") { $inS = $true; continue }
+                if ($c -eq '=') { $eq = $i; break }
+            }
+            if ($eq -lt 1) { continue }
+            $parts = Split-WoaTomlKey $line.Substring(0, $eq)
+            if (-not $parts) { continue }
+            $key = $parts[-1]
+            $prefix = if ($parts.Count -gt 1) { ($parts[0..($parts.Count - 2)] -join '.') } else { "" }
+            $val = $line.Substring($eq + 1).Trim()
+            if (-not $val) { continue }
+            $str = if ($val -match '^"(.*)"$' -or $val -match "^'(.*)'$") { $Matches[1] } else { $null }
+            $bool = if ($val -match '^(true|false)$') { $val -eq 'true' } else { $null }
+            if ($inIndex) {
+                # A dotted key inside [[index]] names some other table, not this entry.
+                if (-not $prefix) {
+                    if ($key -eq 'url' -and $str) { $idxUrl = $str }
+                    if ($key -eq 'default' -and $null -ne $bool) { $idxDefault = $bool }
+                }
+                continue
+            }
+            $scopeSection = if ($prefix) { if ($section) { "$section.$prefix" } else { $prefix } } else { $section }
+            $scope = if ($scopeSection -eq $Top) { $topScope } elseif ($scopeSection -eq $pipTable) { $pipScope } else { $null }
+            if ($null -eq $scope) { continue }
+            if ($key -eq 'no-index' -and $null -ne $bool -and $null -eq $scope.NoIndex) { $scope.NoIndex = $bool }
+            if (($key -eq 'default-index' -or $key -eq 'index-url') -and $str -and -not $scope.IndexUrl) { $scope.IndexUrl = $str }
+            # A one-line array of strings; anything else is not guessed at.
+            if ($key -eq 'extra-index-url') {
+                if ($val -match '^\[(.*)\]$') {
+                    foreach ($m in [regex]::Matches($Matches[1], ('"([^"]*)"' + "|'([^']*)'"))) {
+                        $scope.Extras += $(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value })
+                    }
+                } elseif ($str) { $scope.Extras += $str }
+            }
+            if ($key -eq 'index') { return $null }
+        }
+        & $flush
+        $noIndex = if ($null -ne $pipScope.NoIndex) { $pipScope.NoIndex } else { $topScope.NoIndex }
+        $defaultIndex = if ($entry.DefaultUrl) { $entry.DefaultUrl } elseif ($pipScope.IndexUrl) { $pipScope.IndexUrl } else { $topScope.IndexUrl }
+        $extras = @($entry.Extras) + @($pipScope.Extras) + @($topScope.Extras)
+        return @{ NoIndex = $noIndex; DefaultIndex = $defaultIndex; ExtraIndexes = @($extras | Where-Object { $_ }) }
+    }
+
+    function Get-WoaUvConfigIndexPolicy {
+        $result = @{ NoIndex = $false; DefaultIndex = $null; Unreadable = $false; ExtraIndexes = @() }
+        $noCfg = [string](Get-Item Env:UV_NO_CONFIG -ErrorAction SilentlyContinue).Value
+        if ($noCfg -and ($noCfg.Trim().ToLowerInvariant() -notin @("", "0", "false"))) { return $result }
+        $files = @()
+        $cfgFile = [string](Get-Item Env:UV_CONFIG_FILE -ErrorAction SilentlyContinue).Value
+        if ($cfgFile) {
+            $files += @{ Path = $cfgFile; Top = "" }
+        } else {
+            $dir = (Get-Location).Path
+            while ($dir) {
+                $u = Join-Path $dir "uv.toml"; $pp = Join-Path $dir "pyproject.toml"
+                if (Test-Path -LiteralPath $u -PathType Leaf) { $files += @{ Path = $u; Top = "" }; break }
+                if (Test-Path -LiteralPath $pp -PathType Leaf) {
+                    $txt = try { [System.IO.File]::ReadAllText($pp) } catch { "" }
+                    if ($txt -match '(?m)^\s*\[+tool\.uv(\.|\])') { $files += @{ Path = $pp; Top = "tool.uv" }; break }
+                }
+                $parent = Split-Path -Parent $dir
+                if (-not $parent -or $parent -eq $dir) { break }
+                $dir = $parent
+            }
+            if ($env:APPDATA) { $files += @{ Path = (Join-Path $env:APPDATA "uv\uv.toml"); Top = "" } }
+            if ($env:ProgramData) { $files += @{ Path = (Join-Path $env:ProgramData "uv\uv.toml"); Top = "" } }
+        }
+        $noIndexSet = $false
+        foreach ($f in $files) {
+            if (-not (Test-Path -LiteralPath $f.Path -PathType Leaf)) { continue }
+            $policy = Read-WoaUvTomlIndexKeys -Path $f.Path -Top $f.Top
+            if ($null -eq $policy) { $result.Unreadable = $true; continue }
+            if (-not $noIndexSet -and $null -ne $policy.NoIndex) { $result.NoIndex = $policy.NoIndex; $noIndexSet = $true }
+            if (-not $result.DefaultIndex -and $policy.DefaultIndex) { $result.DefaultIndex = $policy.DefaultIndex }
+            # Additive across files, like the option itself.
+            $result.ExtraIndexes = @($result.ExtraIndexes) + @($policy.ExtraIndexes)
+        }
+        return $result
+    }
+
+    # The host, not a substring: "https://pypi.org.corp.example/simple" is not public PyPI.
+    function Test-WoaUrlIsPublicPyPI {
+        param([string]$Url)
+        if (-not $Url) { return $false }
+        try { $u = [System.Uri]$Url.Trim() } catch { return $false }
+        if (-not $u.IsAbsoluteUri) { return $false }
+        return ($u.Host.ToLowerInvariant() -eq "pypi.org")
+    }
+
+    # This script resolves with uv, so uv's policy is the one that counts: UV_* and its configuration
+    # files. pip's PIP_* variables are pip's alone; uv never reads them, so they say nothing here.
+    function Test-WoaResolveReachesPyPI {
+        foreach ($name in @("UV_OFFLINE", "UV_NO_INDEX")) {
+            $flag = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            if ($flag -and ($flag.Trim().ToLowerInvariant() -notin @("", "0", "false"))) { return $false }
+        }
+        # An extra index adds to the default rather than replacing it (UV_INDEX, UV_EXTRA_INDEX_URL),
+        # so PyPI named there is still consulted.
+        $extraIsPyPI = $false
+        foreach ($name in @("UV_INDEX", "UV_EXTRA_INDEX_URL")) {
+            $list = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            foreach ($u in ($list -split '\s+' | Where-Object { $_ })) {
+                if (Test-WoaUrlIsPublicPyPI $u) { $extraIsPyPI = $true }
+            }
+        }
+        foreach ($name in @("UV_DEFAULT_INDEX", "UV_INDEX_URL")) {
+            $url = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            if ($url -and ($url.Trim())) { return ($extraIsPyPI -or (Test-WoaUrlIsPublicPyPI $url)) }
+        }
+        # Doubt resolves to "not PyPI": that answer keeps a wheel, the other loses the package.
+        $cfg = Get-WoaUvConfigIndexPolicy
+        if ($cfg.Unreadable -or $cfg.NoIndex) { return $false }
+        foreach ($u in @($cfg.ExtraIndexes)) { if (Test-WoaUrlIsPublicPyPI $u) { $extraIsPyPI = $true } }
+        if ($cfg.DefaultIndex -and -not (Test-WoaUrlIsPublicPyPI $cfg.DefaultIndex)) { return $extraIsPyPI }
+        return $true
+    }
+
+    # The index beside the CUDA one for torch's shared dependencies. Invoke-InstallCommand clears the
+    # inherited index settings whenever --default-index is passed, so the caller's policy is restated
+    # here, for the resolver that runs the install: uv reads UV_* and its configuration files, pip reads
+    # PIP_* alone. The default and extra indexes it names, public PyPI when it names none, and no index
+    # at all under no-index, where the find-links wheelhouse is the whole source.
+    function Get-WoaDependencyIndexArgs {
+        param([string]$Resolver = "uv")
+        $pip = ($Resolver -eq "pip")
+        $noIndexNames = if ($pip) { @("PIP_NO_INDEX") } else { @("UV_NO_INDEX") }
+        $defaultNames = if ($pip) { @("PIP_INDEX_URL") } else { @("UV_DEFAULT_INDEX", "UV_INDEX_URL") }
+        $extraNames = if ($pip) { @("PIP_EXTRA_INDEX_URL") } else { @("UV_INDEX", "UV_EXTRA_INDEX_URL") }
+        foreach ($name in $noIndexNames) {
+            $flag = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            if ($flag -and ($flag.Trim().ToLowerInvariant() -notin @("", "0", "false"))) { return @() }
+        }
+        $default = $null
+        foreach ($name in $defaultNames) {
+            $url = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            if ($url -and $url.Trim()) { $default = $url.Trim(); break }
+        }
+        $extras = @()
+        foreach ($name in $extraNames) {
+            $list = [string](Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value
+            foreach ($u in ($list -split '\s+' | Where-Object { $_ })) { $extras += $u }
+        }
+        # uv's configuration files are uv's; pip does not read them.
+        if (-not $pip -and (-not $default -or -not $extras)) {
+            $cfg = Get-WoaUvConfigIndexPolicy
+            if ($cfg.NoIndex) { return @() }
+            if (-not $default -and $cfg.DefaultIndex) { $default = $cfg.DefaultIndex }
+            if (-not $extras) { $extras = @($cfg.ExtraIndexes) }
+        }
+        if (-not $default) { $default = "https://pypi.org/simple" }
+        $indexArgs = @()
+        foreach ($u in @(@($default) + @($extras) | Where-Object { $_ } | Select-Object -Unique)) {
+            $indexArgs += @("--extra-index-url", $u)
+        }
+        return $indexArgs
+    }
+
+    # Exact tags, or a wheel that does not care (cp38-abi3, py3-none). Free-threaded has no abi3.
+    function Test-WoaWheelTagsUsable {
+        param([string]$Name, [string]$PyTag, [string]$AbiTag = "")
+        if (-not $AbiTag) { $AbiTag = $PyTag }
+        if (Test-WoaWheelTags -Name $Name -PyTag $PyTag -AbiTag $AbiTag) { return $true }
+        $fields = ($Name -replace '(?i)\.whl$', '') -split '-'
+        if ($fields.Count -lt 5) { return $false }
+        # Free-threaded CPython has no stable ABI (CPython #111506), so abi3 is not an option there.
+        if ($AbiTag -like "*t") { return $false }
+        $abiTags = $fields[$fields.Count - 2] -split '\.'
+        $minor = 0
+        if ($PyTag -match '^cp3(\d+)$') { $minor = [int]$Matches[1] }
+        foreach ($pyTag in ($fields[$fields.Count - 3] -split '\.')) {
+            # abi3 is forward compatible only from what it was built against: cp314-abi3 fails on cp313.
+            if (($abiTags -contains "abi3") -and ($pyTag -match '^cp3(\d+)$')) {
+                if ([int]$Matches[1] -le $minor) { return $true }
+            }
+            if ($abiTags -contains "none") {
+                if ($pyTag -match '^py3(\d*)$') {
+                    if ([string]::IsNullOrEmpty($Matches[1]) -or ([int]$Matches[1] -le $minor)) { return $true }
+                }
+                if ($pyTag -match '^cp3(\d+)$') {
+                    if ([int]$Matches[1] -le $minor) { return $true }
+                }
+            }
+        }
+        return $false
+    }
+
+    # PyPI alone, and no lower than $Floor; an empty $Floor asks only whether any wheel exists.
+    function Test-WoaPyPIWheel {
+        param([string]$Project, [string]$PyTag, [string]$AbiTag = "", [string]$Floor = "", [switch]$AllowAgnostic, [switch]$Exact)
+        if (-not $Project -or -not $PyTag) { return $false }
+        if (-not $AbiTag) { $AbiTag = $PyTag }
+        # pypi.org/simple normalises the project name; a wheel filename carries the underscored form.
+        $slug = ($Project -replace '_', '-').ToLowerInvariant()
+        try {
+            $body = [string](Invoke-RestMethod -Uri "https://pypi.org/simple/$slug/" -UseBasicParsing -TimeoutSec 20)
+        } catch { return $false }
+        foreach ($match in [regex]::Matches($body, "[A-Za-z0-9_.+-]+win_arm64\.whl")) {
+            $name = $match.Value
+            $tagsOk = if ($AllowAgnostic) { Test-WoaWheelTagsUsable -Name $name -PyTag $PyTag -AbiTag $AbiTag }
+                      else { Test-WoaWheelTags -Name $name -PyTag $PyTag -AbiTag $AbiTag }
+            if (-not $tagsOk) { continue }
+            $fields = ($name -replace '(?i)\.whl$', '') -split '-'
+            if ($fields.Count -lt 5) { continue }
+            if (($fields[0] -replace '_', '-').ToLowerInvariant() -ne $slug) { continue }
+            if (-not $Floor) { $script:WoaPyPIMatchedVersion = $fields[1]; return $true }
+            # -Exact: the same version, so an exact pin the wheelhouse copy satisfies is never lost to a
+            # newer upstream release it does not. Otherwise at or above the floor.
+            $ok = if ($Exact) {
+                (Test-WoaVersionAtLeast -Version $fields[1] -Floor $Floor) -and (Test-WoaVersionAtLeast -Version $Floor -Floor $fields[1])
+            } else { Test-WoaVersionAtLeast -Version $fields[1] -Floor $Floor }
+            if ($ok) {
+                $script:WoaPyPIMatchedVersion = $fields[1]
+                return $true
+            }
+        }
+        return $false
+    }
+
+    # Ours is first in UV_FIND_LINKS and wins the tie; an upstream BEHIND it leaves ours staged.
+    function Test-WoaWheelhouseWheelIsRedundant {
+        param([string]$Name, [string]$PyTag, [string]$AbiTag = "")
+        if ($Name -notlike "*win_arm64*") { return $false }
+        $fields = ($Name -replace '(?i)\.whl$', '') -split '-'
+        if ($fields.Count -lt 5) { return $false }
+        if (-not (Test-WoaResolveReachesPyPI)) { return $false }
+        # Only wheels THIS venv could have used: a cp312 one is not made redundant by a cp313.
+        if (-not (Test-WoaWheelTagsUsable -Name $Name -PyTag $PyTag -AbiTag $AbiTag)) { return $false }
+        # The same version only: a newer upstream wheel leaves ours staged for an exact pin, and a floor
+        # takes the newer one under best-match anyway.
+        return (Test-WoaPyPIWheel -Project $fields[0] -PyTag $PyTag -AbiTag $AbiTag -Floor $fields[1] -AllowAgnostic -Exact)
+    }
+
+    # Exact tags only: the one caller is free-threaded, where abi3 and py3-none are not options.
+    function Test-WoaWheelAvailable {
+        param([string]$Project, [string]$PythonMinor, [string]$AbiTag = "")
+        $tag = "cp" + ($PythonMinor -replace '\.', '')
+        if (-not $AbiTag) { $AbiTag = $tag }
+        $pattern = "$Project-[^`"'<>\s]*?win_arm64\.whl"
+        # Only where the resolve will look: a wheel PyPI publishes is no answer on an exclusive index.
+        if ((Test-WoaResolveReachesPyPI) -and (Test-WoaPyPIWheel -Project $Project -PyTag $tag -AbiTag $AbiTag)) { return $true }
+        if (-not $script:WoaWheelhouse) { return $false }
+        if (Test-WoaWheelhouseIsLocal $script:WoaWheelhouse) {
+            $local = Get-ChildItem -LiteralPath $script:WoaWheelhouse -Filter "$Project-*win_arm64.whl" -ErrorAction SilentlyContinue |
+                Where-Object { Test-WoaWheelTags -Name $_.Name -PyTag $tag -AbiTag $AbiTag } | Select-Object -First 1
+            return [bool]$local
+        }
+        try {
+            $index = [string](Invoke-RestMethod -Uri (Join-UrlPath $script:WoaWheelhouse "index.txt") -UseBasicParsing -TimeoutSec 20)
+            foreach ($match in [regex]::Matches($index, $pattern)) {
+                if (Test-WoaWheelTags -Name $match.Value -PyTag $tag -AbiTag $AbiTag) { return $true }
+            }
+        } catch {}
+        return $false
+    }
+
+    # constraints.txt floors ARM64 pyarrow at 21.0.0 and staging pins exactly, so a 19.x cannot resolve.
+    $script:WoaPyarrowFloor = "21.0.0"
+    function Test-WoaPyarrowWheelUsable {
+        param([string]$Name, [string]$PyTag, [string]$AbiTag)
+        # Usable, not exact: pyarrow's coming win_arm64 wheel is cp311-abi3 (apache/arrow#48539).
+        if (-not (Test-WoaWheelTagsUsable -Name $Name -PyTag $PyTag -AbiTag $AbiTag)) { return $false }
+        $fields = ($Name -replace '(?i)\.whl$', '') -split '-'
+        if ($fields.Count -lt 5) { return $false }
+        return (Test-WoaVersionAtLeast -Version $fields[1] -Floor $script:WoaPyarrowFloor)
+    }
+
+    # uv's --overrides beat a spec named on the command line (0.10.7): drop the trio only, here only.
+    function New-WoaTorchStepOverrideValue {
+        param([string]$Value, [string]$Dir = "")
+        $result = @{ Value = $null; Temps = @() }
+        if (-not $Value) { return $result }
+        $files = @()
+        foreach ($entry in ($Value -split '\s+' | Where-Object { $_ })) {
+            $path = $entry.Trim('"').Trim("'")
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $kept = @()
+            $dropped = $false
+            foreach ($line in (Get-WoaRequirementEntries -Path $path)) {
+                $name = ((($line.Line -split '[\s<>=!~;@\[]', 2)[0]).Trim() -replace '[-_.]+', '-').ToLowerInvariant()
+                if (@("torch", "torchvision", "torchaudio") -contains $name) { $dropped = $true; continue }
+                $kept += (Resolve-WoaOverrideLine -Line $line.Line -BaseDir $line.BaseDir)
+            }
+            if (-not $dropped) { $files += $path; continue }
+            # Flattened, because dropping a line from an include means it cannot come along by
+            # reference. Recorded for deletion: it can carry an authenticated URL.
+            $tmp = if ($Dir -and (Test-Path -LiteralPath $Dir -PathType Container)) {
+                Join-Path $Dir ("torch-step-" + [System.IO.Path]::GetRandomFileName() + ".txt")
+            } else { [System.IO.Path]::GetTempFileName() }
+            [System.IO.File]::WriteAllLines($tmp, [string[]]$kept, (New-Object System.Text.UTF8Encoding($false)))
+            $result.Temps += $tmp
+            $files += $tmp
+        }
+        if (-not $files) { $result.Value = ""; return $result }
+        $safe = foreach ($f in $files) { Get-UvSafePath $f }
+        $result.Value = (($safe | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " ")
+        return $result
+    }
+
+    function Get-WoaRequirementEntries {
+        param([string]$Path, $Seen = $null, [int]$Depth = 0)
+        if ($Depth -gt 8) { return @() }
+        if ($null -eq $Seen) { $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase) }
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+        try { $full = Convert-Path -LiteralPath $Path } catch { return @() }
+        if (-not $Seen.Add($full)) { return @() }
+        try { $lines = [System.IO.File]::ReadAllLines($full) } catch { return @() }
+        $dir = [System.IO.Path]::GetDirectoryName($full)
+        $entries = @()
+        foreach ($line in $lines) {
+            # Comments and blanks come across as entries: a fold should carry the file faithfully.
+            if ($line -match '^\s*(?:-r|--requirement)[=\s]+(.+?)\s*$') {
+                # pip needs whitespace before an inline "#": "-r a#b.txt" keeps its hash.
+                $nested = ($Matches[1] -replace '\s+#.*$', '').Trim().Trim('"', "'")
+                if (-not [System.IO.Path]::IsPathRooted($nested)) { $nested = Join-Path $dir $nested }
+                $entries += @(Get-WoaRequirementEntries -Path $nested -Seen $Seen -Depth ($Depth + 1))
+                continue
+            }
+            $entries += , @{ Line = $line; BaseDir = $dir }
+        }
+        return $entries
+    }
+
+    # UNSLOTH_PYARROW_WHEEL, then PyPI, then the wheelhouse. "" leaves native unselected.
+    function Get-WoaPyarrowSource {
+        param([string]$PythonMinor, [string]$AbiTag = "")
+        $tag = "cp" + ($PythonMinor -replace '\.', '')
+        if (-not $AbiTag) { $AbiTag = $tag }
+        # Cleared on entry: this runs twice and a leftover name would pin a stale version.
+        $script:WoaPyarrowWheelName = $null
+        if ($env:UNSLOTH_PYARROW_WHEEL) {
+            $_paWheel = $env:UNSLOTH_PYARROW_WHEEL
+            if (Test-Path -LiteralPath $_paWheel -PathType Leaf) {
+                $_paName = Split-Path -Leaf $_paWheel
+                # Saved under another name (.bin, no extension): the wheel name comes from the archive, as staging reads it.
+                if ($_paName -notlike "*.whl") {
+                    $_paFromArchive = Get-WheelFileNameFromArchive -Path $_paWheel
+                    if ($_paFromArchive) { $_paName = $_paFromArchive }
+                }
+                if (($_paName -like "pyarrow-*") -and (Test-WoaPyarrowWheelUsable -Name $_paName -PyTag $tag -AbiTag $AbiTag) -and
+                    ($_paName -like "*win_arm64.whl")) {
+                    # The whole archive: a truncated download still starts with "PK".
+                    if (Test-ZipArchiveReadable -Path $_paWheel) { return "local" }
+                    substep "windows on arm: UNSLOTH_PYARROW_WHEEL is not a readable wheel archive -- ignoring it." "Yellow"
+                } else {
+                    substep "windows on arm: UNSLOTH_PYARROW_WHEEL is not a $tag win_arm64 pyarrow >= $($script:WoaPyarrowFloor) wheel -- ignoring it." "Yellow"
+                }
+            } else {
+                substep "windows on arm: UNSLOTH_PYARROW_WHEEL does not exist -- ignoring it." "Yellow"
+            }
+        }
+        # Only where the resolve will look at PyPI: no-index or an exclusive default-index means not.
+        if (Test-WoaResolveReachesPyPI) { try {
+            $body = [string](Invoke-RestMethod -Uri "https://pypi.org/simple/pyarrow/" -UseBasicParsing -TimeoutSec 20)
+            foreach ($match in [regex]::Matches($body, 'pyarrow-[^"''<>\s]*?win_arm64\.whl')) {
+                if (Test-WoaPyarrowWheelUsable -Name $match.Value -PyTag $tag -AbiTag $AbiTag) {
+                    # Recorded so the override pins THIS wheel: a newer sdist satisfies >=21.0.0.
+                    $script:WoaPyarrowWheelName = $match.Value
+                    return "pypi"
+                }
+            }
+        } catch {} }
+        if (Test-WoaWheelhouseIsLocal $script:WoaWheelhouse) {
+            # Opened, not just named: staging pins this wheel exactly, so a truncated one fails.
+            $local = Get-ChildItem -LiteralPath $script:WoaWheelhouse -Filter "pyarrow-*win_arm64.whl" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    (Test-WoaPyarrowWheelUsable -Name $_.Name -PyTag $tag -AbiTag $AbiTag) -and
+                    (Test-ZipArchiveReadable -Path $_.FullName)
+                } | Select-Object -First 1
+            if ($local) { return "wheelhouse" }
+            return ""
+        }
+        try {
+            $index = [string](Invoke-RestMethod -Uri (Join-UrlPath $script:WoaWheelhouse "index.txt") -UseBasicParsing -TimeoutSec 20)
+            foreach ($match in [regex]::Matches($index, 'pyarrow-[^"''<>\s]*?win_arm64\.whl')) {
+                if (Test-WoaPyarrowWheelUsable -Name $match.Value -PyTag $tag -AbiTag $AbiTag) { return "wheelhouse" }
+            }
+        } catch {}
+        return ""
+    }
+
+    # ── Bound nvidia-smi so a wedged driver cannot hang the installer. ──
+    function Invoke-NvidiaSmiBounded {
+        param(
+            [Parameter(Mandatory = $true, Position = 0)][string]$Exe,
+            [Parameter(Position = 1)][string[]]$SmiArgs = @(),
+            [int]$TimeoutSec = 10,
+            # Driver warnings on stderr would corrupt machine-readable --query-gpu
+            # output; the human-readable probes keep the default merge.
+            [switch]$StdoutOnly
+        )
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            $psi.Arguments = ($SmiArgs -join ' ')
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+                try { $proc.Kill() } catch {}
+                $global:LASTEXITCODE = 124
+                return ""
+            }
+            $global:LASTEXITCODE = $proc.ExitCode
+            if ($StdoutOnly) { return $outTask.Result }
+            return ($outTask.Result + "`n" + $errTask.Result)
+        } catch {
+            $global:LASTEXITCODE = 1
+            return ""
+        }
+    }
+
+    # One list, because the presence probe and the driver-version probe must agree: a host only
+    # the first one finds reports a GPU with no driver version, and Initialize-WoaNativeCudaTorch
+    # then skips its CUDA-major guard entirely and can pick a cu13x wheel for a CUDA 12 driver.
+    # Same two locations the main GPU detection below searches.
+    function Get-WoaNvidiaSmiPath {
+        $exe = $null
+        try { $exe = (Get-Command nvidia-smi -ErrorAction SilentlyContinue).Source } catch { $exe = $null }
+        if ($exe) { return $exe }
+        foreach ($candidate in @(
+            "$env:SystemRoot\System32\nvidia-smi.exe",
+            "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        }
+        return $null
+    }
+
+    function Test-WoaNvidiaPresent {
+        $exe = Get-WoaNvidiaSmiPath
+        if (-not $exe) { return $false }
+        # Bounded: this runs before the main GPU detection, and a wedged driver hangs an unbounded call.
+        $listing = Invoke-NvidiaSmiBounded $exe @('-L')
+        return ($LASTEXITCODE -eq 0 -and $listing -match '(?m)^\s*GPU\s+\d+')
+    }
+
+    # The driver's CUDA version as @(major, minor), or $null when nvidia-smi does not say.
+    function Get-WoaDriverCudaVersion {
+        $exe = Get-WoaNvidiaSmiPath
+        if (-not $exe) { return $null }
+        $out = Invoke-NvidiaSmiBounded $exe
+        # Newer drivers print "CUDA UMD Version"; accept both spellings.
+        if ($out -notmatch 'CUDA(?: UMD)? Version:\s+(\d+)\.(\d+)') { return $null }
+        return @([int]$Matches[1], [int]$Matches[2])
+    }
+
+    # Duplicates Get-TorchIndexUrl's mapping because this runs first.
+    function Get-WoaDriverCudaLeaf {
+        $v = Get-WoaDriverCudaVersion
+        if (-not $v) { return $null }
+        $major = [int]$v[0]; $minor = [int]$v[1]
+        if ($major -ge 13) { return "cu130" }
+        if ($major -eq 12 -and $minor -ge 8) { return "cu128" }
+        if ($major -eq 12 -and $minor -ge 6) { return "cu126" }
+        if ($major -ge 12) { return "cu124" }
+        if ($major -ge 11) { return "cu118" }
+        return $null
+    }
+
+    # A free-threaded build installs cp313t, not cp313. Unknown answers $false, keeping the GIL path.
+    function Test-PythonFreeThreaded {
+        param([string]$PythonExe)
+        if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { return $false }
+        $out = ""
+        try {
+            $out = (& $PythonExe -c "import sysconfig; print(1 if sysconfig.get_config_var('Py_GIL_DISABLED') else 0)" 2>$null | Out-String).Trim()
+        } catch { return $false }
+        return ($out -eq "1")
+    }
+
+    function Get-WoaAbiTag {
+        param([string]$PythonMinor, [bool]$FreeThreaded)
+        $tag = "cp" + ($PythonMinor -replace '\.', '')
+        if ($FreeThreaded) { return "${tag}t" }
+        return $tag
+    }
+
+    # CUDA is established POSITIVELY by requiring +cuNNN: PyPI's own win_arm64 torch carries no
+    # local version. A companion belongs to a torch BUILD, so the stamp and +cuXXX tag identify it.
+    function Test-WoaWheelPairsWithTorch {
+        param([string]$TorchVersion, [string]$OtherVersion, [string]$Project = "torchvision")
+        if (-not $TorchVersion -or -not $OtherVersion) { return $false }
+        $stamp = {
+            param($v)
+            $m = [regex]::Match($v, '(?i)\.dev(\d+)')
+            if ($m.Success) { return $m.Groups[1].Value } else { return "" }
+        }
+        $local = {
+            param($v)
+            $parts = $v -split '\+', 2
+            if ($parts.Count -eq 2) { return $parts[1].ToLowerInvariant() } else { return "" }
+        }
+        if ((& $stamp $TorchVersion) -ne (& $stamp $OtherVersion)) { return $false }
+        if ((& $local $TorchVersion) -ne (& $local $OtherVersion)) { return $false }
+        if (& $stamp $TorchVersion) { return $true }
+        # Stable releases share an empty stamp, so they pair by offset: torchvision 0.(M+15) to 2.M.
+        $rel = {
+            param($v)
+            $m = [regex]::Match($v, '^(\d+)\.(\d+)')
+            if ($m.Success) { return @([int]$m.Groups[1].Value, [int]$m.Groups[2].Value) } else { return $null }
+        }
+        $t = & $rel $TorchVersion; $o = & $rel $OtherVersion
+        if (-not $t -or -not $o) { return $false }
+        switch (($Project -replace '[-_.]+', '-').ToLowerInvariant()) {
+            "torchvision" { return (($t[0] -eq 2) -and ($o[0] -eq 0) -and ($o[1] -eq ($t[1] + 15))) }
+            "torchaudio"  { return (($o[0] -eq $t[0]) -and ($o[1] -eq $t[1])) }
+            default       { return $true }
+        }
+    }
+
+    function Get-WoaCudaWheelVersion {
+        param([string]$IndexUrl, [string]$PythonMinor, [string]$Project = "torch", [string]$AbiTag = "",
+              [string]$PairWith = "")
+        if ([string]::IsNullOrWhiteSpace($IndexUrl) -or [string]::IsNullOrWhiteSpace($PythonMinor)) { return $null }
+        $tag = "cp" + ($PythonMinor -replace '\.', '')
+        if (-not $AbiTag) { $AbiTag = $tag }
+        $projectUrl = Join-UrlPath $IndexUrl "$Project/"
+        try {
+            $body = [string](Invoke-RestMethod -Uri $projectUrl -UseBasicParsing -TimeoutSec 20)
+        } catch {
+            return $null
+        }
+        if ([string]::IsNullOrWhiteSpace($body)) { return $null }
+        $best = $null
+        $bestKey = $null
+        # PEP 440 order within one numeric release: dev < a < b < rc < final, then by number.
+        $prerelease = {
+            param([string]$v)
+            $r = ($v -split '\+', 2)[0]
+            if ($r -match '\.dev(\d+)') { return @(0, [long]$Matches[1]) }
+            if ($r -match '(?i)(a|b|rc)(\d+)') { return @(@{ a = 1; b = 2; rc = 3 }[$Matches[1].ToLowerInvariant()], [long]$Matches[2]) }
+            return @(4, [long]0)
+        }
+        foreach ($match in [regex]::Matches($body, "$Project-[^`"'<>\s]*?win_arm64\.whl")) {
+            $name = $match.Value
+            try { $name = [System.Uri]::UnescapeDataString($name) } catch {}
+            if (-not (Test-WoaWheelTags -Name $name -PyTag $tag -AbiTag $AbiTag)) { continue }
+            if ($name -notmatch '\+cu[0-9]+') { continue }
+            $version = ($name -split '-')[1]
+            if ($PairWith -and -not (Test-WoaWheelPairsWithTorch -TorchVersion $PairWith -OtherVersion $version -Project $Project)) { continue }
+            # Numeric release only: a .dev suffix must not make a newer line look older.
+            $release = ($version -split '\+', 2)[0]
+            $numeric = [regex]::Match($release, '^\d+(\.\d+){0,2}').Value
+            $key = $null
+            try { $key = [version]$numeric } catch { continue }
+            if ($null -eq $bestKey -or $key -gt $bestKey) {
+                $bestKey = $key; $best = $version
+            } elseif ($key -eq $bestKey) {
+                # Same release: PEP 440 order, so a final build outranks every prerelease and later numbers win within a kind.
+                $rankNew = & $prerelease $version; $rankBest = & $prerelease $best
+                if (($rankNew[0] -gt $rankBest[0]) -or (($rankNew[0] -eq $rankBest[0]) -and ($rankNew[1] -gt $rankBest[1]))) { $best = $version }
+            }
+        }
+        return $best
+    }
+
+    function Test-WoaCudaWheel {
+        param([string]$IndexUrl, [string]$PythonMinor, [string]$Project = "torch", [string]$AbiTag = "")
+        return [bool](Get-WoaCudaWheelVersion -IndexUrl $IndexUrl -PythonMinor $PythonMinor -Project $Project -AbiTag $AbiTag)
+    }
+
+    function Test-WoaAudioMatchesTorch {
+        param([string]$TorchVersion, [string]$AudioVersion)
+        if (-not $TorchVersion -or -not $AudioVersion) { return $false }
+        $shorten = {
+            param($v)
+            [regex]::Match((($v -split '\+', 2)[0]), '^\d+\.\d+').Value
+        }
+        $a = & $shorten $TorchVersion
+        $b = & $shorten $AudioVersion
+        return ($a -and $b -and $a -eq $b)
+    }
+
+    # Safe to call more than once.
+    function Initialize-WoaNativeCudaTorch {
+        param([string]$PythonMinor, [bool]$FreeThreaded = $false)
+        # ABI, not just minor: cp313-cp313 for a 3.13t interpreter finds GIL wheels it cannot install.
+        $_woaAbiTag = Get-WoaAbiTag -PythonMinor $PythonMinor -FreeThreaded $FreeThreaded
+        $script:WoaFreeThreaded = $FreeThreaded
+        $script:WoaNativeCudaTorch = $false
+        $script:WoaTorchIndexUrl = $null
+        # Cleared too, so a re-probe cannot inherit the first call's answer.
+        $script:WoaTorchAudio = $false
+        if ((Get-HostMachineArch) -ne "arm64") { return }
+        if ($SkipTorch) { return }
+        if ($env:UNSLOTH_WOA_NATIVE -and $env:UNSLOTH_WOA_NATIVE.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
+            substep "windows on arm: UNSLOTH_WOA_NATIVE is off -- using the x64 path." "Yellow"
+            return
+        }
+        if (-not (Test-WoaNvidiaPresent)) { return }
+        # Before any interpreter or venv is chosen, so no ARM64 venv is built for an unresolvable stack.
+        if (-not (Test-WoaResolverPathsUsable)) { return }
+        $pinned = @()
+        if (-not [string]::IsNullOrWhiteSpace($env:UNSLOTH_TORCH_INDEX_URL)) {
+            $pinned += $env:UNSLOTH_TORCH_INDEX_URL.Trim().TrimEnd('/')
+        } elseif (-not [string]::IsNullOrWhiteSpace($env:UNSLOTH_TORCH_INDEX_FAMILY)) {
+            $mirror = if ($env:UNSLOTH_PYTORCH_MIRROR) { $env:UNSLOTH_PYTORCH_MIRROR.TrimEnd('/') } else { "https://download.pytorch.org/whl" }
+            $pinned += "$mirror/$($env:UNSLOTH_TORCH_INDEX_FAMILY.Trim().Trim('/'))"
+        }
+        $candidates = @()
+        if ($pinned.Count -gt 0) {
+            $candidates = $pinned
+        } else {
+            $mirror = if ($env:UNSLOTH_PYTORCH_MIRROR) { $env:UNSLOTH_PYTORCH_MIRROR.TrimEnd('/') } else { "https://download.pytorch.org/whl" }
+            $driverLeaf = Get-WoaDriverCudaLeaf
+            if ($driverLeaf) { $candidates += "$mirror/$driverLeaf" }
+            $candidates += $script:WoaNvidiaTorchIndexUrls
+        }
+        $torchIndex = $null
+        $_woaTorchVersion = $null
+        $_woaVisionVersion = $null
+        $_woaUnpairedIndex = $null
+        foreach ($candidate in $candidates) {
+            if (-not (Test-WoaCudaWheel -IndexUrl $candidate -PythonMinor $PythonMinor -AbiTag $_woaAbiTag -Project "torch")) { continue }
+            $_woaTorchVersion = Get-WoaCudaWheelVersion -IndexUrl $candidate -PythonMinor $PythonMinor -AbiTag $_woaAbiTag
+            # torchvision is part of the stack, so an index qualifies only with a vision build PAIRED to that
+            # torch: a lagging nightly or a partial mirror would otherwise leave torchvision to resolve against
+            # a torch it was not built for, after the ARM64 venv exists.
+            $_woaVisionVersion = Get-WoaCudaWheelVersion -IndexUrl $candidate -PythonMinor $PythonMinor -Project "torchvision" -AbiTag $_woaAbiTag -PairWith $_woaTorchVersion
+            if (-not $_woaVisionVersion) {
+                substep "windows on arm: $(Remove-IndexUrlCredentials $candidate) publishes torch $_woaTorchVersion but no torchvision paired with it; trying the next index." "Yellow"
+                if (-not $_woaUnpairedIndex) { $_woaUnpairedIndex = $candidate }
+                continue
+            }
+            $torchIndex = $candidate
+            break
+        }
+        if (-not $torchIndex) {
+            if ($_woaUnpairedIndex) {
+                substep "windows on arm: no index pairs a torchvision with its win_arm64 CUDA torch; using the x64 stack instead." "Yellow"
+            }
+            return
+        }
+        # A CUDA 13 runtime does not run on a CUDA 12 driver (no forward compatibility on Windows), and
+        # the NVIDIA channel is accepted on tags alone, so the wheel's major is checked against the driver's.
+        $_woaDriver = Get-WoaDriverCudaVersion
+        if ($_woaDriver -and $_woaTorchVersion -match '\+cu(\d+)') {
+            $_woaWheelMajor = [int]($Matches[1].Substring(0, $Matches[1].Length - 1))
+            if ($_woaWheelMajor -gt [int]$_woaDriver[0]) {
+                substep "windows on arm: $(Remove-IndexUrlCredentials $torchIndex) publishes torch $_woaTorchVersion (CUDA $_woaWheelMajor), but this driver supports CUDA $($_woaDriver[0]).$($_woaDriver[1])." "Yellow"
+                substep "using the x64 stack instead. Update the NVIDIA driver for the native install." "Yellow"
+                return
+            }
+        }
+        # torch alone is not enough: datasets needs pyarrow, unbuildable here. Both decided up front.
+        $pyarrowSource = Get-WoaPyarrowSource -PythonMinor $PythonMinor -AbiTag $_woaAbiTag
+        if (-not $pyarrowSource) {
+            substep "windows on arm: native CUDA torch is available, but no win_arm64 pyarrow wheel could be found." "Yellow"
+            substep "using the x64 stack instead. Set UNSLOTH_PYARROW_WHEEL to a win_arm64 pyarrow wheel for the native install." "Yellow"
+            return
+        }
+        # Free-threaded only: constraints.txt's win_arm64 av wheel is cp311-abi3 (CPython #111506).
+        if ($FreeThreaded -and -not (Test-WoaWheelAvailable -Project "av" -PythonMinor $PythonMinor -AbiTag $_woaAbiTag)) {
+            substep "windows on arm: no win_arm64 av (PyAV) wheel for this free-threaded interpreter ($_woaAbiTag)." "Yellow"
+            substep "using the x64 stack instead. A GIL build of the same Python takes the native path." "Yellow"
+            return
+        }
+        $script:WoaNativeCudaTorch = $true
+        $script:WoaTorchIndexUrl = $torchIndex
+        $script:WoaPyarrowSource = $pyarrowSource
+        # Only when the audio wheel PAIRS with the torch one: 2.11 dropped its exact torch pin.
+        $_woaAudioVersion = Get-WoaCudaWheelVersion -IndexUrl $torchIndex -PythonMinor $PythonMinor -Project "torchaudio" -AbiTag $_woaAbiTag -PairWith $_woaTorchVersion
+        $script:WoaTorchAudio = Test-WoaAudioMatchesTorch -TorchVersion $_woaTorchVersion -AudioVersion $_woaAudioVersion
+        # Kept so the install pins what the probe SELECTED: unsafe-best-match spans ALL indexes.
+        $script:WoaTorchWheelVersion = $_woaTorchVersion
+        $script:WoaAudioWheelVersion = $_woaAudioVersion
+        # Paired with that torch by the gate above, never merely the newest.
+        $script:WoaVisionWheelVersion = $_woaVisionVersion
+        # Read off the wheel, not the URL: a mirror of the prerelease channel need not say "nightly".
+        $script:WoaTorchIsPrerelease = [bool]($_woaTorchVersion -match '(?i)\d(a|b|rc)\d|\.dev\d')
+        if ($_woaAudioVersion -and -not $script:WoaTorchAudio) {
+            substep "windows on arm: this index has torchaudio $_woaAudioVersion but torch $_woaTorchVersion; skipping torchaudio."
+        }
     }
 
     function Get-TauriTorchIndexFamily {
@@ -3483,7 +4488,10 @@ exit 0
         # win_arm64 wheel, so a native ARM64 Python source-builds both and dies on CMake /
         # Rust minutes in; x64 runs fine emulated. ARM64 is still returned when it is all
         # there is, and the caller then bootstraps x64 or warns.
-        $preferX64 = $X64Only -or ((Get-HostMachineArch) -eq "arm64")
+        # ARM64 first on a native host, so a leftover x64 interpreter does not capture the venv.
+        $preferArm64 = $script:WoaNativeCudaTorch -and -not $X64Only
+        $preferX64 = $X64Only -or ((Get-HostMachineArch) -eq "arm64" -and -not $preferArm64)
+        $rankByArch = $preferX64 -or $preferArm64
         $candidates = @()
         # Try the Python Launcher first (most reliable on Windows)
         # py.exe resolves to the standard CPython install, not conda.
@@ -3506,7 +4514,7 @@ exit 0
                         # Resolve the actual executable path and verify it is not conda-based
                         $resolvedExe = (& $pyLauncher.Source "-$minor" -S -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
                         if ($resolvedExe -and (Test-Path -LiteralPath $resolvedExe -PathType Leaf) -and -not (Test-IsCondaPython $resolvedExe)) {
-                            if (-not $preferX64) { return @{ Version = $ver; Path = $resolvedExe; Arch = "" } }
+                            if (-not $rankByArch) { return @{ Version = $ver; Path = $resolvedExe; Arch = "" } }
                             $candidates += @{ Version = $ver; Path = $resolvedExe }
                         }
                     }
@@ -3529,7 +4537,7 @@ exit 0
                         # Resolve the real executable so uv bypasses wrapper re-resolution.
                         $resolvedExe = (& $cmd.Source -S -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
                         if ($resolvedExe -and (Test-Path -LiteralPath $resolvedExe -PathType Leaf) -and -not (Test-IsCondaPython $resolvedExe)) {
-                            if (-not $preferX64) { return @{ Version = $ver; Path = $resolvedExe; Arch = "" } }
+                            if (-not $rankByArch) { return @{ Version = $ver; Path = $resolvedExe; Arch = "" } }
                             $candidates += @{ Version = $ver; Path = $resolvedExe }
                         }
                     }
@@ -3540,7 +4548,7 @@ exit 0
         # a same-minor x64 install that is neither preferred nor on PATH never becomes a
         # candidate. `-3.12-64` cannot disambiguate (deprecated, it only means "not
         # 32-bit"), so enumerate every registration with -0p and probe each path.
-        if ($preferX64) {
+        if ($rankByArch) {
             foreach ($pyLauncher in @(Get-Command py -All -CommandType Application -ErrorAction SilentlyContinue)) {
                 if ($pyLauncher.Source -match $script:CondaSkipPattern) { continue }
                 $listed = @()
@@ -3575,6 +4583,12 @@ exit 0
         foreach ($minor in $minors) {
             $sameMinor = @($candidates | Where-Object { $_.Version -eq $minor })
             if ($sameMinor.Count -eq 0) { continue }
+            if ($preferArm64) {
+                # x64 is still returned when no ARM64 build exists; the torch step re-checks the tag.
+                $arm = $sameMinor | Where-Object { $_.Arch -eq "arm64" } | Select-Object -First 1
+                if ($arm) { return $arm }
+                return $sameMinor[0]
+            }
             $x64 = $sameMinor | Where-Object { $_.Arch -eq "x86_64" } | Select-Object -First 1
             if ($x64) { return $x64 }
             if (-not $X64Only) { return $sameMinor[0] }
@@ -3711,6 +4725,12 @@ exit 0
 
     # ── Install Python if no compatible version (3.11-3.13) found ──
     Write-TauriLog "STEP" "Installing Python"
+    # Before choosing an interpreter: the answer flips Find-CompatiblePython's preference.
+    Initialize-WoaNativeCudaTorch -PythonMinor $PythonVersion
+    if ($script:WoaNativeCudaTorch) {
+        step "gpu" "Windows on ARM + NVIDIA: native CUDA wheels available -- installing the ARM64 stack" "Green"
+        substep "torch index: $(Remove-IndexUrlCredentials $script:WoaTorchIndexUrl)"
+    }
     $DetectedPython = Remove-SkippedPython (Find-CompatiblePython)
 
     if ($DetectedPython) {
@@ -3767,10 +4787,88 @@ exit 0
             return (Exit-InstallFailure "Python installation failed")
         }
     }
+    # Re-probe for the interpreter actually selected: every native decision is keyed to a cp3XX tag.
+    $WoaProbedMinor = $PythonVersion
+    # ABI as well as minor, or a 3.13t interpreter reuses the cp313 answer.
+    $WoaProbedFreeThreaded = $false
+    $WoaDetectedFreeThreaded = $false
+    if ($DetectedPython -and (Get-HostMachineArch) -eq "arm64") {
+        $WoaDetectedFreeThreaded = Test-PythonFreeThreaded -PythonExe $DetectedPython.Path
+    }
+    if ($DetectedPython -and (
+            ($DetectedPython.Version -ne $WoaProbedMinor) -or
+            ($WoaDetectedFreeThreaded -ne $WoaProbedFreeThreaded))) {
+        $WoaNativeBeforeReprobe = $script:WoaNativeCudaTorch
+        $WoaProbedMinor = $DetectedPython.Version
+        $WoaProbedFreeThreaded = $WoaDetectedFreeThreaded
+        Initialize-WoaNativeCudaTorch -PythonMinor $DetectedPython.Version `
+            -FreeThreaded $WoaDetectedFreeThreaded
+        if ($script:WoaNativeCudaTorch -ne $WoaNativeBeforeReprobe) {
+            # $null only if every candidate vanished between the passes; keep this one.
+            $ReselectedPython = Remove-SkippedPython (Find-CompatiblePython)
+            if ($ReselectedPython) {
+                # The reselection ranks the requested minor first, so it can hand back an interpreter the
+                # probe has not answered for (an ARM64 3.12 after 3.13 went native). That one is probed
+                # too; when it has no stack, the interpreter the probe accepted is kept and its answer restored.
+                $_woaReselectedFreeThreaded = $false
+                if ((Get-HostMachineArch) -eq "arm64") {
+                    $_woaReselectedFreeThreaded = Test-PythonFreeThreaded -PythonExe $ReselectedPython.Path
+                }
+                if (($ReselectedPython.Version -ne $WoaProbedMinor) -or
+                    ($_woaReselectedFreeThreaded -ne $WoaProbedFreeThreaded)) {
+                    Initialize-WoaNativeCudaTorch -PythonMinor $ReselectedPython.Version `
+                        -FreeThreaded $_woaReselectedFreeThreaded
+                    if ($script:WoaNativeCudaTorch) {
+                        $WoaProbedMinor = $ReselectedPython.Version
+                        $WoaProbedFreeThreaded = $_woaReselectedFreeThreaded
+                        $DetectedPython = $ReselectedPython
+                    } else {
+                        substep "windows on arm: Python $($ReselectedPython.Version) has no win_arm64 CUDA stack; keeping Python $($DetectedPython.Version), which has one." "Yellow"
+                        Initialize-WoaNativeCudaTorch -PythonMinor $WoaProbedMinor `
+                            -FreeThreaded $WoaProbedFreeThreaded
+                    }
+                } else {
+                    $DetectedPython = $ReselectedPython
+                }
+            }
+            if ($script:WoaNativeCudaTorch) {
+                step "gpu" "Windows on ARM + NVIDIA: native CUDA wheels available -- installing the ARM64 stack" "Green"
+                substep "torch index: $(Remove-IndexUrlCredentials $script:WoaTorchIndexUrl)"
+            } else {
+                substep "windows on arm: no win_arm64 CUDA stack for Python $($DetectedPython.Version) -- using the x64 stack." "Yellow"
+            }
+        }
+    }
+    # An emulated x64 python cannot load the win_arm64 wheels the probe just found.
+    if ($script:WoaNativeCudaTorch -and $DetectedPython -and $DetectedPython.Arch -eq "x86_64") {
+        substep "windows on arm: found an x64 Python $($DetectedPython.Version); installing the native ARM64 build..." "Yellow"
+        $Arm64Python = Install-PythonFromPythonOrg -Arch "arm64"
+        if ($Arm64Python -and $Arm64Python.Arch -ne "x86_64") {
+            $DetectedPython = $Arm64Python
+            step "python" "using native ARM64 Python $($DetectedPython.Version)"
+            # python.org installs $PythonVersion, not the minor the re-probe settled on.
+            $_woaNewFreeThreaded = Test-PythonFreeThreaded -PythonExe $DetectedPython.Path
+            if (($DetectedPython.Version -ne $WoaProbedMinor) -or
+                ($_woaNewFreeThreaded -ne $WoaProbedFreeThreaded)) {
+                $WoaProbedMinor = $DetectedPython.Version
+                $WoaProbedFreeThreaded = $_woaNewFreeThreaded
+                Initialize-WoaNativeCudaTorch -PythonMinor $DetectedPython.Version `
+                    -FreeThreaded $_woaNewFreeThreaded
+                if (-not $script:WoaNativeCudaTorch) {
+                    substep "windows on arm: no win_arm64 CUDA stack for Python $($DetectedPython.Version) -- using the x64 stack." "Yellow"
+                }
+            }
+        } else {
+            substep "could not install a native ARM64 Python; falling back to the x64 stack." "Yellow"
+            $script:WoaNativeCudaTorch = $false
+            $script:WoaTorchIndexUrl = $null
+        }
+    }
     # ── Windows on ARM: swap a native ARM64 interpreter for x64 ──
     # pyarrow and hf-transfer publish no win_arm64 wheel, so an ARM64 Python source-builds
-    # both and fails deep into the run. Warn up front if x64 is unobtainable.
-    if ($DetectedPython -and (Get-HostMachineArch) -eq "arm64" -and $DetectedPython.Arch -ne "x86_64") {
+    # both and fails deep into the run. Warn up front if x64 is unobtainable. Not on native.
+    if (-not $script:WoaNativeCudaTorch -and
+        $DetectedPython -and (Get-HostMachineArch) -eq "arm64" -and $DetectedPython.Arch -ne "x86_64") {
         substep "windows on arm: only a native ARM64 Python $($DetectedPython.Version) was found." "Yellow"
         substep "pyarrow and hf-transfer publish no win_arm64 wheels, so installing x64 Python..." "Yellow"
         $X64Python = Install-X64Python
@@ -4587,6 +5685,26 @@ exit 0
         $_Migrated = $true
     }
 
+    # A migrated environment has to be ARM64 too: an x64 one has a Triton that cannot do sm_121.
+    if ($script:WoaNativeCudaTorch -and $_Migrated -and (Test-Path -LiteralPath $VenvPython)) {
+        $_woaMigPlatform = ""
+        try {
+            $_woaMigPlatform = (& $VenvPython -c "import sysconfig; print(sysconfig.get_platform())" 2>$null | Out-String).Trim().ToLowerInvariant()
+        } catch { $_woaMigPlatform = "" }
+        if ($_woaMigPlatform -ne "win-arm64") {
+            $_woaMigLabel = if ($_woaMigPlatform) { $_woaMigPlatform } else { "unknown" }
+            substep "windows on arm: the migrated environment is $_woaMigLabel, not win-arm64 --" "Yellow"
+            substep "rebuilding it as ARM64; the previous one is kept for rollback." "Yellow"
+            try {
+                Start-StudioVenvRollback -ExistingDir $VenvDir
+                # Left set, the install step below would --no-deps into an empty venv.
+                $_Migrated = $false
+            } catch {
+                substep "could not preserve it for rollback -- using the x64 stack instead." "Yellow"
+            }
+        }
+    }
+
     if (-not (Test-Path -LiteralPath $VenvPython)) {
         step "venv" "creating Python $($DetectedPython.Version) virtual environment"
         substep "$VenvDir"
@@ -4603,6 +5721,377 @@ exit 0
     # Mark the managed venv before probing so failed installs can be replaced on rerun.
     if (Test-Path -LiteralPath $VenvDir -PathType Container) {
         try { [System.IO.File]::WriteAllText((Join-Path $VenvDir ".unsloth-studio-owned"), "") } catch {}
+    }
+
+    # The venv itself has to be ARM64 and nothing downstream re-checks: an x64 one aborts here.
+    $WoaVenvMinor = if ($DetectedPython) { $DetectedPython.Version } else { $PythonVersion }
+    if ($script:WoaNativeCudaTorch) {
+        $_woaVenvPlatform = ""
+        try {
+            $_woaVenvPlatform = (& $VenvPython -c "import sysconfig; print(sysconfig.get_platform())" 2>$null | Out-String).Trim().ToLowerInvariant()
+        } catch { $_woaVenvPlatform = "" }
+        if ($_woaVenvPlatform -ne "win-arm64") {
+            $_woaVenvLabel = if ($_woaVenvPlatform) { $_woaVenvPlatform } else { "unknown" }
+            substep "windows on arm: the existing environment is $_woaVenvLabel, not win-arm64 -- using the x64 stack." "Yellow"
+            $script:WoaNativeCudaTorch = $false
+            $script:WoaTorchIndexUrl = $null
+        } else {
+            $_woaVenvVersion = ""
+            try {
+                $_woaVenvVersion = (& $VenvPython -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null | Out-String).Trim()
+            } catch { $_woaVenvVersion = "" }
+            if ($_woaVenvVersion -match '^\d+\.\d+$') { $WoaVenvMinor = $_woaVenvVersion }
+            # And its ABI: the python tag alone keeps the wheels a free-threaded venv cannot use.
+            $script:WoaVenvFreeThreaded = Test-PythonFreeThreaded -PythonExe $VenvPython
+        }
+    }
+
+    # Drop what a PREVIOUS run left and nothing else, or an air-gapped user's mirror goes with it.
+    $_woaOwnedPrefix = Join-Path $StudioHome "woa"
+    $_woaOwnedPrefixes = @($_woaOwnedPrefix, (Get-UvSafePath $_woaOwnedPrefix)) |
+        Where-Object { $_ } | Select-Object -Unique
+    # Split with the separator it is joined with: a whitespace split tears "C:\a b" in two.
+    $_woaJoinWith = @{ "UV_OVERRIDE" = " "; "UV_FIND_LINKS" = ","; "PIP_FIND_LINKS" = " " }
+    $_woaSplitOn = @{ "UV_OVERRIDE" = '\s+'; "UV_FIND_LINKS" = ','; "PIP_FIND_LINKS" = '\s+' }
+    foreach ($_woaResolverVar in 'UV_OVERRIDE', 'UV_FIND_LINKS', 'PIP_FIND_LINKS') {
+        $_woaInherited = [Environment]::GetEnvironmentVariable($_woaResolverVar)
+        if (-not $_woaInherited) { continue }
+        $_woaSep = $_woaSplitOn[$_woaResolverVar]
+        $_woaKept = @()
+        foreach ($_woaEntry in ($_woaInherited -split $_woaSep | ForEach-Object { $_.Trim() })) {
+            if (-not $_woaEntry) { continue }
+            $_woaOwned = $false
+            foreach ($_woaPrefix in $_woaOwnedPrefixes) {
+                # The prefix or something under it, never a sibling: woa-mirror is theirs.
+                if ($_woaEntry.Equals($_woaPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $_woaEntry.StartsWith("$_woaPrefix\", [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $_woaEntry.StartsWith("$_woaPrefix/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $_woaOwned = $true
+                    break
+                }
+            }
+            if (-not $_woaOwned) { $_woaKept += $_woaEntry }
+        }
+        if ($_woaKept.Count -eq 0) {
+            Remove-Item "Env:$_woaResolverVar" -ErrorAction SilentlyContinue
+        } elseif ($_woaKept.Count -ne @($_woaInherited -split $_woaSep | ForEach-Object { $_.Trim() } | Where-Object { $_ }).Count) {
+            Set-Item "Env:$_woaResolverVar" -Value ($_woaKept -join $_woaJoinWith[$_woaResolverVar])
+        }
+    }
+    if ($script:WoaNativeCudaTorch) {
+        $WoaDir = Join-Path $StudioHome "woa"
+        $script:WoaDir = $WoaDir
+        $WoaWheelDir = Join-Path $WoaDir "wheels"
+        try {
+            New-Item -ItemType Directory -Force -Path $WoaWheelDir -ErrorAction Stop | Out-Null
+            # Checked, not assumed: with a file in the way New-Item can return without creating anything.
+            if (-not (Test-Path -LiteralPath $WoaWheelDir -PathType Container)) { throw "$WoaWheelDir was not created; a file may occupy part of the path" }
+        } catch {
+            # The venv is already native ARM64: standing down here would send the torch step to an
+            # index with no win_arm64 wheel. A stop with the reason, like the staging failure below.
+            Write-StudioLine "[ERROR] windows on arm: could not create $WoaWheelDir ($($_.Exception.Message)), and the native ARM64 environment cannot resolve without it." -ForegroundColor Red
+            Write-StudioLine "        Move aside whatever occupies that path, or set UNSLOTH_WOA_NATIVE=0 for the x64 stack." -ForegroundColor Yellow
+            return (Exit-InstallFailure "windows on arm: could not create $WoaWheelDir")
+        }
+    }
+    if ($script:WoaNativeCudaTorch) {
+        if ($script:WoaPyarrowSource -eq "local") {
+            $srcWheel = $env:UNSLOTH_PYARROW_WHEEL
+            $wheelName = [System.IO.Path]::GetFileName($srcWheel)
+            if ($wheelName -notlike "*.whl") {
+                $wheelName = Get-WheelFileNameFromArchive -Path $srcWheel
+            }
+            if (-not $wheelName) {
+                substep "UNSLOTH_PYARROW_WHEEL is not a readable wheel: $srcWheel" "Yellow"
+                $script:WoaNativeCudaTorch = $false
+            } else {
+                try {
+                    # Self-copy: uncaught, it disabled native mode after the ARM64 venv was chosen.
+                    $_woaLocalDest = Join-Path $WoaWheelDir $wheelName
+                    if (-not (Test-WoaSamePath $srcWheel $_woaLocalDest)) {
+                        Copy-Item -LiteralPath $srcWheel -Destination $_woaLocalDest -Force -ErrorAction Stop
+                    }
+                    $script:WoaPyarrowWheelName = $wheelName
+                    substep "windows on arm: using the supplied pyarrow wheel $wheelName"
+                } catch {
+                    substep "could not stage $srcWheel ($($_.Exception.Message))." "Yellow"
+                    $script:WoaNativeCudaTorch = $false
+                }
+            }
+        } elseif ($script:WoaPyarrowSource -eq "wheelhouse") {
+            $tag = "cp" + ($WoaVenvMinor -replace '\.', '')
+            $AbiTag = Get-WoaAbiTag -PythonMinor $WoaVenvMinor -FreeThreaded ([bool]$script:WoaVenvFreeThreaded)
+            if (Test-WoaWheelhouseIsLocal $script:WoaWheelhouse) {
+                # Same filter as the probe, or staging takes a file the probe never cleared.
+                $found = Get-ChildItem -LiteralPath $script:WoaWheelhouse -Filter "pyarrow-*win_arm64.whl" -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        (Test-WoaPyarrowWheelUsable -Name $_.Name -PyTag $tag -AbiTag $AbiTag) -and
+                        (Test-ZipArchiveReadable -Path $_.FullName)
+                    } | Select-Object -First 1
+                if ($found) {
+                    $_woaDest = Join-Path $WoaWheelDir $found.Name
+                    if (-not (Test-WoaSamePath $found.FullName $_woaDest)) {
+                        Copy-Item -LiteralPath $found.FullName -Destination $_woaDest -Force
+                    }
+                    $script:WoaPyarrowWheelName = $found.Name
+                    substep "windows on arm: using pyarrow wheel $($found.Name) from the wheelhouse"
+                } else {
+                    $script:WoaNativeCudaTorch = $false
+                }
+            } else {
+                $wheelName = $null
+                try {
+                    $index = [string](Invoke-RestMethod -Uri (Join-UrlPath $script:WoaWheelhouse "index.txt") -UseBasicParsing -TimeoutSec 20)
+                    foreach ($match in [regex]::Matches($index, 'pyarrow-[^"''<>\s]*?win_arm64\.whl')) {
+                        if (Test-WoaPyarrowWheelUsable -Name $match.Value -PyTag $tag -AbiTag $AbiTag) { $wheelName = $match.Value; break }
+                    }
+                } catch {}
+                if ($wheelName) {
+                    try {
+                        $_woaPaDest = Join-Path $WoaWheelDir $wheelName
+                        Invoke-WebRequest -Uri (Join-UrlPath $script:WoaWheelhouse $wheelName) -OutFile $_woaPaDest -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+                        # A mirror can serve a truncated body with a 200.
+                        if (-not (Test-ZipArchiveReadable -Path $_woaPaDest)) {
+                            Remove-Item -LiteralPath $_woaPaDest -Force -ErrorAction SilentlyContinue
+                            throw "the downloaded wheel is not a readable archive"
+                        }
+                        $script:WoaPyarrowWheelName = $wheelName
+                        substep "windows on arm: downloaded pyarrow wheel $wheelName"
+                    } catch {
+                        substep "could not download $wheelName ($($_.Exception.Message))." "Yellow"
+                        $script:WoaNativeCudaTorch = $false
+                    }
+                } else {
+                    $script:WoaNativeCudaTorch = $false
+                }
+            }
+        }
+        if (-not $script:WoaNativeCudaTorch) {
+            # The venv is already native ARM64, and without pyarrow neither the CUDA index nor the x64 one
+            # can resolve for it: the torch step would fail on the driver-derived index with no wheels.
+            Write-StudioLine "[ERROR] windows on arm: pyarrow could not be staged, and the native ARM64 environment cannot resolve without it." -ForegroundColor Red
+            Write-StudioLine "        Re-run the installer (a transient download is the usual cause), or set UNSLOTH_WOA_NATIVE=0 for the x64 stack." -ForegroundColor Yellow
+            return (Exit-InstallFailure "windows on arm: pyarrow could not be staged")
+        }
+    }
+    if ($script:WoaNativeCudaTorch) {
+        # Mirror the rest of the wheelhouse: anything here drops itself from the lists below.
+        $WoaExtraStaged = 0
+        $_woaExtraTag = "cp" + ($WoaVenvMinor -replace '\.', '')
+        $_woaExtraAbi = Get-WoaAbiTag -PythonMinor $WoaVenvMinor -FreeThreaded ([bool]$script:WoaVenvFreeThreaded)
+        if (Test-WoaWheelhouseIsLocal $script:WoaWheelhouse) {
+            foreach ($wheel in @(Get-ChildItem -LiteralPath $script:WoaWheelhouse -Filter "*.whl" -ErrorAction SilentlyContinue)) {
+                if ($wheel.Name -like "pyarrow-*") { continue }
+                if ($wheel.Name -notlike "*win_arm64*" -and $wheel.Name -notlike "*-any.whl") { continue }
+                if (Test-WoaWheelhouseWheelIsRedundant -Name $wheel.Name -PyTag $_woaExtraTag -AbiTag $_woaExtraAbi) {
+                    $_woaRedundantKey = (($wheel.Name -split '-')[0] -replace '[-_.]+', '-').ToLowerInvariant()
+                    if (-not $script:WoaPyPIProvided.ContainsKey($_woaRedundantKey)) { $script:WoaPyPIProvided[$_woaRedundantKey] = @() }
+                    $script:WoaPyPIProvided[$_woaRedundantKey] += [string]$script:WoaPyPIMatchedVersion
+                    substep "windows on arm: PyPI publishes $($wheel.Name) itself -- taking it from there, not the wheelhouse."
+                    # The managed copy too, or UV_FIND_LINKS still offers it and wins the tie.
+                    Remove-Item -LiteralPath (Join-Path $WoaWheelDir $wheel.Name) -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+                # Opened, not just named: _find_links_wheel_versions reads only the filename.
+                if (-not (Test-ZipArchiveReadable -Path $wheel.FullName)) {
+                    substep "windows on arm: $($wheel.Name) in the wheelhouse is not a readable wheel -- skipping it." "Yellow"
+                    continue
+                }
+                try {
+                    $_woaExtraDest = Join-Path $WoaWheelDir $wheel.Name
+                    if (-not (Test-WoaSamePath $wheel.FullName $_woaExtraDest)) {
+                        Copy-Item -LiteralPath $wheel.FullName -Destination $_woaExtraDest -Force -ErrorAction Stop
+                    }
+                    $WoaExtraStaged++
+                } catch {}
+            }
+        } else {
+            try {
+                $index = [string](Invoke-RestMethod -Uri (Join-UrlPath $script:WoaWheelhouse "index.txt") -UseBasicParsing -TimeoutSec 20)
+                foreach ($match in [regex]::Matches($index, '[A-Za-z0-9_.+-]+\.whl')) {
+                    $name = $match.Value
+                    if ($name -like "pyarrow-*") { continue }
+                    if ($name -notlike "*win_arm64*" -and $name -notlike "*-any.whl") { continue }
+                    if (Test-WoaWheelhouseWheelIsRedundant -Name $name -PyTag $_woaExtraTag -AbiTag $_woaExtraAbi) {
+                        $_woaRedundantKey = (($name -split '-')[0] -replace '[-_.]+', '-').ToLowerInvariant()
+                        if (-not $script:WoaPyPIProvided.ContainsKey($_woaRedundantKey)) { $script:WoaPyPIProvided[$_woaRedundantKey] = @() }
+                        $script:WoaPyPIProvided[$_woaRedundantKey] += [string]$script:WoaPyPIMatchedVersion
+                        substep "windows on arm: PyPI publishes $name itself -- taking it from there, not the wheelhouse."
+                        Remove-Item -LiteralPath (Join-Path $WoaWheelDir $name) -Force -ErrorAction SilentlyContinue
+                        continue
+                    }
+                    $dest = Join-Path $WoaWheelDir $name
+                    # Reused only if it opens, or every retry re-hands the resolver a partial download.
+                    if (Test-Path -LiteralPath $dest) {
+                        if (Test-ZipArchiveReadable -Path $dest) { $WoaExtraStaged++; continue }
+                        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+                    }
+                    try {
+                        Invoke-WebRequest -Uri (Join-UrlPath $script:WoaWheelhouse $name) -OutFile $dest -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+                        if (-not (Test-ZipArchiveReadable -Path $dest)) {
+                            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+                            continue
+                        }
+                        $WoaExtraStaged++
+                    } catch {
+                        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch {}
+        }
+        if ($WoaExtraStaged -gt 0) {
+            substep "windows on arm: staged $WoaExtraStaged more wheel(s) from the wheelhouse."
+        }
+    }
+    if ($script:WoaNativeCudaTorch) {
+        # Overrides for what win_arm64 cannot resolve: an AMD64-only line leaves x64 untouched.
+        $WoaOverrides = Join-Path $WoaDir "overrides.txt"
+        # A hosted wheel must not also be dropped, but only one tagged for THIS interpreter.
+        $WoaWheelTag = "cp" + ($WoaVenvMinor -replace '\.', '')
+        $WoaWheelAbi = Get-WoaAbiTag -PythonMinor $WoaVenvMinor -FreeThreaded ([bool]$script:WoaVenvFreeThreaded)
+        $WoaWheelStable = -not $script:WoaVenvFreeThreaded
+        $WoaWheelMinor = 0
+        if ($WoaVenvMinor -match '^\d+\.(\d+)') { $WoaWheelMinor = [int]$Matches[1] }
+        $WoaWheelNames = @{}
+        foreach ($wheel in @(Get-ChildItem -LiteralPath $WoaWheelDir -Filter "*.whl" -ErrorAction SilentlyContinue)) {
+            $parts = [System.IO.Path]::GetFileNameWithoutExtension($wheel.Name) -split '-'
+            if ($parts.Count -lt 5) { continue }
+            # Platform first: a win_amd64 wheel in the offline cache is not one this venv can use.
+            $platTags = $parts[-1] -split '\.'
+            if (-not (($platTags -contains 'win_arm64') -or ($platTags -contains 'any'))) { continue }
+            $abiTags = $parts[-2] -split '\.'
+            $compatible = $false
+            foreach ($pyTag in ($parts[-3] -split '\.')) {
+                # ABI too: uv rejects a cp313t wheel on a GIL interpreter.
+                if ($pyTag -eq $WoaWheelTag -and (
+                        ($abiTags -contains $WoaWheelAbi) -or
+                        ($WoaWheelStable -and ($abiTags -contains 'abi3')) -or
+                        ($abiTags -contains 'none'))) {
+                    $compatible = $true; break
+                }
+                if (($abiTags -contains 'none') -and ($pyTag -match '^py3(\d*)$')) {
+                    if ([string]::IsNullOrEmpty($Matches[1]) -or ([int]$Matches[1] -le $WoaWheelMinor)) {
+                        $compatible = $true; break
+                    }
+                }
+                if ($WoaWheelStable -and ($abiTags -contains 'abi3') -and ($pyTag -match '^cp3(\d+)$')) {
+                    if ([int]$Matches[1] -le $WoaWheelMinor) { $compatible = $true; break }
+                }
+            }
+            if (-not $compatible) { continue }
+            # Version too: the released metadata floors some of these.
+            $_woaWheelKey = ($parts[0] -replace '[-_.]+', '-').ToLowerInvariant()
+            if (-not $WoaWheelNames.ContainsKey($_woaWheelKey)) { $WoaWheelNames[$_woaWheelKey] = @() }
+            $WoaWheelNames[$_woaWheelKey] += $parts[1]
+        }
+        # Still available for win_arm64, or the drop list below excludes it on ARM64 entirely.
+        foreach ($_woaProvided in $script:WoaPyPIProvided.Keys) {
+            if (-not $WoaWheelNames.ContainsKey($_woaProvided)) { $WoaWheelNames[$_woaProvided] = @() }
+            $WoaWheelNames[$_woaProvided] += @($script:WoaPyPIProvided[$_woaProvided] | Where-Object { $_ })
+        }
+        # None of these has a win_arm64 wheel or a buildable sdist; httpx negotiates around brotli.
+        $WoaDropCandidates = @(
+            "hf-transfer", "hf_transfer", "xformers", "torchcodec",
+            "brotli", "brotlicffi"
+        )
+        # Only when the chosen index has no win_arm64 build; the GA channel does.
+        if (-not $script:WoaTorchAudio) { $WoaDropCandidates += "torchaudio" }
+        # Floors the RELEASED metadata puts on a drop candidate: below one, keep the drop.
+        $WoaDropFloors = @{ "xformers" = "0.0.22.post7" }
+        $WoaOverrideLines = @(
+            '# Generated by install.ps1 for Windows on ARM (win_arm64). See the WoA block there.'
+        )
+        # Both spellings reach the file; they are one package to the reader.
+        $WoaReported = @{}
+        foreach ($candidate in $WoaDropCandidates) {
+            $key = ($candidate -replace '[-_.]+', '-').ToLowerInvariant()
+            $_woaHosted = $false
+            if ($WoaWheelNames.ContainsKey($key)) {
+                $_woaFloor = $WoaDropFloors[$key]
+                if (-not $_woaFloor) { $_woaHosted = $true }
+                else {
+                    foreach ($_woaHostedVer in $WoaWheelNames[$key]) {
+                        if (Test-WoaVersionAtLeast -Version $_woaHostedVer -Floor $_woaFloor) { $_woaHosted = $true; break }
+                    }
+                    if (-not $_woaHosted -and -not $WoaReported.ContainsKey($key)) {
+                        $WoaReported[$key] = $true
+                        substep "windows on arm: the wheelhouse $key is below the required $_woaFloor -- keeping the drop." "Yellow"
+                    }
+                }
+            }
+            if ($_woaHosted) {
+                if (-not $WoaReported.ContainsKey($key)) {
+                    $WoaReported[$key] = $true
+                    substep "windows on arm: keeping $key (the wheelhouse provides a win_arm64 wheel)."
+                }
+                continue
+            }
+            $WoaOverrideLines += "$candidate ; platform_machine == `"AMD64`""
+        }
+        # Released unsloth metadata caps torch below the only win_arm64 CUDA build (a 2.15 nightly).
+        $WoaOverrideLines += 'torch>=2.4'
+        $WoaOverrideLines += 'torchvision>=0.19'
+        # Without this uv takes the newest pyarrow on PyPI, an sdist here. For the PyPI route too.
+        if ($script:WoaPyarrowWheelName -and $script:WoaPyarrowWheelName -match '^pyarrow-([^-]+)-') {
+            $WoaOverrideLines += "pyarrow==$($Matches[1])"
+        }
+        # uv COMBINES override files and two naming one package is an error: no overwrite, no append.
+        $_woaOwnNames = @{}
+        foreach ($_woaLine in $WoaOverrideLines) {
+            if ($_woaLine -match '^\s*(#|$)') { continue }
+            $_woaName = (($_woaLine -split '[\s<>=!~;@\[]', 2)[0]).Trim()
+            if ($_woaName) { $_woaOwnNames[($_woaName -replace '[-_.]+', '-').ToLowerInvariant()] = $true }
+        }
+        # Folding is the LAST resort: copying a line moves the base its relative paths resolve on.
+        $_woaKeepFiles = @()
+        if ($env:UV_OVERRIDE) {
+            foreach ($_woaOvFile in ($env:UV_OVERRIDE -split '\s+' | Where-Object { $_ })) {
+                if (-not (Test-Path -LiteralPath $_woaOvFile -PathType Leaf)) { continue }
+                try { $_woaOvFull = Convert-Path -LiteralPath $_woaOvFile } catch { continue }
+                # Includes followed: a conflict hidden in one is still a conflict.
+                $_woaOvEntries = @(Get-WoaRequirementEntries -Path $_woaOvFull)
+                $_woaOvConflicts = $false
+                foreach ($_woaOvEntry in $_woaOvEntries) {
+                    $_woaOvName = ((($_woaOvEntry.Line -split '[\s<>=!~;@\[]', 2)[0]).Trim() -replace '[-_.]+', '-').ToLowerInvariant()
+                    if ($_woaOvName -and $_woaOwnNames.ContainsKey($_woaOvName)) { $_woaOvConflicts = $true; break }
+                }
+                if (-not $_woaOvConflicts) {
+                    $_woaKeepFiles += $_woaOvFull
+                    continue
+                }
+                foreach ($_woaOvEntry in $_woaOvEntries) {
+                    $_woaOvName = ((($_woaOvEntry.Line -split '[\s<>=!~;@\[]', 2)[0]).Trim() -replace '[-_.]+', '-').ToLowerInvariant()
+                    if ($_woaOvName -and $_woaOwnNames.ContainsKey($_woaOvName)) { continue }
+                    $WoaOverrideLines += (Resolve-WoaOverrideLine -Line $_woaOvEntry.Line -BaseDir $_woaOvEntry.BaseDir)
+                }
+            }
+        }
+        # No BOM: uv reads these as plain requirements files.
+        [System.IO.File]::WriteAllLines($WoaOverrides, [string[]]$WoaOverrideLines, (New-Object System.Text.UTF8Encoding($false)))
+        $_woaOverrideValue = @(Get-UvSafePath $WoaOverrides)
+        foreach ($_woaKeepFile in $_woaKeepFiles) { $_woaOverrideValue += (Get-UvSafePath $_woaKeepFile) }
+        # Under `irm | iex` these are the caller's own session variables: snapshotted once here and put
+        # back when the installer returns, after the setup child and an autostarted Studio inherited them.
+        if ($null -eq $script:WoaResolverEnvSaved) {
+            $script:WoaResolverEnvSaved = @{
+                UV_OVERRIDE = $env:UV_OVERRIDE; UV_FIND_LINKS = $env:UV_FIND_LINKS; PIP_FIND_LINKS = $env:PIP_FIND_LINKS
+            }
+        }
+        $env:UV_OVERRIDE = ($_woaOverrideValue -join " ")
+        # Additive, ours first to win a tie. UV_FIND_LINKS is comma-separated, PIP_FIND_LINKS not.
+        $_woaCallerUvLinks = $env:UV_FIND_LINKS
+        $_woaCallerPipLinks = $env:PIP_FIND_LINKS
+        $env:UV_FIND_LINKS = if ($_woaCallerUvLinks) { "$WoaWheelDir,$_woaCallerUvLinks" } else { $WoaWheelDir }
+        $_woaSafeWheelDir = Get-UvSafePath $WoaWheelDir
+        $env:PIP_FIND_LINKS = if ($_woaCallerPipLinks) { "$_woaSafeWheelDir $_woaCallerPipLinks" } else { $_woaSafeWheelDir }
+        # install_python_stack.py falls back to pip when `uv` is missing, and pip has no UV_OVERRIDE.
+        $uvDir = $null
+        try { $uvDir = [System.IO.Path]::GetDirectoryName($script:UvExe) } catch {}
+        if ($uvDir -and (Test-Path -LiteralPath $uvDir -PathType Container) -and ($env:PATH -notlike "*$uvDir*")) {
+            $env:PATH = "$uvDir;$env:PATH"
+        }
+        step "windows on arm" "native ARM64 CUDA stack selected"
+        substep "overrides: $WoaOverrides"
     }
 
     if (-not (Test-VenvPythonReady -PythonExe $VenvPython)) {
@@ -4658,41 +6147,6 @@ exit 0
             } else {
                 $env:__COMPAT_LAYER = $prevCompat
             }
-        }
-    }
-
-    # ── Bound nvidia-smi so a wedged driver cannot hang the installer. ──
-    function Invoke-NvidiaSmiBounded {
-        param(
-            [Parameter(Mandatory = $true, Position = 0)][string]$Exe,
-            [Parameter(Position = 1)][string[]]$SmiArgs = @(),
-            [int]$TimeoutSec = 10,
-            # Driver warnings on stderr would corrupt machine-readable --query-gpu
-            # output; the human-readable probes keep the default merge.
-            [switch]$StdoutOnly
-        )
-        try {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $Exe
-            $psi.Arguments = ($SmiArgs -join ' ')
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.CreateNoWindow = $true
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            $outTask = $proc.StandardOutput.ReadToEndAsync()
-            $errTask = $proc.StandardError.ReadToEndAsync()
-            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-                try { $proc.Kill() } catch {}
-                $global:LASTEXITCODE = 124
-                return ""
-            }
-            $global:LASTEXITCODE = $proc.ExitCode
-            if ($StdoutOnly) { return $outTask.Result }
-            return ($outTask.Result + "`n" + $errTask.Result)
-        } catch {
-            $global:LASTEXITCODE = 1
-            return ""
         }
     }
 
@@ -5403,6 +6857,9 @@ exit 0
         if (-not [string]::IsNullOrWhiteSpace($env:UNSLOTH_TORCH_INDEX_FAMILY)) {
             return "$baseUrl/$($env:UNSLOTH_TORCH_INDEX_FAMILY.Trim().Trim('/'))"
         }
+        if ($script:WoaNativeCudaTorch -and $script:WoaTorchIndexUrl) {
+            return $script:WoaTorchIndexUrl
+        }
         if (-not $NvidiaSmiExe) { return "$baseUrl/cpu" }
         try {
             $output = Invoke-NvidiaSmiBounded $NvidiaSmiExe
@@ -5419,39 +6876,6 @@ exit 0
         } catch {}
         substep "could not determine CUDA version from nvidia-smi, defaulting to cu126" "Yellow"
         return "$baseUrl/cu126"
-    }
-
-    function Remove-IndexUrlCredentials {
-        param([string]$Url)
-        # Ordinal, not culture-aware: on non-English locales (e.g. th-TH) linguistic
-        # IndexOf treats "://" as ignorable, mis-locates it, and crashes Substring (issue #7279).
-        $sep = $Url.IndexOf('://', [System.StringComparison]::Ordinal)
-        if ($sep -lt 0) { return $Url }
-        $scheme = $Url.Substring(0, $sep)
-        $rest = $Url.Substring($sep + 3)
-        # Drop query / fragment (may hold auth tokens).
-        $q = $rest.IndexOfAny([char[]]('?', '#'))
-        if ($q -ge 0) { $rest = $rest.Substring(0, $q) }
-        $slash = $rest.IndexOf('/', [System.StringComparison]::Ordinal)
-        $authority = if ($slash -ge 0) { $rest.Substring(0, $slash) } else { $rest }
-        $at = $authority.LastIndexOf('@', [System.StringComparison]::Ordinal)
-        $host_ = if ($at -ge 0) { $authority.Substring($at + 1) } else { $authority }
-        if ($slash -ge 0) { return "${scheme}://${host_}$($rest.Substring($slash))" }
-        return "${scheme}://${host_}"
-    }
-
-    # Append a path to a URL that may carry ?query / #fragment auth. A private mirror is
-    # allowed to be "https://mirror/whl?token=abc", and a naive "$base/$leaf" put the leaf
-    # INSIDE the token value, leaving the path still /whl -- so the tokenized mirror this
-    # exists to honour was the one case that could not resolve a wheel.
-    function Join-UrlPath {
-        param([string]$Base, [string]$Path)
-        if ([string]::IsNullOrWhiteSpace($Base)) { return $Path }
-        $cut = $Base.IndexOfAny([char[]]('?', '#'))
-        if ($cut -lt 0) { return "$($Base.TrimEnd('/'))/$Path" }
-        $head = $Base.Substring(0, $cut).TrimEnd('/')
-        $tail = $Base.Substring($cut)
-        return "$head/$Path$tail"
     }
 
     # ── Torch flavor helpers (to repair a stale CPU / wrong-CUDA wheel) ──
@@ -5882,32 +7306,17 @@ exit 0
         $lines = @($pins | Where-Object { $_ -match '^torch' })
         if ($lines.Count -eq 0 -or $lines[0] -notmatch '^torch==') { return $null }
         # --overrides replaces any UV_OVERRIDE env file, so fold caller files in, minus their trio.
-        $ovDirs = @()
+        # REBASED as they are folded: uv resolves relative references against the containing file.
         if ($env:UV_OVERRIDE) {
             foreach ($ovFile in ($env:UV_OVERRIDE -split '\s+' | Where-Object { $_ })) {
-                if (Test-Path -LiteralPath $ovFile -PathType Leaf) {
-                    $ovFull = (Convert-Path -LiteralPath $ovFile)
-                    # ReadAllLines, not Get-Content: PS 5.1 decodes a BOM-less file with the ANSI
-                    # code page, turning a non-ASCII path into mojibake the UTF-8 write preserves.
-                    $lines += @([System.IO.File]::ReadAllLines($ovFull) | Where-Object {
-                        $_ -notmatch '^\s*torch(vision|audio)?([\s<>=!~;@[]|$)'
-                    })
-                    $ovDirs += (Split-Path -Parent $ovFull)
+                if (-not (Test-Path -LiteralPath $ovFile -PathType Leaf)) { continue }
+                foreach ($ovEntry in (Get-WoaRequirementEntries -Path $ovFile)) {
+                    if ($ovEntry.Line -match '^\s*torch(vision|audio)?([\s<>=!~;@[]|$)') { continue }
+                    $lines += (Resolve-WoaOverrideLine -Line $ovEntry.Line -BaseDir $ovEntry.BaseDir)
                 }
             }
         }
-        # uv resolves an override's relative references against THAT file's dir, so write the
-        # merge beside the caller's override; %TEMP% when there is none, several dirs, or read-only.
-        $f = $null
-        $ovDirs = @($ovDirs | Sort-Object -Unique)
-        if ($ovDirs.Count -eq 1) {
-            try {
-                $candidate = Join-Path $ovDirs[0] ("unsloth-torch-overrides-" + [guid]::NewGuid().ToString("N") + ".txt")
-                New-Item -ItemType File -Path $candidate -ErrorAction Stop | Out-Null
-                $f = $candidate
-            } catch { $f = $null }
-        }
-        if (-not $f) { $f = [System.IO.Path]::GetTempFileName() }
+        $f = [System.IO.Path]::GetTempFileName()
         # Track it the moment it exists: WriteAllText can throw and the outer cleanup would have
         # no path to remove, leaving a partial copy, authenticated URLs included, on disk.
         $script:TorchOverridesFile = $f
@@ -6107,10 +7516,48 @@ exit 0
             # resolve a mismatched 2.11.0 build. Mirrors install.sh.
             # The hoisted trio, so the vetted route window and the installed specs cannot drift.
             $_torchSpecs = @($_pinTorchSpec, $_pinVisionSpec, $_pinAudioSpec)
+            $_torchExtraArgs = @()
             if ($VenvPlatform -eq "win-arm64") {
-                substep "windows on arm: skipping torchaudio (upstream publishes no"
-                substep "win_arm64 wheel); torch and torchvision install normally."
+                if (-not $script:WoaTorchAudio) {
+                    substep "windows on arm: skipping torchaudio (upstream publishes no"
+                    substep "win_arm64 wheel); torch and torchvision install normally."
+                }
                 $_torchSpecs = @($_pinTorchSpec, $_pinVisionSpec)
+            }
+            # NVIDIA's out-of-tree builds sit above the usual ceiling, so lift it. Floors stay.
+            if ($script:WoaNativeCudaTorch -and $VenvPlatform -eq "win-arm64") {
+                # Pinned exactly with its local +cu tag: that version is on no other index.
+                $_torchSpecs = @()
+                $_torchSpecs += if ($script:WoaTorchWheelVersion) { "torch==$($script:WoaTorchWheelVersion)" } else { "torch>=2.4" }
+                $_torchSpecs += if ($script:WoaVisionWheelVersion) { "torchvision==$($script:WoaVisionWheelVersion)" } else { "torchvision>=0.19" }
+                if ($script:WoaTorchAudio) {
+                    $_torchSpecs += if ($script:WoaAudioWheelVersion) { "torchaudio==$($script:WoaAudioWheelVersion)" } else { "torchaudio>=2.4" }
+                    substep "windows on arm: this index publishes torchaudio; installing the full trio."
+                }
+                # NVIDIA's index publishes only the trio; the shared dependencies come from the index the
+                # caller's resolver policy names, public PyPI by default, and from the wheelhouse alone under no-index.
+                $_woaDependencyIndexArgs = @(Get-WoaDependencyIndexArgs)
+                $_torchExtraArgs = @("--index-strategy", "unsafe-best-match") + $_woaDependencyIndexArgs
+                # Invoke-InstallCommand clears UV_FIND_LINKS beside the other inherited index settings, so the
+                # staged wheelhouse is named on the command line; under no-index it is the only dependency source.
+                if ($script:WoaDir) {
+                    $_torchExtraArgs += @("--find-links", (Get-UvSafePath (Join-Path $script:WoaDir "wheels")))
+                }
+                if ($_woaDependencyIndexArgs.Count -eq 0) {
+                    substep "windows on arm: no-index is set, so torch's dependencies must come from the find-links wheelhouse."
+                } elseif ($_woaDependencyIndexArgs -notcontains "https://pypi.org/simple") {
+                    substep "windows on arm: torch's dependencies resolve from the configured index, not public PyPI."
+                }
+                # Only a prerelease channel needs this. The URL spelling is a second signal.
+                if ($script:WoaTorchIsPrerelease -or ($script:WoaTorchIndexUrl -match 'nightly')) {
+                    $_torchExtraArgs = @("--prerelease=allow") + $_torchExtraArgs
+                    substep "windows on arm: allowing prerelease torch (this index publishes win_arm64 CUDA wheels as nightlies)."
+                }
+            }
+            # Release preservation cannot run here: its kept specs have no win_arm64 build.
+            if ($script:PrevTorchPin -and $script:WoaNativeCudaTorch -and $VenvPlatform -eq "win-arm64") {
+                $script:PrevTorchPin = $null
+                Remove-Item Env:UNSLOTH_KEPT_TORCH -ErrorAction SilentlyContinue
             }
             if ($script:PrevTorchPin) {
                 $_keptTorch = $script:PrevTorchPin.TorchSpec; $_keptVision = $script:PrevTorchPin.VisionSpec; $_keptAudio = $script:PrevTorchPin.AudioSpec
@@ -6124,7 +7571,46 @@ exit 0
                 }
             }
             if (-not $script:PrevTorchPin) {
-                $torchInstallExit = Invoke-InstallCommandRetry -Label "install PyTorch" { & $script:UvExe pip install --python $VenvPython @_torchSpecs --default-index $TorchIndexUrl }
+                # Only where an exact pin is at stake; every other host keeps the overrides it had.
+                $_woaOverrideSaved = $null
+                $_woaOverrideSwapped = $false
+                $_woaOverrideTemps = @()
+                $_woaCutoffSaved = @{}
+                if ($script:WoaNativeCudaTorch -and $VenvPlatform -eq "win-arm64" -and $env:UV_OVERRIDE) {
+                    $_woaOverrideSaved = $env:UV_OVERRIDE
+                    $_woaStep = New-WoaTorchStepOverrideValue -Value $_woaOverrideSaved -Dir $script:WoaDir
+                    $env:UV_OVERRIDE = $_woaStep.Value
+                    $_woaOverrideTemps = @($_woaStep.Temps)
+                    $_woaOverrideSwapped = $true
+                }
+                if ($script:WoaNativeCudaTorch -and $VenvPlatform -eq "win-arm64") {
+                    # The probe read the index page, which carries no upload dates, and the pin is exact:
+                    # an upload cutoff would reject the selected wheel outright. Only this one command.
+                    foreach ($_woaCutoffName in @("UV_EXCLUDE_NEWER", "UV_EXCLUDE_NEWER_PACKAGE")) {
+                        $_woaCutoffValue = [string](Get-Item "Env:$_woaCutoffName" -ErrorAction SilentlyContinue).Value
+                        if ($_woaCutoffValue) {
+                            $_woaCutoffSaved[$_woaCutoffName] = $_woaCutoffValue
+                            Remove-Item "Env:$_woaCutoffName" -ErrorAction SilentlyContinue
+                            substep "windows on arm: $_woaCutoffName is not applied to the exact CUDA pin (the index carries no upload dates)."
+                        }
+                    }
+                    # --no-index ignores every registry index, the selected CUDA one included, so the trio could not
+                    # install at all. It yields for this one command: torch comes from the index the probe chose, and
+                    # the dependencies from the wheelhouse alone, since Get-WoaDependencyIndexArgs named no other source.
+                    $_woaNoIndexValue = [string](Get-Item "Env:UV_NO_INDEX" -ErrorAction SilentlyContinue).Value
+                    if ($_woaNoIndexValue -and ($_woaNoIndexValue.Trim().ToLowerInvariant() -notin @("", "0", "false"))) {
+                        $_woaCutoffSaved["UV_NO_INDEX"] = $_woaNoIndexValue
+                        Remove-Item "Env:UV_NO_INDEX" -ErrorAction SilentlyContinue
+                        substep "windows on arm: UV_NO_INDEX yields for the CUDA trio, which only the selected index carries; its dependencies still come from the wheelhouse."
+                    }
+                }
+                try {
+                    $torchInstallExit = Invoke-InstallCommandRetry -Label "install PyTorch" { & $script:UvExe pip install --python $VenvPython @_torchSpecs --default-index $TorchIndexUrl @_torchExtraArgs }
+                } finally {
+                    if ($_woaOverrideSwapped) { $env:UV_OVERRIDE = $_woaOverrideSaved }
+                    foreach ($_woaTmp in $_woaOverrideTemps) { Remove-Item -LiteralPath $_woaTmp -Force -ErrorAction SilentlyContinue }
+                    foreach ($_woaCutoffName in @($_woaCutoffSaved.Keys)) { Set-Item "Env:$_woaCutoffName" $_woaCutoffSaved[$_woaCutoffName] }
+                }
             }
             if ($torchInstallExit -ne 0) {
                 Write-StudioLine "[ERROR] Failed to install PyTorch (exit code $torchInstallExit)" -ForegroundColor Red
@@ -6483,6 +7969,26 @@ sys.exit(2 if conflict else (0 if installed else 1))
         }
     }
 
+    # This script is fetched live while `unsloth` comes from PyPI, so setup.ps1 can predate ARM64
+    # support. Tested by capability, not version.
+    if ($script:WoaNativeCudaTorch) {
+        $WoaStudioSetup = $null
+        try {
+            $WoaStudioSetup = (& $VenvPython -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent / 'setup.ps1')" 2>$null | Select-Object -First 1)
+        } catch {}
+        $WoaStudioAware = $false
+        if ($WoaStudioSetup -and (Test-Path -LiteralPath $WoaStudioSetup -PathType Leaf)) {
+            $WoaStudioAware = [bool](Select-String -LiteralPath $WoaStudioSetup -Pattern 'WinArm64Venv' -Quiet)
+        }
+        if (-not $WoaStudioAware) {
+            Write-StudioLine "[ERROR] This unsloth release predates Windows-on-ARM support." -ForegroundColor Red
+            Write-StudioLine "        The installed studio setup would replace the ARM64 CUDA PyTorch just installed" -ForegroundColor Yellow
+            Write-StudioLine "        with a build that has no win_arm64 wheel, leaving the environment without torch." -ForegroundColor Yellow
+            Write-StudioLine "        Upgrade to a newer unsloth, or re-run with UNSLOTH_WOA_NATIVE=0 for the x64 path." -ForegroundColor Yellow
+            return (Exit-InstallFailure "installed unsloth has no Windows-on-ARM support")
+        }
+    }
+
     # ── Run studio setup ──
     # setup.ps1 will handle installing Git, CMake, Visual Studio Build Tools,
     # CUDA Toolkit, and other dependencies automatically via winget. Node.js is
@@ -6566,6 +8072,12 @@ sys.exit(2 if conflict else (0 if installed else 1))
     $hadPreviousInstallRollbackManaged = ($null -ne $previousInstallRollbackManaged)
     $previousSetupPython = $env:UNSLOTH_SETUP_PYTHON
     $hadPreviousSetupPython = ($null -ne $previousSetupPython)
+    $previousWoaHasTorchaudio = $env:UNSLOTH_WOA_HAS_TORCHAUDIO
+    $hadPreviousWoaHasTorchaudio = ($null -ne $previousWoaHasTorchaudio)
+    $previousWoaTorchPrerelease = $env:UNSLOTH_WOA_TORCH_PRERELEASE
+    $hadPreviousWoaTorchPrerelease = ($null -ne $previousWoaTorchPrerelease)
+    $previousWoaSelectedTorchIndex = $env:UNSLOTH_WOA_SELECTED_TORCH_INDEX
+    $hadPreviousWoaSelectedTorchIndex = ($null -ne $previousWoaSelectedTorchIndex)
     try {
         $env:SKIP_STUDIO_BASE = "1"
         $env:STUDIO_PACKAGE_NAME = $PackageName
@@ -6578,6 +8090,16 @@ sys.exit(2 if conflict else (0 if installed else 1))
         # keeps it present and blank, 5.1 / 7.0-7.4 remove it, and setup.ps1 treats both as unknown.
         $env:UNSLOTH_INSTALLER_TORCH_TAG = if ($SkipTorch) { "" } else {
             [string](Get-ExpectedTorchFlavorTag -TorchIndexUrl $TorchIndexUrl -ROCmIndexUrl $ROCmIndexUrl)
+        }
+        # Windows on ARM: whether this run's index paired a torchaudio, whether that torch is a
+        # prerelease (the URL alone misses a quiet mirror), and WHICH index. Not
+        # UNSLOTH_WOA_TORCH_INDEX_URL, which a later run would read as a pin.
+        $env:UNSLOTH_WOA_HAS_TORCHAUDIO = if ($script:WoaNativeCudaTorch -and $script:WoaTorchAudio) { "1" } else { "0" }
+        $env:UNSLOTH_WOA_TORCH_PRERELEASE = if ($script:WoaNativeCudaTorch -and $script:WoaTorchIsPrerelease) { "1" } else { "0" }
+        if ($script:WoaNativeCudaTorch -and $script:WoaTorchIndexUrl) {
+            $env:UNSLOTH_WOA_SELECTED_TORCH_INDEX = $script:WoaTorchIndexUrl
+        } else {
+            Remove-Item Env:UNSLOTH_WOA_SELECTED_TORCH_INDEX -ErrorAction SilentlyContinue
         }
         # Tauri desktop app bundles its own frontend — skip Node/npm/frontend build
         $env:SKIP_STUDIO_FRONTEND = if ($TauriMode) { "1" } else { "0" }
@@ -6721,6 +8243,13 @@ sys.exit(2 if conflict else (0 if installed else 1))
             $env:UNSLOTH_SETUP_PYTHON = $previousSetupPython
         } else {
             Remove-Item Env:UNSLOTH_SETUP_PYTHON -ErrorAction SilentlyContinue
+        }
+        foreach ($_woaPair in @(
+                @("UNSLOTH_WOA_HAS_TORCHAUDIO", $hadPreviousWoaHasTorchaudio, $previousWoaHasTorchaudio),
+                @("UNSLOTH_WOA_TORCH_PRERELEASE", $hadPreviousWoaTorchPrerelease, $previousWoaTorchPrerelease),
+                @("UNSLOTH_WOA_SELECTED_TORCH_INDEX", $hadPreviousWoaSelectedTorchIndex, $previousWoaSelectedTorchIndex))) {
+            if ($_woaPair[1]) { Set-Item "Env:$($_woaPair[0])" $_woaPair[2] }
+            else { Remove-Item "Env:$($_woaPair[0])" -ErrorAction SilentlyContinue }
         }
     }
     # $null, not a code: Application Control refused to create the process, so there is
@@ -6992,10 +8521,21 @@ sys.exit(2 if conflict else (0 if installed else 1))
 }
 
 # Under `irm | iex` the script scope IS the caller's session; an earlier value must not leak.
+$script:WoaResolverEnvSaved = $null
 $script:TorchOverridesFile = $null
 try {
     Install-UnslothStudio @args
 } finally {
+    # The resolver variables exported for the native ARM64 stack are process-scoped, so the caller's own
+    # `uv pip` in this session would otherwise keep resolving with Studio's overrides and wheelhouse.
+    if ($script:WoaResolverEnvSaved) {
+        foreach ($_woaEnvName in @($script:WoaResolverEnvSaved.Keys)) {
+            $_woaEnvValue = $script:WoaResolverEnvSaved[$_woaEnvName]
+            if ($null -eq $_woaEnvValue) { Remove-Item "Env:$_woaEnvName" -ErrorAction SilentlyContinue }
+            else { Set-Item "Env:$_woaEnvName" $_woaEnvValue }
+        }
+        $script:WoaResolverEnvSaved = $null
+    }
     # UNSLOTH_KEPT_TORCH is a process-scoped handoff, and the session outlives the installer.
     Remove-Item Env:UNSLOTH_KEPT_TORCH -ErrorAction SilentlyContinue
     # The generated overrides file copies the caller's UV_OVERRIDE contents; never leave it.
