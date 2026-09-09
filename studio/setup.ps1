@@ -4916,6 +4916,206 @@ function Fast-Download {
 # ── Check if Python deps need updating ──
 # Compare installed package version against PyPI latest.
 # Skip all Python dependency work if versions match (fast update path).
+# Does the venv on disk claim, and prove, a finished install?
+#
+# Two callers ask for opposite reasons: the incomplete-install guard forces the dependency
+# pass when this says no, and the offline rule below keeps the fast path when it says yes.
+# One implementation, so those two can never disagree about what "complete" means.
+function Test-StudioInstallVerified {
+    try {
+        & python -c "
+import os, sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import install_manifest
+except Exception:
+    # Present but unimportable is damage, not an old release, and this is the
+    # one file whose damage silences every check below. Absent keeps the old
+    # escape: separating it from an old tree needs a RECORD walk here, and the
+    # CLI already reports studio_install_manifest_missing.
+    sys.exit(1 if os.path.isfile(os.path.join(sys.argv[1], 'install_manifest.py')) else 0)
+try:
+    ok = install_manifest.verify_install(deep = True)['ok']
+except TypeError:
+    ok = install_manifest.verify_install()['ok']  # older tree, no payload scan
+sys.exit(0 if ok else 1)
+" "$PSScriptRoot" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+# UV_OFFLINE is uv's own "there is no network" switch, and every install command this script
+# runs goes through uv. Same boolish spelling the POSIX side accepts.
+function Test-UvOfflineRequested {
+    $value = "$($env:UV_OFFLINE)".Trim()
+    return @('1', 'true', 'yes', 'on') -contains $value.ToLowerInvariant()
+}
+
+function Invoke-FastPathEscapes {
+    # Every reason an "up to date" package on disk is still not a working install. Both
+    # callers that can keep the fast path -- the version compare below and the UV_OFFLINE
+    # rule after it -- run this, so an offline skip is held to exactly the bar an online one
+    # is held to. While these lived inline in the version compare alone, an offline update
+    # of a venv below the desktop backend floor (or carrying the anyio or tokenizers damage,
+    # or stranded on a CPU wheel under an XPU pin) reported success and repaired nothing:
+    # only the dependency pass acts on any of it.
+    #
+    # Two things deliberately stay out. Test-StudioInstallVerified, because both callers ask
+    # it for themselves and word the same answer differently, so a shared copy would have to
+    # drop one of the two messages. And the AMD/ROCm probe, which now sits after the whole
+    # if/elseif chain gated on $SkipPythonDeps -- exactly where setup.sh has always kept it,
+    # and reaching both branches for the same reason.
+    #
+    # Scope: a plain assignment inside a function creates a LOCAL, which would silently throw
+    # away everything decided here. Rather than $script:-prefix every arm -- one missed prefix
+    # and the escape is a no-op -- the flag is copied in, written unqualified by the arms
+    # exactly as they did inline, and published once on the way out.
+    $SkipPythonDeps = $script:SkipPythonDeps
+
+    # The documented escape hatch, and the first arm because it is the only one a user can
+    # reach: install_python_stack.py honours UNSLOTH_STUDIO_FULL_DEPS in _full_deps_requested
+    # ("A skip nobody can turn off is a bug nobody can work around"), but that file is never
+    # invoked when the version compare above sets $SkipPythonDeps, so setting it did nothing
+    # for exactly the install it exists for -- one that is "up to date" and still broken.
+    # First also means the bounded probes below cannot cost anything once the answer is
+    # settled. Spelled inline rather than as a Test-FullDepsRequested helper so this function
+    # stays the self-contained unit the tests slice out of the file, but the accepted values
+    # are Test-UvOfflineRequested's: trimmed, case-insensitive 1/true/yes/on.
+    $_fullDepsRequested = "$($env:UNSLOTH_STUDIO_FULL_DEPS)".Trim()
+    if (@('1', 'true', 'yes', 'on') -contains $_fullDepsRequested.ToLowerInvariant()) {
+        substep "UNSLOTH_STUDIO_FULL_DEPS is set -- forcing dependency pass..." "Cyan"
+        $SkipPythonDeps = $false
+    }
+
+    # A pre-#6483 install stuck on anyio>=4.14 would skip the repair (#6797), so force it.
+    $_anyioBad = $false
+    try {
+        & python -c "
+import re, sys
+from importlib.metadata import version, PackageNotFoundError
+try:
+    parts = version('anyio').split('.')
+    major = int(parts[0])
+    minor = int(re.sub(r'[^0-9].*', '', parts[1])) if len(parts) > 1 else 0
+except (PackageNotFoundError, ValueError, IndexError):
+    sys.exit(1)
+sys.exit(0 if (major, minor) >= (4, 14) else 1)
+" 2>$null
+        if ($LASTEXITCODE -eq 0) { $_anyioBad = $true }
+    } catch {}
+    if ($_anyioBad) {
+        substep "anyio >=4.14 found (#6483) -- forcing dependency pass to repair..." "Cyan"
+        $SkipPythonDeps = $false
+    }
+    # Same shape, same reason, and the sibling of the probe setup.sh runs: a venv
+    # installed before the tokenizers pin can hold a tokenizers the installed
+    # transformers rejects at import, which takes down every `import transformers`
+    # and so the whole model stack, while $_PkgName itself is current. Without this
+    # the fast path reports "up to date" and repairs nothing. Ask the metadata, not
+    # an import: the import is what is broken. Any unreadable half exits 1 and
+    # changes nothing.
+    $_tokenizersBad = $false
+    try {
+        & python -c "
+import sys
+from importlib.metadata import PackageNotFoundError, requires, version
+try:
+    from packaging.requirements import Requirement
+    installed = version('tokenizers')
+    windows = [
+        req.specifier
+        for req in (Requirement(raw) for raw in (requires('transformers') or []))
+        if req.name == 'tokenizers' and req.marker is None
+    ]
+except (PackageNotFoundError, ImportError, ValueError, IndexError):
+    sys.exit(1)
+sys.exit(0 if windows and installed not in windows[0] else 1)
+" 2>$null
+        if ($LASTEXITCODE -eq 0) { $_tokenizersBad = $true }
+    } catch {}
+    if ($_tokenizersBad) {
+        substep "installed transformers rejects the installed tokenizers -- forcing dependency pass to repair..." "Cyan"
+        $SkipPythonDeps = $false
+    }
+    # If the desktop app specifies a minimum required backend version and the installed
+    # package is older than that requirement, force the dependency pass to upgrade it.
+    if ($env:UNSLOTH_DESKTOP_BACKEND_VERSION) {
+        $_desktopVerBad = $false
+        try {
+            & python -c "
+import re, sys
+try:
+    from packaging.version import parse as parse_v
+except ImportError:
+    def parse_v(v):
+        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', (v or '').strip())
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
+installed = parse_v(sys.argv[1])
+required = parse_v(sys.argv[2])
+sys.exit(0 if installed is not None and required is not None and installed >= required else 1)
+" "$InstalledVer" "$env:UNSLOTH_DESKTOP_BACKEND_VERSION" 2>$null
+            if ($LASTEXITCODE -ne 0) { $_desktopVerBad = $true }
+        } catch {}
+        if ($_desktopVerBad) {
+            substep "$_PkgName $InstalledVer < $env:UNSLOTH_DESKTOP_BACKEND_VERSION (required by desktop app) -- forcing dependency pass to update..." "Cyan"
+            $SkipPythonDeps = $false
+        }
+    }
+    # ...and the same for an Intel Arc / Data Center GPU, or an up-to-date package on a CPU
+    # wheel stays on CPU torch forever. $SkipPythonDeps is re-tested so an escape taken above
+    # does not read twice. Both escapes below exist to reach the XPU install and its two
+    # remediations, all three gated on $XpuIndexUrl (set only when the resolved leaf is xpu),
+    # so $_xpuIsReachable holds them back where a pin or no-torch mode sends this host
+    # elsewhere and clearing the fast path would install nothing and re-fire forever.
+    $_pinLeafNow = Get-TorchIndexLeaf (Get-PinnedTorchIndexUrl)
+    $_xpuIsReachable = (-not $NoTorchMode) -and ((-not $_pinLeafNow) -or ($_pinLeafNow -eq "xpu"))
+    if ($script:IsIntelXpu -and $SkipPythonDeps -and $_xpuIsReachable) {
+        # The WHEEL, not the runtime: torch.xpu.is_available() is also false for a supported
+        # +xpu wheel on a wedged driver, and the dependency pass cannot repair a driver, so
+        # keying on it would force a full resolution every update for nothing.
+        if (-not (Test-VenvTorchIsXpuSupported -VenvPath $VenvDir)) {
+            substep "Intel GPU detected but installed PyTorch is not a supported XPU build -- reinstalling XPU PyTorch" "Cyan"
+            $SkipPythonDeps = $false
+        }
+    }
+    # Keyed off the installed wheel as well as the scan: an explicit xpu pin on a host the
+    # scan skips (a mixed NVIDIA + Intel box) still ends up on XPU with $script:IsIntelXpu
+    # false. The bitsandbytes floor and the Triton replacement live in the dependency pass
+    # below, so a venv that reached +xpu without them would fast-path past them forever.
+    if ($SkipPythonDeps -and $_xpuIsReachable -and ($script:IsIntelXpu -or $installedTorchTag -eq "xpu")) {
+        $_xpuDepsCode = "import importlib.metadata as m; " +
+            "print('BNB=' + next((d.version for d in m.distributions() " +
+            "if (d.metadata['Name'] or '').lower() == 'bitsandbytes'), '')); " +
+            "print('TRITONWIN=' + next((d.version for d in m.distributions() " +
+            "if (d.metadata['Name'] or '').lower().replace('_','-') == 'triton-windows'), ''))"
+        $_xpuDeps = Invoke-BoundedPythonProbe -PythonExe "python" -Code $_xpuDepsCode
+        if (-not $_xpuDeps.Ok) {
+            # A probe that did not answer says nothing about the venv, and reading that as
+            # "dependencies are current" would fast-path past both remediations forever.
+            # Same direction as an unparseable version below: one extra pass.
+            substep "Intel XPU dependencies could not be read -- running the dependency pass" "Cyan"
+            $SkipPythonDeps = $false
+        } else {
+            $_bnbVer = if ($_xpuDeps.Output -match '(?m)^BNB=(\S+)\s*$') { $Matches[1] } else { "" }
+            # An unreadable version is treated as stale, the safe direction: one extra pass,
+            # never a venv left without 4-bit kernels. Trailing suffixes (0.51.0.dev0) are
+            # dropped, not cast.
+            $_bnbNum = ($_bnbVer -replace '[^0-9.].*$', '').TrimEnd('.')
+            $_bnbStale = $true
+            if ($_bnbNum -match '^\d+\.\d+') {
+                try { $_bnbStale = [version]$_bnbNum -lt [version]"0.50.0" } catch {}
+            }
+            $_tritonWinPresent = $_xpuDeps.Output -match '(?m)^TRITONWIN=\S+\s*$'
+            if ($_bnbStale -or $_tritonWinPresent) {
+                substep "Intel XPU dependencies are stale -- running the dependency pass" "Cyan"
+                $SkipPythonDeps = $false
+            }
+        }
+    }
+
+    $script:SkipPythonDeps = $SkipPythonDeps
+}
+
 $_PkgName = if ($env:STUDIO_PACKAGE_NAME) { $env:STUDIO_PACKAGE_NAME } else { "unsloth" }
 $SkipPythonDeps = $false
 
@@ -4945,108 +5145,53 @@ sys.exit(2 if conflict else (0 if version else 1))
     } elseif ($InstalledVer -and $LatestVer -and ($InstalledVer -eq $LatestVer)) {
         step "python" "$_PkgName $InstalledVer is up to date"
         $SkipPythonDeps = $true
-        # A pre-#6483 install stuck on anyio>=4.14 would skip the repair (#6797), so force it.
-        $_anyioBad = $false
-        try {
-            & python -c "
-import re, sys
-from importlib.metadata import version, PackageNotFoundError
-try:
-    parts = version('anyio').split('.')
-    major = int(parts[0])
-    minor = int(re.sub(r'[^0-9].*', '', parts[1])) if len(parts) > 1 else 0
-except (PackageNotFoundError, ValueError, IndexError):
-    sys.exit(1)
-sys.exit(0 if (major, minor) >= (4, 14) else 1)
-" 2>$null
-            if ($LASTEXITCODE -eq 0) { $_anyioBad = $true }
-        } catch {}
-        if ($_anyioBad) {
-            substep "anyio >=4.14 found (#6483) -- forcing dependency pass to repair..." "Cyan"
-            $SkipPythonDeps = $false
-        }
-        # Same shape, same reason, and the sibling of the probe setup.sh runs: a venv
-        # installed before the tokenizers pin can hold a tokenizers the installed
-        # transformers rejects at import, which takes down every `import transformers`
-        # and so the whole model stack, while $_PkgName itself is current. Without this
-        # the fast path reports "up to date" and repairs nothing. Ask the metadata, not
-        # an import: the import is what is broken. Any unreadable half exits 1 and
-        # changes nothing.
-        $_tokenizersBad = $false
-        try {
-            & python -c "
-import sys
-from importlib.metadata import PackageNotFoundError, requires, version
-try:
-    from packaging.requirements import Requirement
-    installed = version('tokenizers')
-    windows = [
-        req.specifier
-        for req in (Requirement(raw) for raw in (requires('transformers') or []))
-        if req.name == 'tokenizers' and req.marker is None
-    ]
-except (PackageNotFoundError, ImportError, ValueError, IndexError):
-    sys.exit(1)
-sys.exit(0 if windows and installed not in windows[0] else 1)
-" 2>$null
-            if ($LASTEXITCODE -eq 0) { $_tokenizersBad = $true }
-        } catch {}
-        if ($_tokenizersBad) {
-            substep "installed transformers rejects the installed tokenizers -- forcing dependency pass to repair..." "Cyan"
-            $SkipPythonDeps = $false
-        }
         # An interrupted install leaves $_PkgName current while studio.txt
         # never finished, so the compare above says "up to date" and update --
         # plus the desktop Repair button -- no-ops on a venv that cannot boot.
-        $_studioInstallIncomplete = $false
-        try {
-            & python -c "
-import os, sys
-sys.path.insert(0, sys.argv[1])
-try:
-    import install_manifest
-except Exception:
-    # Present but unimportable is damage, not an old release, and this is the
-    # one file whose damage silences every check below. Absent keeps the old
-    # escape: separating it from an old tree needs a RECORD walk here, and the
-    # CLI already reports studio_install_manifest_missing.
-    sys.exit(1 if os.path.isfile(os.path.join(sys.argv[1], 'install_manifest.py')) else 0)
-try:
-    ok = install_manifest.verify_install(deep = True)['ok']
-except TypeError:
-    ok = install_manifest.verify_install()['ok']  # older tree, no payload scan
-sys.exit(0 if ok else 1)
-" "$PSScriptRoot" 2>$null
-            if ($LASTEXITCODE -ne 0) { $_studioInstallIncomplete = $true }
-        } catch {}
+        $_studioInstallIncomplete = -not (Test-StudioInstallVerified)
         if ($_studioInstallIncomplete) {
             substep "studio install incomplete -- forcing dependency pass to repair..." "Cyan"
             $SkipPythonDeps = $false
         }
-        # If the desktop app specifies a minimum required backend version and the installed
-        # package is older than that requirement, force the dependency pass to upgrade it.
-        if ($env:UNSLOTH_DESKTOP_BACKEND_VERSION) {
-            $_desktopVerBad = $false
-            try {
-                & python -c "
-import re, sys
-try:
-    from packaging.version import parse as parse_v
-except ImportError:
-    def parse_v(v):
-        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', (v or '').strip())
-        return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
-installed = parse_v(sys.argv[1])
-required = parse_v(sys.argv[2])
-sys.exit(0 if installed is not None and required is not None and installed >= required else 1)
-" "$InstalledVer" "$env:UNSLOTH_DESKTOP_BACKEND_VERSION" 2>$null
-                if ($LASTEXITCODE -ne 0) { $_desktopVerBad = $true }
-            } catch {}
-            if ($_desktopVerBad) {
-                substep "$_PkgName $InstalledVer < $env:UNSLOTH_DESKTOP_BACKEND_VERSION (required by desktop app) -- forcing dependency pass to update..." "Cyan"
-                $SkipPythonDeps = $false
-            }
+        # ...and every remaining escape, shared verbatim with the offline rule below so the
+        # two branches can never disagree about what an up-to-date install owes.
+        Invoke-FastPathEscapes
+    } elseif ($InstalledVer -and $LatestVer) {
+        substep "$_PkgName $InstalledVer -> $LatestVer available, updating..."
+    } elseif (-not $LatestVer) {
+        # PyPI unreachable. Updating to be safe stays the default -- an unreachable PyPI is
+        # usually a blip, and a pass over a warm cache is cheap.
+        #
+        # UV_OFFLINE is the exception, because it is not a blip: the caller has declared there
+        # is no network, uv refuses to reach one, and so every install command that pass would
+        # run can only fail. The choice is between a pass that cannot work and keeping what is
+        # on disk, and keeping it is only defensible on the same evidence the incomplete-install
+        # guard demands -- so ask the same question.
+        #
+        # ...and then the same escapes the up-to-date branch takes. A verified tree is not the
+        # whole bar: the desktop backend floor, the anyio and tokenizers damage and a CPU wheel
+        # under an XPU pin all describe an install that verifies and still cannot do its job,
+        # and a skip here that ducked them would repair nothing while reporting success.
+        if ($InstalledVer -and (Test-UvOfflineRequested) -and (Test-StudioInstallVerified)) {
+            substep "PyPI is unreachable and UV_OFFLINE is set -- keeping the verified install"
+            $SkipPythonDeps = $true
+            Invoke-FastPathEscapes
+        } else {
+            substep "could not reach PyPI, updating to be safe..."
         }
+    }
+
+    # A current package can still have CPU torch on an AMD host, because nothing above
+    # looks at the wheel's flavour. Placed after the chain and gated on the flag rather
+    # than hoisted into Invoke-FastPathEscapes, so that it covers the UV_OFFLINE branch
+    # too and lands in the same place setup.sh keeps it: there the equivalent block sits
+    # after the whole if/elif chain under `[ "$_SKIP_PYTHON_DEPS" = true ]`, which is what
+    # has always made the POSIX side check both branches. Inside the wrapper rather than
+    # outside it only for tidiness: $SkipPythonDeps is $false whenever the chain is skipped.
+    #
+    # Skipping the probe once the pass is already forced is the point of the gate: it is a
+    # bounded subprocess whose answer could no longer change the outcome.
+    if ($SkipPythonDeps) {
         # ...but not if an AMD GPU is present and installed PyTorch is CPU-only
         # (host predates ROCm-wheel support, or GPU added later): the fast "up to
         # date" path would leave the user on CPU torch with Train/Export disabled.
@@ -5066,61 +5211,6 @@ sys.exit(0 if installed is not None and required is not None and installed >= re
                 $SkipPythonDeps = $false
             }
         }
-        # ...and the same for an Intel Arc / Data Center GPU, or an up-to-date package on a CPU
-        # wheel stays on CPU torch forever. $SkipPythonDeps is re-tested so an escape taken above
-        # does not read twice. Both escapes below exist to reach the XPU install and its two
-        # remediations, all three gated on $XpuIndexUrl (set only when the resolved leaf is xpu),
-        # so $_xpuIsReachable holds them back where a pin or no-torch mode sends this host
-        # elsewhere and clearing the fast path would install nothing and re-fire forever.
-        $_pinLeafNow = Get-TorchIndexLeaf (Get-PinnedTorchIndexUrl)
-        $_xpuIsReachable = (-not $NoTorchMode) -and ((-not $_pinLeafNow) -or ($_pinLeafNow -eq "xpu"))
-        if ($script:IsIntelXpu -and $SkipPythonDeps -and $_xpuIsReachable) {
-            # The WHEEL, not the runtime: torch.xpu.is_available() is also false for a supported
-            # +xpu wheel on a wedged driver, and the dependency pass cannot repair a driver, so
-            # keying on it would force a full resolution every update for nothing.
-            if (-not (Test-VenvTorchIsXpuSupported -VenvPath $VenvDir)) {
-                substep "Intel GPU detected but installed PyTorch is not a supported XPU build -- reinstalling XPU PyTorch" "Cyan"
-                $SkipPythonDeps = $false
-            }
-        }
-        # Keyed off the installed wheel as well as the scan: an explicit xpu pin on a host the
-        # scan skips (a mixed NVIDIA + Intel box) still ends up on XPU with $script:IsIntelXpu
-        # false. The bitsandbytes floor and the Triton replacement live in the dependency pass
-        # below, so a venv that reached +xpu without them would fast-path past them forever.
-        if ($SkipPythonDeps -and $_xpuIsReachable -and ($script:IsIntelXpu -or $installedTorchTag -eq "xpu")) {
-            $_xpuDepsCode = "import importlib.metadata as m; " +
-                "print('BNB=' + next((d.version for d in m.distributions() " +
-                "if (d.metadata['Name'] or '').lower() == 'bitsandbytes'), '')); " +
-                "print('TRITONWIN=' + next((d.version for d in m.distributions() " +
-                "if (d.metadata['Name'] or '').lower().replace('_','-') == 'triton-windows'), ''))"
-            $_xpuDeps = Invoke-BoundedPythonProbe -PythonExe "python" -Code $_xpuDepsCode
-            if (-not $_xpuDeps.Ok) {
-                # A probe that did not answer says nothing about the venv, and reading that as
-                # "dependencies are current" would fast-path past both remediations forever.
-                # Same direction as an unparseable version below: one extra pass.
-                substep "Intel XPU dependencies could not be read -- running the dependency pass" "Cyan"
-                $SkipPythonDeps = $false
-            } else {
-                $_bnbVer = if ($_xpuDeps.Output -match '(?m)^BNB=(\S+)\s*$') { $Matches[1] } else { "" }
-                # An unreadable version is treated as stale, the safe direction: one extra pass,
-                # never a venv left without 4-bit kernels. Trailing suffixes (0.51.0.dev0) are
-                # dropped, not cast.
-                $_bnbNum = ($_bnbVer -replace '[^0-9.].*$', '').TrimEnd('.')
-                $_bnbStale = $true
-                if ($_bnbNum -match '^\d+\.\d+') {
-                    try { $_bnbStale = [version]$_bnbNum -lt [version]"0.50.0" } catch {}
-                }
-                $_tritonWinPresent = $_xpuDeps.Output -match '(?m)^TRITONWIN=\S+\s*$'
-                if ($_bnbStale -or $_tritonWinPresent) {
-                    substep "Intel XPU dependencies are stale -- running the dependency pass" "Cyan"
-                    $SkipPythonDeps = $false
-                }
-            }
-        }
-    } elseif ($InstalledVer -and $LatestVer) {
-        substep "$_PkgName $InstalledVer -> $LatestVer available, updating..."
-    } elseif (-not $LatestVer) {
-        substep "could not reach PyPI, updating to be safe..."
     }
 }
 
@@ -5157,6 +5247,8 @@ if (-not $SkipPythonDeps) {
 # install_python_stack.py drops the manifest before its own dependency pass, but
 # pip, torch and triton are replaced first here. Drop it now so a run killed in
 # those leaves the venv marked half-built, not behind a marker that verifies.
+# remove_manifest parks the file rather than deleting it, so the dependency pass
+# can still read what the last completed pass recorded and skip what is current.
 $_ManifestDropped = $true
 try {
     & python -c "
@@ -5331,16 +5423,24 @@ if ($ROCmIndexUrl) {
             $_rocmKeptActive = $true
         }
     }
+    # Same rule as the XPU and CPU arms: force only when the resident torch is not this
+    # family, the pin moved or the import failed. An unconditional --force-reinstall made
+    # every update re-resolve the trio against the ROCm index and rewrite its resolved
+    # dependencies (fsspec moved forward here and back in the core step, every time).
+    $rocmForce = @()
+    if ($installedTorchTag -ne "rocm") { $rocmForce = @("--force-reinstall") }
+    if ($script:PinChangedForceReinstall) { $rocmForce = @("--force-reinstall") }
+    if ($script:TorchImportDefinitivelyFailed) { $rocmForce = @("--force-reinstall") }
     while ($true) {
         # Built here, not in the verbose branch (a splat assigned there is unset on the other path).
         $_rocmTrio = @($ROCmTorchSpec, $ROCmVisionSpec, $ROCmAudioSpec)
         if ($WinArm64NoAudio) { $_rocmTrio = @($ROCmTorchSpec, $ROCmVisionSpec) }
         if ($script:UnslothVerbose) {
-            Fast-Install @_rocmTrio --force-reinstall --index-url $ROCmIndexUrl | ForEach-Object { Redact-InstallOutput "$_" } | Out-Host
+            Fast-Install @_rocmTrio @rocmForce --index-url $ROCmIndexUrl | ForEach-Object { Redact-InstallOutput "$_" } | Out-Host
             $torchInstallExit = $LASTEXITCODE
             $output = ""
         } else {
-            $output = Fast-Install @_rocmTrio --force-reinstall --index-url $ROCmIndexUrl | Out-String
+            $output = Fast-Install @_rocmTrio @rocmForce --index-url $ROCmIndexUrl | Out-String
             $torchInstallExit = $LASTEXITCODE
         }
         if ($torchInstallExit -eq 0 -or -not $_rocmKeptActive) { break }
@@ -5798,7 +5898,103 @@ function Test-TargetPackageVersion {
     return $false
 }
 
-$_NeedT5Install = $false
+# The pins, once. install_manifest.sidecar_is_current audits these exact strings and
+# Install-T5Sidecar installs them, so the check and the install can never disagree about
+# what a current sidecar holds. Mirrors _SIDECAR_COMMON_PINS in setup.sh.
+#
+# Every name here has to be one that audit can actually reach. It proves a distribution
+# arrived by looking for its package directory, and falls back to the top-level names in
+# that distribution's own RECORD only when neither spelling of the project name is a
+# directory (six.py has no directory at all; pillow's is PIL). A pin whose payload is
+# neither -- nothing recorded either -- reads as stale forever, and then every update
+# deletes and refetches a healthy several-hundred-MB sidecar.
+$SidecarCommonPins = @("huggingface_hub==1.8.0", "hf_xet==1.4.2", "tiktoken")
+
+function Test-SidecarCurrent {
+    # One predicate for both shells: install_manifest.py answers, setup.sh asks the same
+    # way. A shell reimplementation is what let the two drift -- Test-TargetPackageVersion
+    # sees a transformers 5.3.0 METADATA and calls a sidecar whose package tree an
+    # interrupted pip left half-written "current", and the training worker then dies on
+    # `import transformers` with the setup log reporting success.
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetDir,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+    if (-not (Test-Path -LiteralPath $TargetDir -PathType Container)) { return $false }
+    $shim = Join-Path $PSScriptRoot "install_manifest.py"
+    if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
+        return (Test-TargetPackageVersion -TargetDir $TargetDir -PackageName "transformers" -ExpectedVersion $Version)
+    }
+    $pins = @("transformers==$Version") + $SidecarCommonPins
+    $out = ""
+    try {
+        $out = (& python $shim sidecar $TargetDir @pins 2>$null | Out-String).Trim()
+    } catch {
+        $out = ""
+    }
+    # The marker, not the exit code alone. An install_manifest.py predating the shim has
+    # no __main__ block at all, so running it exits 0 with no output -- and reading that
+    # silence as "current" would retire the sidecar rebuild entirely.
+    if ($out -eq "sidecar: current") { return $true }
+    if ($out -like "sidecar:*") {
+        if ($script:UnslothVerbose) { substep "sidecar $TargetDir`: $($out.Substring(9))" }
+        return $false
+    }
+    # An old or unusable tree: fall back to the version grep this replaced.
+    return (Test-TargetPackageVersion -TargetDir $TargetDir -PackageName "transformers" -ExpectedVersion $Version)
+}
+
+function Install-T5Sidecar {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetDir,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$DirName,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+    substep "pre-installing transformers $Version $Reason..."
+    Assert-StudioOwnedOrAbsent -Path $TargetDir -Label "transformers $Label sidecar venv"
+    if (Test-Path -LiteralPath $TargetDir) { Remove-Item -LiteralPath $TargetDir -Recurse -Force }
+    [System.IO.Directory]::CreateDirectory($TargetDir) | Out-Null
+    Mark-StudioOwned -Path $TargetDir
+    foreach ($pkg in @("transformers==$Version", "huggingface_hub==1.8.0", "hf_xet==1.4.2")) {
+        if ($script:UnslothVerbose) {
+            Fast-Install --target $TargetDir --no-deps $pkg
+            $t5PkgExit = $LASTEXITCODE
+            $output = ""
+        } else {
+            $output = Fast-Install --target $TargetDir --no-deps $pkg | Out-String
+            $t5PkgExit = $LASTEXITCODE
+        }
+        if ($t5PkgExit -ne 0) {
+            Write-StudioLine "[FAIL] Could not install $pkg into $DirName/" -ForegroundColor Red
+            Write-StudioLine (Redact-InstallOutput $output) -ForegroundColor Red
+            $ErrorActionPreference = $script:PrevEAP_T5
+            Exit-SetupFailure "Could not install $pkg into $DirName"
+        }
+    }
+    if ($script:UnslothVerbose) {
+        Fast-Install --target $TargetDir --no-deps tiktoken
+        $tiktokenInstallExit = $LASTEXITCODE
+        $output = ""
+    } else {
+        $output = Fast-Install --target $TargetDir --no-deps tiktoken | Out-String
+        $tiktokenInstallExit = $LASTEXITCODE
+    }
+    if ($tiktokenInstallExit -ne 0) {
+        substep "Could not install tiktoken into $DirName/ -- Qwen tokenizers may fail" "Yellow"
+    }
+    step "transformers" "$Version pre-installed"
+}
+
+# Per tier, not one flag for all three. The old single flag rebuilt every sidecar
+# whenever any one of them was stale, and -- through the `-not $SkipPythonDeps` clause
+# that used to sit at the end of this list -- on every update that touched the dependency
+# pass at all, whether or not a sidecar had moved. That is three wipes and twelve
+# `--target` installs, measured at 60-90 s on Windows, for work already done.
+$_NeedT5_530 = $false
+$_NeedT5_550 = $false
+$_NeedT5_510 = $false
 if (Test-Path -LiteralPath $VenvT5Legacy) {
     # Legacy layout -- migrate. The tiered venvs a staged run builds land under the
     # stage root and may never be activated, so removing the live legacy one here
@@ -5807,130 +6003,37 @@ if (Test-Path -LiteralPath $VenvT5Legacy) {
         Assert-StudioOwnedOrAbsent -Path $VenvT5Legacy -Label "legacy transformers sidecar venv"
         Remove-Item -LiteralPath $VenvT5Legacy -Recurse -Force
     }
-    $_NeedT5Install = $true
+    $_NeedT5_530 = $true
+    $_NeedT5_550 = $true
+    $_NeedT5_510 = $true
 }
-if (-not (Test-Path -LiteralPath $VenvT5_530Dir)) { $_NeedT5Install = $true }
-if (-not (Test-Path -LiteralPath $VenvT5_550Dir)) { $_NeedT5Install = $true }
-if (-not (Test-Path -LiteralPath $VenvT5_510Dir)) { $_NeedT5Install = $true }
-if (-not (Test-TargetPackageVersion -TargetDir $VenvT5_530Dir -PackageName "transformers" -ExpectedVersion "5.3.0")) { $_NeedT5Install = $true }
-if (-not (Test-TargetPackageVersion -TargetDir $VenvT5_550Dir -PackageName "transformers" -ExpectedVersion "5.5.0")) { $_NeedT5Install = $true }
-if (-not (Test-TargetPackageVersion -TargetDir $VenvT5_510Dir -PackageName "transformers" -ExpectedVersion "5.10.2")) { $_NeedT5Install = $true }
-# Also reinstall when python deps were updated
-if (-not $SkipPythonDeps) { $_NeedT5Install = $true }
+if (-not (Test-SidecarCurrent -TargetDir $VenvT5_530Dir -Version "5.3.0")) { $_NeedT5_530 = $true }
+if (-not (Test-SidecarCurrent -TargetDir $VenvT5_550Dir -Version "5.5.0")) { $_NeedT5_550 = $true }
+if (-not (Test-SidecarCurrent -TargetDir $VenvT5_510Dir -Version "5.10.2")) { $_NeedT5_510 = $true }
 
-if ($_NeedT5Install) {
+if ($_NeedT5_530 -or $_NeedT5_550 -or $_NeedT5_510) {
 Write-StudioLine ""
+}
 
-$prevEAP_t5 = $ErrorActionPreference
+$script:PrevEAP_T5 = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 
-# --- .venv_t5_530 (transformers 5.3.0) ---
-substep "pre-installing transformers 5.3.0 for newer model support..."
-Assert-StudioOwnedOrAbsent -Path $VenvT5_530Dir -Label "transformers 5.3 sidecar venv"
-if (Test-Path -LiteralPath $VenvT5_530Dir) { Remove-Item -LiteralPath $VenvT5_530Dir -Recurse -Force }
-[System.IO.Directory]::CreateDirectory($VenvT5_530Dir) | Out-Null
-Mark-StudioOwned -Path $VenvT5_530Dir
-foreach ($pkg in @("transformers==5.3.0", "huggingface_hub==1.8.0", "hf_xet==1.4.2")) {
-    if ($script:UnslothVerbose) {
-        Fast-Install --target $VenvT5_530Dir --no-deps $pkg
-        $t5PkgExit = $LASTEXITCODE
-        $output = ""
-    } else {
-        $output = Fast-Install --target $VenvT5_530Dir --no-deps $pkg | Out-String
-        $t5PkgExit = $LASTEXITCODE
-    }
-    if ($t5PkgExit -ne 0) {
-        Write-StudioLine "[FAIL] Could not install $pkg into .venv_t5_530/" -ForegroundColor Red
-        Write-StudioLine (Redact-InstallOutput $output) -ForegroundColor Red
-        $ErrorActionPreference = $prevEAP_t5
-        Exit-SetupFailure "Could not install $pkg into .venv_t5_530"
-    }
-}
-if ($script:UnslothVerbose) {
-    Fast-Install --target $VenvT5_530Dir --no-deps tiktoken
-    $tiktokenInstallExit = $LASTEXITCODE
-    $output = ""
+if ($_NeedT5_530) {
+    Install-T5Sidecar -TargetDir $VenvT5_530Dir -Version "5.3.0" -Label "5.3" -DirName ".venv_t5_530" -Reason "for newer model support"
 } else {
-    $output = Fast-Install --target $VenvT5_530Dir --no-deps tiktoken | Out-String
-    $tiktokenInstallExit = $LASTEXITCODE
+    step "transformers" "5.3.0 sidecar current"
 }
-if ($tiktokenInstallExit -ne 0) {
-    substep "Could not install tiktoken into .venv_t5_530/ -- Qwen tokenizers may fail" "Yellow"
-}
-step "transformers" "5.3.0 pre-installed"
-
-# --- .venv_t5_550 (transformers 5.5.0) ---
-substep "pre-installing transformers 5.5.0 for Gemma 4 support..."
-Assert-StudioOwnedOrAbsent -Path $VenvT5_550Dir -Label "transformers 5.5 sidecar venv"
-if (Test-Path -LiteralPath $VenvT5_550Dir) { Remove-Item -LiteralPath $VenvT5_550Dir -Recurse -Force }
-[System.IO.Directory]::CreateDirectory($VenvT5_550Dir) | Out-Null
-Mark-StudioOwned -Path $VenvT5_550Dir
-foreach ($pkg in @("transformers==5.5.0", "huggingface_hub==1.8.0", "hf_xet==1.4.2")) {
-    if ($script:UnslothVerbose) {
-        Fast-Install --target $VenvT5_550Dir --no-deps $pkg
-        $t5PkgExit = $LASTEXITCODE
-        $output = ""
-    } else {
-        $output = Fast-Install --target $VenvT5_550Dir --no-deps $pkg | Out-String
-        $t5PkgExit = $LASTEXITCODE
-    }
-    if ($t5PkgExit -ne 0) {
-        Write-StudioLine "[FAIL] Could not install $pkg into .venv_t5_550/" -ForegroundColor Red
-        Write-StudioLine (Redact-InstallOutput $output) -ForegroundColor Red
-        $ErrorActionPreference = $prevEAP_t5
-        Exit-SetupFailure "Could not install $pkg into .venv_t5_550"
-    }
-}
-if ($script:UnslothVerbose) {
-    Fast-Install --target $VenvT5_550Dir --no-deps tiktoken
-    $tiktokenInstallExit = $LASTEXITCODE
-    $output = ""
+if ($_NeedT5_550) {
+    Install-T5Sidecar -TargetDir $VenvT5_550Dir -Version "5.5.0" -Label "5.5" -DirName ".venv_t5_550" -Reason "for Gemma 4 support"
 } else {
-    $output = Fast-Install --target $VenvT5_550Dir --no-deps tiktoken | Out-String
-    $tiktokenInstallExit = $LASTEXITCODE
+    step "transformers" "5.5.0 sidecar current"
 }
-if ($tiktokenInstallExit -ne 0) {
-    substep "Could not install tiktoken into .venv_t5_550/ -- Qwen tokenizers may fail" "Yellow"
-}
-step "transformers" "5.5.0 pre-installed"
-
-# --- .venv_t5_510 (transformers 5.10.2) ---
-substep "pre-installing transformers 5.10.2 for Gemma 4 Unified support..."
-Assert-StudioOwnedOrAbsent -Path $VenvT5_510Dir -Label "transformers 5.10 sidecar venv"
-if (Test-Path -LiteralPath $VenvT5_510Dir) { Remove-Item -LiteralPath $VenvT5_510Dir -Recurse -Force }
-[System.IO.Directory]::CreateDirectory($VenvT5_510Dir) | Out-Null
-Mark-StudioOwned -Path $VenvT5_510Dir
-foreach ($pkg in @("transformers==5.10.2", "huggingface_hub==1.8.0", "hf_xet==1.4.2")) {
-    if ($script:UnslothVerbose) {
-        Fast-Install --target $VenvT5_510Dir --no-deps $pkg
-        $t5PkgExit = $LASTEXITCODE
-        $output = ""
-    } else {
-        $output = Fast-Install --target $VenvT5_510Dir --no-deps $pkg | Out-String
-        $t5PkgExit = $LASTEXITCODE
-    }
-    if ($t5PkgExit -ne 0) {
-        Write-StudioLine "[FAIL] Could not install $pkg into .venv_t5_510/" -ForegroundColor Red
-        Write-StudioLine (Redact-InstallOutput $output) -ForegroundColor Red
-        $ErrorActionPreference = $prevEAP_t5
-        Exit-SetupFailure "Could not install $pkg into .venv_t5_510"
-    }
-}
-if ($script:UnslothVerbose) {
-    Fast-Install --target $VenvT5_510Dir --no-deps tiktoken
-    $tiktokenInstallExit = $LASTEXITCODE
-    $output = ""
+if ($_NeedT5_510) {
+    Install-T5Sidecar -TargetDir $VenvT5_510Dir -Version "5.10.2" -Label "5.10" -DirName ".venv_t5_510" -Reason "for Gemma 4 Unified support"
 } else {
-    $output = Fast-Install --target $VenvT5_510Dir --no-deps tiktoken | Out-String
-    $tiktokenInstallExit = $LASTEXITCODE
+    step "transformers" "5.10.2 sidecar current"
 }
-if ($tiktokenInstallExit -ne 0) {
-    substep "Could not install tiktoken into .venv_t5_510/ -- Qwen tokenizers may fail" "Yellow"
-}
-$ErrorActionPreference = $prevEAP_t5
-step "transformers" "5.10.2 pre-installed"
-
-} # end $_NeedT5Install
+$ErrorActionPreference = $script:PrevEAP_T5
 
 # ==========================================================================
 #  PHASE 3.4: Prefer prebuilt llama.cpp bundles before source build

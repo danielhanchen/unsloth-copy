@@ -28,6 +28,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 MANIFEST_NAME = "unsloth_install_manifest.json"
+# Where remove_manifest parks the completion manifest. Only the dependency pass reads
+# it, and only as evidence of what the LAST completed pass did; verify_install, the
+# setup fast path and the desktop preflight never look at it, so a venv whose live
+# manifest is gone still reads as half-built everywhere it matters.
+PREVIOUS_MANIFEST_NAME = "unsloth_install_manifest.previous.json"
 MANIFEST_SCHEMA = 1
 
 # Canonical truthy set for UNSLOTH_NO_TORCH, matching install.ps1 / install.sh.
@@ -54,6 +59,27 @@ TRACKED_REQUIREMENT_FILES: Tuple[str, ...] = (
 # The import chain studio/backend/run.py walks on startup.
 BOOT_REQUIREMENT_FILE = "studio.txt"
 
+# Every file the dependency pass reads to decide what to install, recorded under the
+# additive `pass_inputs` key so a step can prove its inputs have not moved.
+#
+# NOT folded into TRACKED_REQUIREMENT_FILES, even though it is a superset of it:
+# verify_install compares the whole `requirement_files` dict, so one new name there
+# would report every install in the field as `studio_install_requirements_changed`
+# and buy each of them an immediate repair pass. New evidence goes under new keys.
+PASS_INPUT_FILES: Tuple[str, ...] = TRACKED_REQUIREMENT_FILES + (
+    "diffusers-pin.txt",
+    "triton-kernels.txt",
+    "overrides.txt",
+    "single-env/constraints.txt",
+    "single-env/overrides-darwin-arm64.txt",
+)
+
+# setup.sh / setup.ps1 write this beside a sidecar directory they created; the runtime
+# self-heal in studio/backend/utils/transformers_version.py puts one back after its own
+# rebuild. Absent means the directory is not ours to delete, which is also the answer
+# `sidecar_is_current` has to give: a rebuild is the only repair, and it starts with rm.
+SIDECAR_OWNED_MARKER = ".unsloth-studio-owned"
+
 
 def venv_root() -> Path:
     """Directory holding pyvenv.cfg for the interpreter running this code."""
@@ -62,6 +88,10 @@ def venv_root() -> Path:
 
 def manifest_path(root: Optional[Path] = None) -> Path:
     return (root or venv_root()) / MANIFEST_NAME
+
+
+def previous_manifest_path(root: Optional[Path] = None) -> Path:
+    return (root or venv_root()) / PREVIOUS_MANIFEST_NAME
 
 
 def requirements_root(script_dir: Optional[Path] = None) -> Path:
@@ -108,6 +138,29 @@ def requirement_digests(req_root: Optional[Path] = None) -> Dict[str, str]:
     digests: Dict[str, str] = {}
     for name in TRACKED_REQUIREMENT_FILES:
         digest = _sha256(root / name)
+        if digest is not None:
+            digests[name] = digest
+    return digests
+
+
+def digest_file(path) -> Optional[str]:
+    """sha256 of one file, or None when it is absent or unreadable.
+
+    None is never equal to a recorded digest, so an input that cannot be read
+    forces the step that consumes it to run. That is the safe direction.
+    """
+    try:
+        return _sha256(Path(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def pass_input_digests(req_root: Optional[Path] = None) -> Dict[str, str]:
+    """sha256 of every PASS_INPUT_FILES entry that exists, relpath -> digest."""
+    root = Path(req_root) if req_root is not None else requirements_root()
+    digests: Dict[str, str] = {}
+    for name in PASS_INPUT_FILES:
+        digest = digest_file(root / name)
         if digest is not None:
             digests[name] = digest
     return digests
@@ -257,14 +310,69 @@ def remove_manifest(root: Optional[Path] = None) -> bool:
     True when no manifest remains. A surviving marker (Windows raises on a
     read-only or locked file) still names this version and these digests, so a
     pass killed afterwards would verify as complete.
+
+    The file is parked under PREVIOUS_MANIFEST_NAME rather than deleted: setup.ps1
+    calls this before pip, torch and triton are replaced, which is before
+    install_python_stack.py gets to read what the last pass recorded, and without the
+    parked copy every Windows update ran the whole dependency pass again. The parked
+    copy is evidence only (see read_previous_manifest) and is dropped by the next
+    write_manifest. Deleting it is still the fallback when the rename is refused.
     """
+    path = manifest_path(root)
     try:
-        manifest_path(root).unlink()
+        os.replace(path, previous_manifest_path(root))
     except FileNotFoundError:
         return True
     except OSError:
-        return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
     return True
+
+
+def read_previous_manifest(root: Optional[Path] = None) -> Optional[dict]:
+    """The manifest remove_manifest parked, or None.
+
+    Evidence of the last COMPLETED pass, for the dependency pass alone: every skip it
+    permits is still re-verified on disk, and verify_install never reads it, so this
+    can make an update faster but never make a half-built venv look finished.
+    """
+    try:
+        raw = previous_manifest_path(root).read_text(encoding = "utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# The keys write_manifest owns, and the only ones verify_install, the setup fast path
+# and desktop-capabilities ever decide on. Additive evidence -- `extra` here, keyword
+# arguments to update_manifest -- may never shadow one: a caller that could rewrite
+# `package_version` or `requirement_files` would falsely validate or silently invalidate
+# an install, and nothing downstream re-derives them. The optional three are in for the
+# same reason as the rest: absent means "unknown", so evidence must not be able to
+# invent an answer the installing build never gave. ONE constant, because two copies of
+# this list is exactly how the two writers would come to disagree.
+PROTECTED_MANIFEST_KEYS: Tuple[str, ...] = (
+    "schema",
+    "completed_at_ms",
+    "package",
+    "package_version",
+    "python",
+    "platform",
+    "prefix",
+    "steps_total",
+    "requirement_files",
+    "no_torch",
+    "expected_torch_tag",
+    "expected_torch_tag_pinned",
+)
 
 
 def write_manifest(
@@ -275,6 +383,7 @@ def write_manifest(
     no_torch: Optional[bool] = None,
     expected_torch_tag: Optional[str] = None,
     expected_torch_tag_pinned: Optional[bool] = None,
+    extra: Optional[Dict[str, object]] = None,
 ) -> Optional[Path]:
     """Record a completed install. Never raises: no manifest reads as incomplete,
     which is the safe answer."""
@@ -307,14 +416,62 @@ def write_manifest(
     # eGPU with no repair offered. Absent means unknown, as with every other additive key.
     if expected_torch_tag_pinned is not None:
         payload["expected_torch_tag_pinned"] = bool(expected_torch_tag_pinned)
+    # The dependency pass's own evidence: `pass_inputs`, `step_results`, `pip_check_ok`,
+    # `mlx_health`, `uv_version`, `installer_python_tag`. Additive and never authoritative
+    # on its own -- every consumer re-verifies on disk before skipping anything. None is
+    # dropped rather than written, so "absent means unknown" holds for these keys too, and
+    # nothing here may shadow a field above: those are what verify_install reads.
+    for key, value in (extra or {}).items():
+        if value is None or key in payload or key in PROTECTED_MANIFEST_KEYS:
+            continue
+        payload[key] = value
     path = manifest_path(root)
     try:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent = 2, sort_keys = True), encoding = "utf-8")
         os.replace(tmp, path)
-        return path
     except OSError:
         return None
+    # The parked copy described the pass before this one; the live file now does.
+    try:
+        previous_manifest_path(root).unlink()
+    except OSError:
+        pass
+    return path
+
+
+def update_manifest(root: Optional[Path] = None, **extra: object) -> bool:
+    """Merge additive keys into an existing manifest. Never raises.
+
+    For evidence that is only available AFTER the manifest is written -- the MLX
+    import probe runs there so a kill during its 180 s timeout cannot lose a
+    finished install. False when there is nothing to update, which the callers
+    treat as "record nothing", never as a failed install.
+
+    PROTECTED_MANIFEST_KEYS are dropped, exactly as write_manifest drops them from
+    `extra`: this merges into a manifest that already means "the install finished",
+    so a caller able to rewrite the fields that claim describes could leave the file
+    valid-looking and wrong with nothing on disk contradicting it.
+    """
+    values = {
+        key: value
+        for key, value in extra.items()
+        if value is not None and key not in PROTECTED_MANIFEST_KEYS
+    }
+    if not values:
+        return False
+    data = read_manifest(root)
+    if data is None:
+        return False
+    data.update(values)
+    path = manifest_path(root)
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent = 2, sort_keys = True), encoding = "utf-8")
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def read_manifest(root: Optional[Path] = None) -> Optional[dict]:
@@ -518,6 +675,189 @@ def missing_requirements(
             if not _version_satisfies(dist.version, specifier):
                 missing.append(name)
     return missing
+
+
+# A closure walk that never finishes is a full dependency pass on every update, and a
+# site-packages on a wedged network mount can produce one. Generous, because the walk is
+# in-memory after the index is built and 400 distributions cost well under a second.
+CLOSURE_SCAN_BUDGET_SECONDS = 10.0
+# Belt to the deadline's braces: a metadata set that somehow cycles without repeating a
+# (name, extras) key still stops.
+_CLOSURE_MAX_VISITS = 20000
+
+
+def installed_dependency_index() -> Optional[Dict[str, Tuple[str, List[str]]]]:
+    """canonical name -> (version, raw Requires-Dist lines) for this interpreter.
+
+    One pass over the metadata, because every gated step asks the same question about
+    the same site-packages and `distribution(name)` re-reads a dist-info per lookup.
+    None when the metadata cannot be enumerated at all, which the caller reads as
+    "cannot audit" rather than "satisfied".
+    """
+    from importlib.metadata import distributions
+    try:
+        index: Dict[str, Tuple[str, List[str]]] = {}
+        for dist in distributions(path = _metadata_scan_paths()):
+            try:
+                name = dist.metadata["Name"]
+                version = dist.version
+            except Exception:
+                # A dist-info with unreadable metadata is damage the caller's other
+                # checks report; it must not take the whole index with it.
+                continue
+            if not name or not version:
+                continue
+            key = _canonical(str(name))
+            # First wins, matching sys.path precedence. A duplicate is a conflict
+            # metadata_conflict() already reports, and picking the other copy here
+            # would make two checks disagree about the same venv.
+            if key in index:
+                continue
+            try:
+                requires = list(dist.requires or [])
+            except Exception:
+                requires = []
+            index[key] = (str(version), requires)
+        return index
+    except Exception:
+        return None
+
+
+def unsatisfied_closure_requirement(
+    req_file: Path,
+    index: Optional[Dict[str, Tuple[str, List[str]]]] = None,
+    budget_seconds: float = CLOSURE_SCAN_BUDGET_SECONDS,
+) -> Optional[str]:
+    """The first requirement in *req_file*'s INSTALLED closure that is not met, or None.
+
+    missing_requirements() reads the file's own lines, which stay true after a
+    transitive dependency is uninstalled: `mammoth>=1.8.0` is satisfied by a mammoth
+    whose `cobble` is gone, and importing it raises. The step that would have repaired
+    that is exactly the one being considered for a skip, so the audit has to follow
+    Requires-Dist down from each line.
+
+    Only for steps installed WITH dependencies. A `--no-deps` step deliberately leaves
+    its requirements' own dependencies unresolved, so auditing one would report a
+    conflict the installer created on purpose and force that step to run forever.
+
+    Fails CLOSED, unlike missing_requirements() and violated_constraints(): every
+    return path that is not a proven-complete closure names a reason, and the caller
+    reads any string as "install it". `packaging` absent, a direct URL requirement whose
+    provenance a version cannot answer, an unreadable file, a budget overrun -- none of
+    those are evidence that the closure holds, and the cost of being wrong is one
+    dependency pass rather than a broken import nobody repairs.
+    """
+    try:
+        from packaging.requirements import Requirement
+    except Exception:
+        return "<packaging unavailable>"
+    if index is None:
+        index = installed_dependency_index()
+    if index is None:
+        return "<metadata unreadable>"
+    try:
+        lines = Path(req_file).read_text(encoding = "utf-8-sig").splitlines()
+    except (OSError, ValueError):
+        return "<requirements unreadable>"
+
+    deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
+    # (raw requirement, the extras whose markers are in scope for it). The top level has
+    # no extra, so only markers that do not mention one apply.
+    pending: List[Tuple[str, Tuple[str, ...]]] = []
+    for line in lines:
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        if text.startswith("-"):
+            # A pip flag. None of the audited files carry one today, and an `-r` include
+            # would hide requirements from this walk entirely.
+            return f"<flag line: {text}>"
+        pending.append((text, ("",)))
+
+    seen: set = set()
+    visits = 0
+    while pending:
+        visits += 1
+        if visits > _CLOSURE_MAX_VISITS:
+            return "<closure too large>"
+        if deadline is not None and time.monotonic() > deadline:
+            return "<closure audit timed out>"
+        raw, contexts = pending.pop()
+        try:
+            requirement = Requirement(raw)
+        except Exception:
+            return f"<unparseable: {raw}>"
+        marker = requirement.marker
+        if marker is not None:
+            try:
+                applies = any(marker.evaluate({"extra": extra}) for extra in contexts)
+            except Exception:
+                return f"<unevaluable marker: {raw}>"
+            if not applies:
+                continue
+        if requirement.url:
+            # A direct reference is satisfied by whatever landed, and the version says
+            # nothing about which. _direct_reference_is_installed answers that for the
+            # one step that has one, and that step is --no-deps and never gets here.
+            return f"{requirement.name} (direct reference)"
+        key = _canonical(requirement.name)
+        record = index.get(key)
+        if record is None:
+            return requirement.name
+        version, requires = record
+        if requirement.specifier and not requirement.specifier.contains(version, prereleases = True):
+            return f"{requirement.name} {version}"
+        extras = tuple(sorted(_canonical(extra) for extra in requirement.extras))
+        visit_key = (key, extras)
+        if visit_key in seen:
+            continue
+        seen.add(visit_key)
+        # An extra's own dependencies are declared with `extra == "<name>"` markers, so
+        # a requirement asking for foo[bar] puts "bar" in scope for foo's Requires-Dist
+        # alongside the unconditional ones. Both spellings, because PEP 685 normalisation
+        # of the name inside the marker only arrived with newer build backends: a wheel
+        # built before it still says extra == "all_files", and matching only the
+        # canonical "all-files" would silently drop that extra's whole subtree.
+        child_contexts = ("", *extras, *requirement.extras)
+        pending.extend((child, child_contexts) for child in requires)
+    return None
+
+
+def violated_constraints(
+    req_file: Optional[Path] = None, installed: Optional[Dict[str, str]] = None
+) -> List[str]:
+    """Constrained distributions whose INSTALLED version sits outside the pin.
+
+    A constraints file never asks for an install, so an absent distribution is
+    not a violation -- only a resident one outside its window is. That is exactly
+    what a skipped step has to rule out: `-c constraints.txt` is passed to every
+    constrained step, so a constraint that moved under an unchanged requirements
+    file is the one input digest equality cannot see.
+
+    Empty on an unreadable file, matching missing_requirements: the caller's other
+    evidence still has to pass, and reporting a violation nobody can name would
+    force a full pass on every run.
+    """
+    path = req_file or (requirements_root() / "single-env" / "constraints.txt")
+    try:
+        lines = path.read_text(encoding = "utf-8-sig").splitlines()
+    except (OSError, ValueError):
+        return []
+
+    violated: List[str] = []
+    for line in lines:
+        parsed = _parse_requirement_line(line)
+        if parsed is None:
+            continue
+        name, marker, specifier = parsed
+        if not specifier or not _marker_applies(marker):
+            continue
+        version = _installed_version(name, installed)
+        # Absent is not a violation; unparseable metadata is, since the step that
+        # would fix it is the one being considered for a skip.
+        if version and not _version_satisfies(version, specifier):
+            violated.append(name)
+    return violated
 
 
 # Shared between wheels, so one uninstall deletes another's recorded files.
@@ -755,8 +1095,13 @@ def verify_install(
     installed_conflicts: Optional[Sequence[str]] = None,
     deep: bool = False,
     scan_paths: Optional[Sequence[str]] = None,
+    manifest: Optional[dict] = None,
 ) -> dict:
     """Report whether the managed install finished and can still boot.
+
+    `manifest` verifies the tree against a manifest the caller already holds -- the
+    dependency pass checking a parked one -- instead of the live file; everything
+    else about the verdict is unchanged.
 
     Reason strings are surfaced verbatim by the desktop preflight as its
     staleness reason, so keep them stable.
@@ -776,7 +1121,8 @@ def verify_install(
     missing = missing_requirements(reqs / BOOT_REQUIREMENT_FILE, installed = installed)
     deps_ok = not missing
 
-    manifest = read_manifest(root)
+    if manifest is None:
+        manifest = read_manifest(root)
     manifest_ok = False
     reason: Optional[str] = None
     vanished = False
@@ -850,3 +1196,284 @@ def verify_install(
         "missing": missing,
         "reason": None if (manifest_ok and deps_ok) else (reason or "studio_deps_missing"),
     }
+
+
+# -- Sidecar directories ------------------------------------------------------
+#
+# The transformers 5.x sidecars are flat `pip --target` trees, prepended to sys.path by
+# the training worker; no interpreter owns them, so nothing here may import from one.
+#
+# Deliberately MIRRORED from `_venv_dir_is_valid` + `_sidecar_scan_impl` in
+# studio/backend/utils/transformers_version.py rather than imported: that module lives
+# under studio/backend, imports the backend's logger and settings, and is not reachable
+# from the installer's stdlib-only world. Keep the two predicates in sync -- the runtime
+# self-heal there is what pays for a disagreement, by rebuilding on every request a
+# setup run just declared current.
+
+# Version-tagged extension suffixes (.cpython-313-darwin.so, .cp313-win_amd64.pyd,
+# free-threaded .cpython-314t-*). Untagged binaries carry no version and are skipped, as
+# are pypy/graalpy/debug spellings: an unrecognised name reports nothing rather than guessing.
+_EXT_VERSION_TAG_RE = re.compile(r"\.(?:cpython-|cp)(\d{2,}t?)\b")
+# Stable-ABI binaries. A GIL build imports one produced by any older CPython, so they are
+# skipped there; a free-threaded build takes a SIGSEGV instead of an ImportError.
+_ABI3_EXT_RE = re.compile(r"\.abi3\.(?:so|pyd)$")
+
+SIDECAR_SCAN_BUDGET_SECONDS = 5.0
+
+
+def _current_ext_tag() -> str:
+    import sysconfig
+    return "{}{}{}".format(
+        sys.version_info.major,
+        sys.version_info.minor,
+        "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "",
+    )
+
+
+def _sidecar_payload_present(root: Path, dist) -> bool:
+    """Whether anything *dist* records as installed is on disk under *root*.
+
+    The fallback for the distributions a directory name cannot reach: one that ships
+    top-level MODULES (`six.py`, `typing_extensions.py`) has no directory to find, and
+    an import name that matches neither spelling of the project (pillow -> PIL,
+    protobuf -> google) has one under a name this cannot guess. Reported stale, they
+    make `sidecar_is_current` rebuild a healthy several-hundred-MB tree on every update.
+
+    Deliberately weaker than _sidecar_damaged_files, which is the check that reads
+    every RECORD row: this only has to answer "did the payload arrive at all", the
+    question the directory probe was asking. Anything unreadable answers no, so the
+    existing failure messages still cover the cases they always covered.
+    """
+    try:
+        recorded = list(dist.files or [])
+    except Exception:
+        return False
+    for entry in recorded:
+        parts = tuple(part for part in str(entry).replace("\\", "/").split("/") if part)
+        # `..` escapes the tree, console scripts are recorded outside it (pip writes
+        # ../../bin/hf), and metadata is not payload: none of them says the files landed.
+        if (
+            not parts
+            or ".." in parts
+            or parts[0] in ("bin", "Scripts")
+            or parts[0].endswith((".dist-info", ".egg-info"))
+        ):
+            continue
+        try:
+            if (root / parts[0]).exists():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _sidecar_pin_ok(root: Path, spec: str) -> Optional[str]:
+    """None when the pin is satisfied in *root*, else why it is not."""
+    from importlib.metadata import distributions
+
+    name, _, wanted = spec.partition("==")
+    name = name.strip()
+    wanted = wanted.strip()
+    if not name:
+        return None
+    canonical = _canonical(name)
+    module = canonical.replace("-", "_")
+    # The package tree itself, as _venv_dir_is_valid checks it: a dist-info whose
+    # payload was removed still answers every metadata question. Two stats, and for
+    # every pin that has a directory that is the whole payload question -- the RECORD
+    # fallback below is only reached when neither spelling of the name is one.
+    directory_present = any((root / candidate).is_dir() for candidate in (module, canonical))
+    found: List[str] = []
+    payload_present = False
+    try:
+        for dist in distributions(path = [str(root)]):
+            try:
+                dist_name = dist.metadata.get("Name") or ""
+            except Exception:
+                continue
+            if _canonical(dist_name) != canonical:
+                continue
+            found.append(dist.version or "")
+            # Only when the directory probe came up empty, and only until one answers:
+            # this reads a RECORD, and paying that for every pin on every update is
+            # what the stats above exist to avoid.
+            if not directory_present and not payload_present:
+                payload_present = _sidecar_payload_present(root, dist)
+    except Exception:
+        return f"{name} metadata unreadable"
+    if not found:
+        return f"{name} not installed"
+    if not directory_present and not payload_present:
+        return f"{name} directory missing"
+    if len(found) > 1:
+        return f"{name} has {len(found)} metadata records"
+    if wanted and found[0] != wanted:
+        return f"{name}=={found[0] or 'unknown'}, want {wanted}"
+    return None
+
+
+def _sidecar_damaged_files(
+    root: Path,
+    limit: int = 3,
+    budget_seconds: float = SIDECAR_SCAN_BUDGET_SECONDS,
+) -> List[str]:
+    """RECORD rows under a sidecar that are gone, truncated, or built for another CPython.
+
+    Fails open everywhere: the caller's answer to a finding is to delete several hundred
+    MB and refetch, so anything unreadable reports nothing rather than guessing. Bounded,
+    because no installer wraps this in a timeout and a stalled mount would wedge setup.
+    """
+    import csv
+    import io
+    import stat
+
+    deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
+    ext_tag = _current_ext_tag()
+    entries: List[Tuple[str, str, Optional[int], Path, str]] = []
+    owners: Dict[str, int] = {}
+    try:
+        dist_infos = sorted(root.glob("*.dist-info"))
+    except OSError:
+        return []
+    for dist_info in dist_infos:
+        name = dist_info.name.split("-")[0]
+        try:
+            record = (dist_info / "RECORD").read_text(encoding = "utf-8", errors = "replace")
+        except OSError:
+            # Absent or unreadable RECORD says nothing about damage.
+            continue
+        try:
+            rows = list(csv.reader(io.StringIO(record)))
+        except csv.Error:
+            continue
+        for row in rows:
+            rel = row[0] if row else ""
+            if not rel or rel.endswith("/"):
+                continue
+            if ".dist-info/" in rel or ".egg-info/" in rel or rel.endswith(".pyc"):
+                continue
+            parts = tuple(part for part in rel.replace("\\", "/").split("/") if part)
+            # Console scripts are not checkable in a flat --target tree, and believing
+            # them fails CLOSED on a healthy sidecar (pip records ../../bin/hf, uv bin/hf).
+            # Nothing here is ever put on PATH.
+            if (
+                rel.startswith("/")
+                or (len(rel) > 1 and rel[1] == ":")
+                or ".." in parts
+                or (parts and parts[0] in ("bin", "Scripts"))
+            ):
+                continue
+            target = root / rel
+            key = os.path.normcase(str(target))
+            # Before the filter: a dropped row still owns the path it claims.
+            owners[key] = owners.get(key, 0) + 1
+            if len(parts) > 1 and parts[0] in _SHARED_NON_RUNTIME_ROOTS:
+                continue
+            recorded: Optional[int] = None
+            if len(row) >= 3 and row[2] and parts[-1] not in _INSTALLER_REWRITTEN_NAMES:
+                try:
+                    recorded = int(row[2])
+                except ValueError:
+                    recorded = None
+            entries.append((name, rel, recorded, target, key))
+
+    found: List[str] = []
+    for name, rel, recorded, target, key in entries:
+        # Every row: batching a deadline let one slow mount overrun it by a minute.
+        if deadline is not None and time.monotonic() > deadline:
+            return found
+        try:
+            info = target.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            found.append(f"{name}: {rel} is missing")
+        except OSError:
+            # Unreadable is not gone, and the answer costs a several-hundred-MB refetch.
+            continue
+        else:
+            if not stat.S_ISREG(info.st_mode):
+                found.append(f"{name}: {rel} is not a regular file")
+            # A path two distributions claim makes the recorded SIZES ambiguous;
+            # a larger file is a packaging collision, not damage.
+            elif owners[key] == 1 and recorded is not None and info.st_size < recorded:
+                found.append(f"{name}: {rel} is {info.st_size} bytes, expected {recorded}")
+            elif rel.endswith((".so", ".pyd")):
+                # The BASENAME alone decides: a directory carrying a wheel-style tag
+                # (pkg.cp312.libs/) says nothing about the untagged binary inside it.
+                base = rel.replace("\\", "/").rsplit("/", 1)[-1]
+                match = _EXT_VERSION_TAG_RE.search(base)
+                if match and match.group(1) != ext_tag:
+                    found.append(
+                        f"{name}: {rel} targets cp{match.group(1)}, interpreter is cp{ext_tag}"
+                    )
+                elif match is None and ext_tag.endswith("t") and _ABI3_EXT_RE.search(base):
+                    found.append(
+                        f"{name}: {rel} is a stable-ABI build, which free-threaded "
+                        f"cp{ext_tag} cannot load"
+                    )
+        if len(found) >= limit:
+            return found
+    return found
+
+
+def sidecar_is_current(
+    venv_dir,
+    pins: Sequence[str],
+    budget_seconds: float = SIDECAR_SCAN_BUDGET_SECONDS,
+) -> Tuple[bool, str]:
+    """Whether a transformers sidecar directory already holds exactly *pins*, intact.
+
+    `(True, "")` or `(False, reason)`. The reason is logged by the setup scripts, so
+    a rebuild always says what it is repairing.
+
+    *pins* are `name==version` or a bare `name` (present at any version). Every check
+    is on-disk evidence: nothing here trusts a previous run's record, because the
+    directory is what the next `import transformers` will read.
+    """
+    root = Path(venv_dir)
+    try:
+        if not root.is_dir():
+            return False, "missing"
+        if not os.listdir(root):
+            return False, "empty"
+    except OSError as exc:
+        return False, f"unreadable ({exc.__class__.__name__})"
+    # Rebuilding means `rm -rf`, so an unowned directory must not be called current:
+    # the caller would either delete someone else's tree or abort mid-update.
+    if not (root / SIDECAR_OWNED_MARKER).is_file():
+        return False, f"no {SIDECAR_OWNED_MARKER} marker"
+    for spec in pins:
+        problem = _sidecar_pin_ok(root, spec)
+        if problem is not None:
+            return False, problem
+    damaged = _sidecar_damaged_files(root, budget_seconds = budget_seconds)
+    if damaged:
+        return False, "; ".join(damaged)
+    return True, ""
+
+
+# -- CLI shim -----------------------------------------------------------------
+#
+# setup.sh and setup.ps1 both need `sidecar_is_current`, and a shell reimplementation of
+# it is what let the two drift the last time. Exit 0 current, 1 not current, 2 anything
+# this module does not implement.
+#
+# Both shells also require the marker line below before believing exit 0: an
+# install_manifest.py predating this shim has no `__main__` block at all, so running it
+# exits 0 with no output, and a bare exit code would read that as "current".
+_SIDECAR_CLI_MARKER = "sidecar:"
+
+
+def _sidecar_cli(argv: Sequence[str]) -> int:
+    if len(argv) < 2:
+        print("usage: install_manifest.py sidecar <dir> <pin>...", file = sys.stderr)
+        return 2
+    current, reason = sidecar_is_current(argv[0], tuple(argv[1:]))
+    print(f"{_SIDECAR_CLI_MARKER} {'current' if current else reason}")
+    return 0 if current else 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["sidecar"]:
+        sys.exit(_sidecar_cli(sys.argv[2:]))
+    print(f"usage: {os.path.basename(__file__)} sidecar <dir> <pin>...", file = sys.stderr)
+    sys.exit(2)
