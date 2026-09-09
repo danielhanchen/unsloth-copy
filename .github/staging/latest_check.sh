@@ -30,7 +30,7 @@ OUT=$(docker run -i --rm --entrypoint bash "$IMAGE" -c '
   /opt/unsloth/llama.cpp/build/bin/llama-server --version 2>&1 | tail -1
   /opt/unsloth/llama.cpp/build/bin/llama-server --list-devices 2>&1 | tail -3')
 echo "$OUT"
-echo "$OUT" | grep -q "^marker linux-.*-cuda cuda12-portable" || fail "marker is not the CUDA portable bundle (the CPU prebuilt replaced it)"
+echo "$OUT" | grep -Eq "^marker linux-(x64|arm64)-cuda cuda1[0-9]-portable" || fail "marker is not the CUDA portable bundle (the CPU prebuilt replaced it)"
 [ "$(echo "$OUT" | grep -c '^present ')" = 2 ] || fail "libggml-cuda.so missing from the image"
 
 echo "== CPU inference through the CUDA bundle"

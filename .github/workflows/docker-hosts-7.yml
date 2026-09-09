@@ -1,4 +1,4 @@
-# Round 7: the published Studio image (unsloth/unsloth:latest) after unsloth#10495,
+# Round 7b: the published Studio image (unsloth/unsloth:latest) after unsloth#10495,
 # which keeps the base image's CUDA llama.cpp bundle instead of letting the GPU-less
 # build replace it with a CPU prebuilt. Every hosted runner is GPU-less too, so this
 # round proves the CUDA bundle still serves CPU inference on Linux amd64/arm64,
