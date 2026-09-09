@@ -2214,6 +2214,10 @@ _SIDECAR_COMMON_PINS="huggingface_hub==1.8.0 hf_xet==1.4.2"
 _sidecar_top_up_tiktoken() {
     _stt_dir="$1"
     _stt_label="$2"
+    # Under the offline keep this would reach for the network through fast_install's pip
+    # fallback, and for a tier whose rebuild was deferred it would create a directory
+    # holding tiktoken alone.
+    [ "${_OFFLINE_FAST_PATH:-false}" = true ] && return 0
     for _stt_meta in "$_stt_dir"/tiktoken-*.dist-info/METADATA; do
         if [ -f "$_stt_meta" ]; then
             unset _stt_meta
@@ -2301,7 +2305,12 @@ _install_sidecar() {
 _NEED_T5_530=false
 _NEED_T5_550=false
 _NEED_T5_510=false
-if [ -d "$STUDIO_HOME/.venv_t5" ]; then
+if [ -d "$STUDIO_HOME/.venv_t5" ] && [ "${_OFFLINE_FAST_PATH:-false}" = true ]; then
+    # The migration below is a wipe followed by three rebuilds, and under the offline
+    # keep nothing can be fetched: the legacy sidecar is the only one this install has,
+    # so it stays, untouched, for the next online update to migrate.
+    substep "legacy transformers sidecar left in place -- UV_OFFLINE is set, migration waits for the next online update"
+elif [ -d "$STUDIO_HOME/.venv_t5" ]; then
     # Legacy layout — migrate. The tiered venvs a staged run builds land under the
     # stage root and may never be activated, so removing the live legacy one here
     # would strip the running install of its only sidecar. The live update does it.
