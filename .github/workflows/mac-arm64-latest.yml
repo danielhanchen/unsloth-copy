@@ -1,0 +1,31 @@
+# Round 7c: the Apple Silicon leg of round 7 on macos-26, whose host has 94 GB free
+# (macos-15 arm64 has 42 GB and the runner itself ran out of disk while colima pulled
+# the 27 GB Studio image). Same script and assertions as docker-hosts-7.yml.
+name: Docker on hosted runners, round 7c (Apple Silicon on macos-26)
+on:
+  push:
+    branches: ['docker-hosts-7-probe']
+  workflow_dispatch:
+env:
+  IMAGE: unsloth/unsloth:latest
+  REV: 580cffabac84cf0d373d27ebed2af4251dbbf88e
+jobs:
+  macos-arm64:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host
+        run: uname -m; sw_vers | head -2; sysctl -n kern.hv_support || true; df -g / | tail -1
+      - name: Reclaim disk
+        run: rm -rf /Users/runner/hostedtoolcache /Users/runner/.dotnet 2>/dev/null || true; df -g / | tail -1
+      - name: Install colima and start a Linux VM (QEMU, no nested virtualization on hosted M-series)
+        run: |
+          brew install --quiet docker colima qemu 2>&1 | tail -2
+          colima start --vm-type qemu --cpu 3 --memory 5 --disk 80 2>&1 | tail -8
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: latest on aarch64 (bundle, CPU inference, imports)
+        run: bash .github/staging/latest_check.sh "$IMAGE" aarch64 "$REV" 0
+      - name: Host disk after
+        if: always()
+        run: df -g / | tail -1; colima stop 2>/dev/null || true
