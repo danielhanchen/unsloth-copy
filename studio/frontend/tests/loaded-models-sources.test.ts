@@ -531,3 +531,49 @@ test("the announced row yields once that same model is resident", () => {
   assert.equal(rows.length, 1);
   assert.notEqual(rows[0].loading, true);
 });
+
+test("an nvfp4 image row names the kernel backend that served it", () => {
+  const [flashinfer] = describeDiffusionStatus({
+    loaded: true,
+    repo_id: "unsloth/Z-Image-Turbo-NVFP4",
+    family: "z-image",
+    transformer_quant: "nvfp4",
+    transformer_quant_backend: "flashinfer",
+    dtype: "bfloat16",
+    device: "cuda",
+  } as never);
+  assert.equal(flashinfer.detail, "z-image · NVFP4 · FlashInfer · cuda");
+
+  const [torchao] = describeDiffusionStatus({
+    loaded: true,
+    repo_id: "unsloth/Z-Image-Turbo-NVFP4",
+    family: "z-image",
+    transformer_quant: "nvfp4",
+    transformer_quant_backend: "torchao",
+    dtype: "bfloat16",
+    device: "cuda",
+  } as never);
+  assert.equal(torchao.detail, "z-image · NVFP4 · torchao · cuda");
+});
+
+test("a row without a quant backend is unchanged, on old and new backends alike", () => {
+  const [fp8] = describeDiffusionStatus({
+    loaded: true,
+    repo_id: "unsloth/Z-Image-Turbo",
+    family: "z-image",
+    transformer_quant: "fp8",
+    transformer_quant_backend: null,
+    dtype: "bfloat16",
+    device: "cuda",
+  } as never);
+  assert.equal(fp8.detail, "z-image · FP8 · cuda");
+  const [old] = describeDiffusionStatus({
+    loaded: true,
+    repo_id: "unsloth/Z-Image-Turbo",
+    family: "z-image",
+    transformer_quant: "fp8",
+    dtype: "bfloat16",
+    device: "cuda",
+  } as never);
+  assert.equal(old.detail, "z-image · FP8 · cuda");
+});
