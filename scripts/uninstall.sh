@@ -343,6 +343,25 @@ _remove_path() {
     fi
 }
 
+# An install lock, and only an install lock.
+#
+# prebuilt_core.install_lock creates these with os.open(O_CREAT | O_EXCL) and writes a pid, so
+# the lock is always a regular file. _remove_path is rm -rf, which in a user-chosen master root
+# would take a whole tree that merely happens to be named .node.install.lock -- a name the user
+# owns as much as any other, since the root is theirs. Nothing outside these fixed names reaches
+# here, so the test costs nothing and removes the one shape we never meant to delete.
+#
+# A symlink is unlinked rather than followed: -f is true for a link to a file, and rm on the link
+# takes the link.
+_remove_lock_file() {
+    _rlf="$1"
+    if [ -L "$_rlf" ] || [ -f "$_rlf" ]; then
+        _remove_path "$_rlf"
+    elif [ -e "$_rlf" ]; then
+        echo "  keeping non-file at an install-lock path: $_rlf" >&2
+    fi
+}
+
 # $1 override, $2 default. A relative override is invalid per XDG and dropped by dirs (which
 # Tauri resolves through), so honouring one would spare the real data and rm -rf under our cwd.
 _xdg_dir() {
@@ -464,6 +483,32 @@ _custom_studio_data_dirs() {
 #   3. Env-mode studio.conf at $<root>/share/studio.conf (discovered via 1)
 # install.sh writes UNSLOTH_EXE='<root>/unsloth_studio/bin/unsloth', so the install root is three
 # dirnames up. Each discovered non-default root is printed on its own line, de-duplicated.
+# The master root UNSLOTH_HOME names, or empty. studio/ is its child and llama.cpp, node and
+# whisper.cpp are its other children, so removing the Studio root alone strands them. Stripped
+# and tilde-expanded like storage_roots.unsloth_home() and studio/setup.sh, or a padded value
+# would name a directory neither install nor uninstall agrees on.
+_master_root() {
+    _mr=$(printf '%s' "${UNSLOTH_HOME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_mr" ] || return 0
+    # shellcheck disable=SC2088
+    case "$_mr" in
+        "~") _mr="$HOME" ;;
+        "~/"*) _mr="$HOME/${_mr#'~/'}" ;;
+    esac
+    # shellcheck disable=SC1007
+    # || _mr_canon="": a bare assignment takes the substitution's exit status, and this script
+    # runs under set -e. A root that is already gone, or on a disconnected drive, is the ordinary
+    # case here -- a second uninstall, a portable install on an unplugged disk -- and without the
+    # guard it killed the whole run before any of the rest of the cleanup. Ordinary bash hides
+    # this by clearing errexit inside command substitution; dash and `sh` in POSIX mode, which
+    # is what the advertised `| sh` one-liner uses on Debian, Ubuntu and WSL, do not.
+    # setup.sh's master-root block already guards the same call this way.
+    _mr_canon=$(CDPATH= cd -P -- "$_mr" 2>/dev/null && pwd -P) || _mr_canon=""
+    [ -n "$_mr_canon" ] && _mr="$_mr_canon"
+    case "$_mr" in "$HOME/.unsloth"|/|"") return 0 ;; esac
+    printf '%s\n' "$_mr"
+}
+
 _custom_studio_roots() {
     # $1 = "lexical": skip the canonicalization (see the legacy sd.cpp sibling below). Reset on
     # every call, so a plain call is never affected by a preceding lexical one.
@@ -508,6 +553,11 @@ _custom_studio_roots() {
     elif [ -n "${STUDIO_HOME:-}" ]; then
         _emit "$STUDIO_HOME"
         _from_conf "$STUDIO_HOME/share/studio.conf"
+    elif [ -n "$(_master_root)" ]; then
+        # Last, as in storage_roots.studio_root(): UNSLOTH_HOME names the tree, and the two
+        # above name this exact directory, so either of them wins outright.
+        _emit "$(_master_root)/studio"
+        _from_conf "$(_master_root)/studio/share/studio.conf"
     fi
     # Default-mode conf.
     _from_conf "$HOME/.local/share/unsloth/studio.conf"
@@ -647,6 +697,41 @@ _unsloth_uninstall_main() {
             _remove_path "$_lex_sd_cpp"
         fi
     done
+    # The master root's own children. Marker-gated and deny-listed rather than removed outright
+    # like the ~/.unsloth ones below: <master> is a directory the user chose and may hold their
+    # files, so only a tree an Unsloth installer marked is ours to delete. The locks and .staging
+    # are ours by name (prebuilt_core.py) and carry no marker.
+    _mr_root="$(_master_root)"
+    if [ -n "$_mr_root" ]; then
+        if _is_unsafe_root "$_mr_root"; then
+            echo "  refusing to remove unsafe path: $_mr_root" >&2
+        else
+            for _mr_child in llama.cpp node whisper.cpp stable-diffusion.cpp; do
+                _mr_path="$_mr_root/$_mr_child"
+                if _is_unsafe_root "$_mr_path"; then
+                    echo "  refusing to remove unsafe path: $_mr_path" >&2
+                elif [ -e "$_mr_path" ] && [ ! -f "$_mr_path/.unsloth-studio-owned" ]; then
+                    echo "  keeping $_mr_child without Unsloth owner marker: $_mr_path" >&2
+                else
+                    _remove_path "$_mr_path"
+                fi
+            done
+            for _mr_lock in .llama.cpp.install.lock .node.install.lock \
+                    .whisper.cpp.install.lock .sd.cpp.install.lock; do
+                _remove_lock_file "$_mr_root/$_mr_lock"
+            done
+            # The prebuilt installers SHARE <root>/.staging and prune it only when empty, so
+            # anything left in it here is not ours. rmdir, not _remove_path: in a user-chosen
+            # root a recursive delete would take files an install was content to leave.
+            rmdir "$_mr_root/.staging" 2>/dev/null || true
+            for _mr_stale in "$_mr_root"/.*.install.lock.stale.*; do
+                [ -e "$_mr_stale" ] && _remove_lock_file "$_mr_stale"
+            done
+            # Only when nothing of the user's is left; rmdir refuses a non-empty directory.
+            rmdir "$_mr_root" 2>/dev/null || true
+        fi
+    fi
+    # end master-root children
     # Same gate as a custom root: an ungated run takes a hand-made ~/.unsloth/studio, and then
     # ~/.unsloth via the empty-dir prune below.
     # -e OR -L: -e follows a link and misses a dangling one, which _remove_path would still
@@ -687,14 +772,14 @@ _unsloth_uninstall_main() {
     _remove_path "$HOME/.unsloth/whisper.cpp"
     # Prebuilt install locks: every prebuilt serializes on <parent>/.<name>.install.lock
     # (prebuilt_core.py), and a stray lock keeps ~/.unsloth from being pruned below.
-    _remove_path "$HOME/.unsloth/.llama.cpp.install.lock"
-    _remove_path "$HOME/.unsloth/.node.install.lock"
-    _remove_path "$HOME/.unsloth/.whisper.cpp.install.lock"
+    _remove_lock_file "$HOME/.unsloth/.llama.cpp.install.lock"
+    _remove_lock_file "$HOME/.unsloth/.node.install.lock"
+    _remove_lock_file "$HOME/.unsloth/.whisper.cpp.install.lock"
     # Taking over an abandoned lock renames it to .stale.<pid> before unlinking
     # (install_node_prebuilt.py); a crash between the two strands the rename, and a stranded one
     # blocks the rmdir below. Unmatched globs stay literal, hence the existence test.
     for _stale in "$HOME"/.unsloth/.*.install.lock.stale.*; do
-        [ -e "$_stale" ] && _remove_path "$_stale"
+        [ -e "$_stale" ] && _remove_lock_file "$_stale"
     done
     # ROCm-on-WSL helper artifacts (librocdxg clone, smoke-test venv); removing them frees the rmdir.
     _remove_path "$HOME/.unsloth/librocdxg"
