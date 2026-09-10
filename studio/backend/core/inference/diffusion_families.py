@@ -173,6 +173,8 @@ _FAMILIES: tuple[DiffusionFamily, ...] = (
         prequant_repos = (
             ("int8", "unsloth/FLUX.1-schnell-FP8"),
             ("fp8", "unsloth/FLUX.1-schnell-FP8"),
+            # Per-layer policy ``flux_mod_single_v1`` with baked activation scales, gated on schnell only.
+            ("nvfp4", "unsloth/FLUX.1-schnell-NVFP4"),
         ),
         # Checkpoints baked from the dev / Krea-dev weights (same arch, different weights); without these every
         # int8/fp8 load pays the dense download + on-the-fly quantise.
@@ -339,6 +341,9 @@ _FAMILIES: tuple[DiffusionFamily, ...] = (
         prequant_repos = (
             ("int8", "unsloth/Z-Image-Turbo-FP8"),
             ("fp8", "unsloth/Z-Image-Turbo-FP8"),
+            # Per-layer policy ``zimg_f8mod_toq34_v1``, GPTQ-corrected on the 4-bit operand, baked activation
+            # scales. The plain RTN build of the same policy is hosted alongside for A/B only.
+            ("nvfp4", "unsloth/Z-Image-Turbo-NVFP4"),
         ),
         # Both hosted checkpoints are baked from the distilled Turbo transformer, so the undistilled base has none and
         # must quantize its own dense weights.
