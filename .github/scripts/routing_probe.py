@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -83,7 +84,7 @@ SCENARIOS = {
     },
     "legacy_studio_home_env": {"env": {"UNSLOTH_STUDIO_HOME": "$HOME/oldstudio"},
                                "mkdir": ["oldstudio/cache"]},
-    "legacy_STUDIO_HOME_env": {"env": {"STUDIO_HOME": "$HOME/oldstudio2"},
+    "legacy_studio_home_alias": {"env": {"STUDIO_HOME": "$HOME/oldstudio2"},
                                "mkdir": ["oldstudio2/cache"]},
     "user_set_hf_home": {"env": {"HF_HOME": "$HOME/myhf"}, "mkdir": ["myhf/hub"]},
     "warm_caches_everywhere": {
@@ -93,6 +94,18 @@ SCENARIOS = {
     },
     "blank_overrides": {"env": {"UNSLOTH_HOME": "", "UNSLOTH_STUDIO_HOME": "", "HF_HOME": ""}},
 }
+
+
+def _fold_home(payload: dict, home: Path) -> dict:
+    """Replace the per-revision synthetic HOME with a token, whatever case the host reports."""
+    blob = json.dumps(payload)
+    for form in (str(home).replace("\\", "\\\\"), str(home)):
+        if not form:
+            continue
+        pattern = re.compile(re.escape(form), re.IGNORECASE)
+        blob = pattern.sub(lambda _m: "$HOME", blob)
+    # Separators too: the same directory is D:\\a\\x here and D:/a/x elsewhere.
+    return json.loads(blob.replace("\\\\", "/"))
 
 
 def probe(tree: Path, home: Path, extra_env: dict) -> dict:
@@ -136,9 +149,13 @@ def main() -> int:
             got = probe(tree, home, env)
             # The synthetic HOME differs per revision, so it is folded to a token before any
             # comparison; otherwise every path would "differ".
-            blob = json.dumps(got).replace(str(home).replace("\\", "\\\\"), "$HOME")
-            blob = blob.replace(str(home), "$HOME")
-            results[scenario][rev] = json.loads(blob)
+            #
+            # Case-insensitively, and on the JSON-escaped form as well as the plain one. On
+            # Windows Path.resolve() returns the directory's REAL on-disk case, which is not
+            # necessarily the case this script created it with, and a fold that missed made
+            # every path in that scenario read as moved. That is a measurement bug that looks
+            # exactly like the regression this job exists to catch, so it is worth the care.
+            results[scenario][rev] = _fold_home(got, home)
 
     (OUT / "routing.json").write_text(json.dumps(results, indent = 1, sort_keys = True))
 
