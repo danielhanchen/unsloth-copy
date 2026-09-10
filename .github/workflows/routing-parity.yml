@@ -1,0 +1,70 @@
+name: Routing parity vs v0.1.701-beta
+
+# Does an existing install's data move when it upgrades?
+#
+# The question this answers is the maintainer's, verbatim: will this "break old users who
+# already have unsloth and when updating, it'll re-download the caches". So it runs the REAL
+# resolver from three revisions against identical synthetic fixtures and diffs the answers:
+#
+#   OLD   v0.1.701-beta, the shipped desktop release
+#   BASE  upstream main, the merge base
+#   HEAD  this PR
+#
+# A move of a USER-DATA path (databases, auth, projects, exports, models) fails the job. A move
+# of a regenerable cache is reported and allowed, because that is what the PR is for.
+#
+# env -i is not optional: the runner's own XDG_CACHE_HOME / HF_HOME / UV_CACHE_DIR would be
+# inherited by all three revisions equally and mask a default that moved.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["pr-10597-routing"]
+
+jobs:
+  routing:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, macos-15, windows-latest, ubuntu-22.04, macos-13]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the one third-party import the resolver needs
+        run: python -m pip install --disable-pip-version-check structlog
+
+      - name: Fetch the old release and upstream main
+        shell: bash
+        run: |
+          set -eu
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --no-tags --depth 1 upstream refs/tags/v0.1.701-beta:refs/heads/oldrel
+          git fetch --no-tags --depth 1 upstream main:refs/heads/upstream-main
+          git worktree add ../oldrel oldrel
+          git worktree add ../basemain upstream-main
+          echo "OLD  $(git -C ../oldrel rev-parse --short HEAD)"
+          echo "BASE $(git -C ../basemain rev-parse --short HEAD)"
+          echo "HEAD $(git rev-parse --short HEAD)"
+
+      - name: Probe every revision
+        shell: bash
+        run: python .github/scripts/routing_probe.py
+
+      - name: Time a disk reading
+        shell: bash
+        run: python .github/scripts/disk_timing.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-${{ matrix.os }}
+          path: routing-out/
+          if-no-files-found: warn
