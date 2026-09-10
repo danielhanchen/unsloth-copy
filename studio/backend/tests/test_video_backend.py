@@ -7836,7 +7836,9 @@ def test_dense_quant_replan_uses_the_scaled_text_encoder(fake_runtime, monkeypat
     scale, text_encoder_gb, transformer_gb, vae_gb = _shared_setup_9(monkeypatch)
     monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
     monkeypatch.setattr(
-        video_mod, "select_transformer_quant_scheme", lambda target, mode, family = None: "int8"
+        video_mod,
+        "select_transformer_quant_scheme",
+        lambda target, mode, family = None, **_kw: "int8",
     )
     monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: None)
     # Force the first plan to offload so the re-plan branch runs.
@@ -8256,7 +8258,7 @@ def test_unified_memory_refuses_on_the_dense_peak_even_when_a_quant_is_requested
     monkeypatch.setattr(video_mod, "resolve_diffusion_device_target", lambda: target)
     monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda t: True)
     monkeypatch.setattr(
-        video_mod, "select_transformer_quant_scheme", lambda t, q, family = None: "fp8"
+        video_mod, "select_transformer_quant_scheme", lambda t, q, family = None, **_kw: "fp8"
     )
     # An integrated CUDA device: 48 GiB shared, so LTX-2's ~65 GB of dense weights cannot fit even
     # though the fp8 steady size would.
@@ -8895,3 +8897,328 @@ def test_h3_generate_non_oom_error_leaves_the_graphs_alone(fake_runtime):
     with pytest.raises(RuntimeError, match = "shape mismatch"):
         backend.generate(prompt = "a fox", steps = 4)
     assert handle.resets == 0
+
+
+
+
+def _stub_denoiser_seed(
+    monkeypatch,
+    *,
+    scheme = "nvfp4",
+    components = ("transformer", "transformer_2"),
+    seeded = True,
+    repo = "unsloth/Wan2.2-T2V-A14B-NVFP4",
+    plan_scheme = "nvfp4",
+):
+    """Stub the whole seeding route: plan-time scheme, registry lookup and checkpoint load."""
+    import core.inference.video as video_mod
+    import core.inference.video_denoiser_prequant as dq
+
+    if plan_scheme is not None:
+        monkeypatch.setattr(video_mod, "_video_auto_denoiser_scheme", lambda fam, **kw: plan_scheme)
+    source = types.SimpleNamespace(
+        kind = "repo", location = repo, filename = "x.pt", fallback_filename = None
+    )
+    monkeypatch.setattr(
+        dq, "denoiser_prequant_sources", lambda fam, s, base: {c: source for c in components}
+    )
+    modules = {c: object() for c in components}
+    calls = []
+
+    def _fake_pipe_kwargs(fam, base, **kwargs):
+        calls.append({"base": base, **kwargs})
+        return dict(modules) if seeded else {}
+
+    monkeypatch.setattr(dq, "denoiser_prequant_pipe_kwargs", _fake_pipe_kwargs)
+    return calls, modules
+
+
+def test_wan_a14b_prequant_seeds_both_dits_instead_of_quantising_them(fake_runtime, monkeypatch):
+    """The prequant twin of ``test_wan_a14b_dense_quant_applies_to_both_dits``."""
+    import core.inference.video as video_mod
+
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    quantised = []
+
+    def _fake_quant(
+        view,
+        target,
+        *,
+        mode,
+        family,
+        logger = None,
+    ):
+        quantised.append(view.transformer)
+        return "int8"
+
+    monkeypatch.setattr(video_mod, "quantize_transformer", _fake_quant)
+    calls, modules = _stub_denoiser_seed(monkeypatch)
+
+    backend = VideoBackend()
+    status = backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+
+    assembled = _FakeWanPipelineSingle.last
+    assert assembled["transformer"] is modules["transformer"]
+    assert assembled["transformer_2"] is modules["transformer_2"]
+    assert quantised == [], "a seeded DiT must not be quantised again"
+    assert status["transformer_quant"] == "nvfp4"
+    resolved = status["resolved"]["transformer_quant"]
+    assert "unsloth/Wan2.2-T2V-A14B-NVFP4" in resolved["reason"]
+    assert resolved["requested"] == "nvfp4" and resolved["value"] == "nvfp4"
+    assert resolved["status"] == "applied"
+    assert calls and calls[0]["scheme"] == "nvfp4"
+
+
+def test_a_checkpoint_that_will_not_load_falls_back_to_the_dense_quant(fake_runtime, monkeypatch):
+    import core.inference.video as video_mod
+
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    quantised = []
+
+    def _fake_quant(
+        view,
+        target,
+        *,
+        mode,
+        family,
+        logger = None,
+    ):
+        quantised.append(view.transformer)
+        return "nvfp4"
+
+    monkeypatch.setattr(video_mod, "quantize_transformer", _fake_quant)
+    _stub_denoiser_seed(monkeypatch, seeded = False)
+
+    backend = VideoBackend()
+    status = backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+    pipe = backend._state.pipe
+    assert quantised == [pipe.transformer, pipe.transformer_2]
+    assert status["transformer_quant"] == "nvfp4"
+    assert "unsloth/" not in status["resolved"]["transformer_quant"]["reason"]
+
+
+def test_seeding_is_skipped_entirely_under_offload(fake_runtime, monkeypatch):
+    import core.inference.video as video_mod
+
+    monkeypatch.setenv("UNSLOTH_DIFFUSION_ALLOW_PRECISION_FALLBACK", "1")
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: None)
+    calls, _modules = _stub_denoiser_seed(monkeypatch)
+    real_plan = video_mod.plan_diffusion_memory
+    monkeypatch.setattr(
+        video_mod,
+        "plan_diffusion_memory",
+        lambda **kwargs: dataclasses.replace(real_plan(**kwargs), offload_policy = "model"),
+    )
+    _stub_apply_memory_plan(monkeypatch, video_mod)
+
+    backend = VideoBackend()
+    status = backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+    assert calls == [], "no checkpoint may be fetched for a load that cannot keep it resident"
+    assert status["transformer_quant"] is None
+    assert "moves the DiT" in status["resolved"]["transformer_quant"]["reason"]
+
+
+def _plans_for(monkeypatch, video_mod):
+    """Every ``model_dense_mib`` the memory planner was asked to judge, in order."""
+    real_plan = video_mod.plan_diffusion_memory
+    seen: list = []
+
+    def _record(**kwargs):
+        seen.append(kwargs.get("model_dense_mib"))
+        return real_plan(**kwargs)
+
+    monkeypatch.setattr(video_mod, "plan_diffusion_memory", _record)
+    return seen
+
+
+def test_the_memory_plan_prices_a_seeded_denoiser_at_the_measured_row(fake_runtime, monkeypatch):
+    """The memory plan prices a seeded denoiser at the measured row, not the dense term."""
+    import core.inference.video as video_mod
+
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: None)
+    monkeypatch.setattr(video_mod, "video_family_prequant_resident_gb", lambda fam, scheme: 8.0)
+    _stub_denoiser_seed(monkeypatch)
+    seen = _plans_for(monkeypatch, video_mod)
+
+    backend = VideoBackend()
+    backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+    fam = _detect_load_family("Wan-AI/Wan2.2-T2V-A14B-Diffusers", None, None)
+    mib_per_gb = 1000.0**3 / (1024.0 * 1024.0)
+    companions = fam.bf16_components_gb[1] + fam.bf16_components_gb[2]
+    assert seen == [int((8.0 + companions) * mib_per_gb)]
+    assert seen[0] < int((fam.bf16_components_gb[0] + companions) * mib_per_gb)
+
+
+def test_a_failed_seed_replans_at_bf16_and_refuses_again(fake_runtime, monkeypatch):
+    """The artifact-sized budget is valid only once the checkpoint is in hand."""
+    import core.inference.video as video_mod
+
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: "nvfp4")
+    monkeypatch.setattr(video_mod, "video_family_prequant_resident_gb", lambda fam, scheme: 8.0)
+    _stub_denoiser_seed(monkeypatch, seeded = False)
+    seen = _plans_for(monkeypatch, video_mod)
+    refusals: list = []
+    monkeypatch.setattr(
+        video_mod,
+        "raise_on_unified_memory_shortfall",
+        lambda plan, family = None, logger = None: refusals.append(
+            plan.model_dense_mib if hasattr(plan, "model_dense_mib") else None
+        ),
+    )
+
+    backend = VideoBackend()
+    backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+    fam = _detect_load_family("Wan-AI/Wan2.2-T2V-A14B-Diffusers", None, None)
+    mib_per_gb = 1000.0**3 / (1024.0 * 1024.0)
+    companions = fam.bf16_components_gb[1] + fam.bf16_components_gb[2]
+    assert seen == [
+        int((8.0 + companions) * mib_per_gb),
+        int((fam.bf16_components_gb[0] + companions) * mib_per_gb),
+    ]
+    assert len(refusals) == 2
+
+
+def test_the_planned_scheme_is_what_the_load_seeds(fake_runtime, monkeypatch):
+    """The scheme the plan committed to is the one the load seeds."""
+    import core.inference.video as video_mod
+
+    monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: None)
+    calls, _modules = _stub_denoiser_seed(monkeypatch, plan_scheme = None)
+    monkeypatch.setattr(video_mod, "_video_auto_denoiser_scheme", lambda fam, **kw: None)
+
+    backend = VideoBackend()
+    status = backend.load_pipeline(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+        _video_auto_denoiser_planned = "nvfp4",
+    )
+    assert [c["scheme"] for c in calls] == ["nvfp4"]
+    assert status["transformer_quant"] == "nvfp4"
+
+
+_A14B_SIBLINGS = [
+    _sibling("model_index.json", 10),
+    _sibling("transformer/config.json", 1),
+    _sibling("transformer/diffusion_pytorch_model-00001-of-00002.safetensors", 14),
+    _sibling("transformer/diffusion_pytorch_model-00002-of-00002.safetensors", 14),
+    _sibling("transformer_2/config.json", 1),
+    _sibling("transformer_2/diffusion_pytorch_model-00001-of-00002.safetensors", 14),
+    _sibling("transformer_2/diffusion_pytorch_model-00002-of-00002.safetensors", 14),
+    _sibling("text_encoder/model-00001-of-00001.safetensors", 11),
+    _sibling("vae/diffusion_pytorch_model.safetensors", 3),
+    _sibling("scheduler/scheduler_config.json", 1),
+]
+
+
+def test_base_download_files_drops_both_experts_and_keeps_both_configs():
+    """A seeded MoE drops both experts' dense shards and keeps both configs."""
+    info = types.SimpleNamespace(siblings = _A14B_SIBLINGS)
+
+    dense = dict(VideoBackend._base_download_files(info, "pipeline"))
+    seeded = dict(
+        VideoBackend._base_download_files(
+            info,
+            "pipeline",
+            skip_transformer_weights = True,
+            skip_transformer_components = ("transformer", "transformer_2"),
+        )
+    )
+    assert not any(n.endswith(".safetensors") and n.startswith("transformer") for n in seeded)
+    assert seeded["transformer/config.json"] == 1
+    assert seeded["transformer_2/config.json"] == 1
+    assert seeded["text_encoder/model-00001-of-00001.safetensors"] == 11
+    assert sum(dense.values()) - sum(seeded.values()) == 56
+
+
+def test_base_download_files_keeps_the_h3_partition_default():
+    info = types.SimpleNamespace(siblings = _H3_SIBLINGS)
+    references = dict(
+        VideoBackend._base_download_files(
+            info, "pipeline", skip_transformer_weights = True, h3_task = "ref2va"
+        )
+    )
+    assert not any(n.startswith("transformer_ref/diffusion_pytorch_model") for n in references)
+    assert "transformer_ref/config.json" in references
+
+
+def test_the_download_plan_stages_both_experts_artifacts(monkeypatch):
+    """The download plan stages both experts' artifacts."""
+    import core.inference.video_denoiser_prequant as dq
+
+    _plan_api(
+        monkeypatch,
+        {
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers": [
+                _PlanSibling("model_index.json", 1000),
+                _PlanSibling("transformer/config.json", 1000),
+                _PlanSibling("transformer/diffusion_pytorch_model.safetensors", 28_000_000_000),
+                _PlanSibling("transformer_2/config.json", 1000),
+                _PlanSibling("transformer_2/diffusion_pytorch_model.safetensors", 28_000_000_000),
+                _PlanSibling("text_encoder/model-00001-of-00001.safetensors", 11_000_000_000),
+                _PlanSibling("vae/diffusion_pytorch_model.safetensors", 500_000_000),
+            ],
+            "unsloth/Wan2.2-T2V-A14B-NVFP4": [
+                _PlanSibling("Wan2.2-T2V-A14B-NVFP4.pt", 8_000_000_000),
+                _PlanSibling("Wan2.2-T2V-A14B-transformer_2-NVFP4.pt", 8_100_000_000),
+            ],
+        },
+    )
+    sources = {
+        "transformer": types.SimpleNamespace(
+            kind = "repo",
+            location = "unsloth/Wan2.2-T2V-A14B-NVFP4",
+            filename = "Wan2.2-T2V-A14B-NVFP4.pt",
+            fallback_filename = None,
+        ),
+        "transformer_2": types.SimpleNamespace(
+            kind = "repo",
+            location = "unsloth/Wan2.2-T2V-A14B-NVFP4",
+            filename = "Wan2.2-T2V-A14B-transformer_2-NVFP4.pt",
+            fallback_filename = None,
+        ),
+    }
+    monkeypatch.setattr(dq, "denoiser_prequant_sources", lambda fam, scheme, base: sources)
+
+    plan = VideoBackend().download_plan(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        model_kind = "pipeline",
+        transformer_quant = "nvfp4",
+    )
+
+    staged = {f for e in plan["entries"] for f in e["files"]}
+    assert "Wan2.2-T2V-A14B-NVFP4.pt" in staged
+    assert "Wan2.2-T2V-A14B-transformer_2-NVFP4.pt" in staged
+    assert not any(
+        f.endswith("diffusion_pytorch_model.safetensors") and f.startswith("transformer")
+        for f in staged
+    )
+    assert "transformer/config.json" in staged and "transformer_2/config.json" in staged
+    assert (
+        plan["required_bytes"]
+        == 8_000_000_000 + 8_100_000_000 + 1000 * 3 + 11_000_000_000 + 500_000_000
+    )
