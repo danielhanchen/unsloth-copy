@@ -1,0 +1,32 @@
+name: "staging-10526 sbpl utf8"
+on:
+  push:
+    branches: ["pr-10526-sbpl-utf8"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python sbpl_utf8_check.py
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_sandbox_macos.py studio/backend/tests/test_sandbox_probe.py studio/backend/tests/test_tool_sandbox_wiring.py studio/backend/tests/test_bypass_permissions.py -q --tb=line || true
