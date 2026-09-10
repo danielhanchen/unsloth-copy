@@ -4745,3 +4745,5 @@ if (
         transformers.integrations.bitsandbytes.should_convert_module = patched_should_convert_module
     except Exception:
         pass
+
+# probe: staging path-filter check a
