@@ -1,0 +1,1055 @@
+{
+  "pr": 10528,
+  "head_ref": "studio-cache-management",
+  "base_sha": "191b69c12b4434b5247f1fd7a455b4a760b169ae",
+  "head_sha": "93b1c126bd72a675decaef62f6f02874b80eab78",
+  "scene": "pr10528_all_routes",
+  "ports": {
+    "BEFORE": 8994,
+    "AFTER": 8997
+  },
+  "expects": {
+    "control:/chat": "IDENTICAL halves. /chat is a shell route the PR adds nothing to; with real disk figures no toast is armed, so the composer, the sidebar and the navbar must look the same on both sides. A difference here is contamination, not a finding.",
+    "control:/studio": "IDENTICAL halves. The Train workspace; the PR touches no training UI.",
+    "control:/images": "IDENTICAL halves. The PR touches no image UI.",
+    "control:/audio": "IDENTICAL halves. The PR touches no audio UI.",
+    "control:/video": "IDENTICAL halves. The PR touches no video UI.",
+    "control:/hub": "IDENTICAL halves. The only backend change that reaches the Hub is DownloadRegistry._purging, which refuses a claim WHILE a cache purge is running. The scene never purges, so the Hub must be unchanged; that guard is a concurrency property, not a visible one.",
+    "control:/projects": "IDENTICAL halves.",
+    "control:/export": "IDENTICAL halves.",
+    "control:/data-recipes": "IDENTICAL halves.",
+    "control:/api-monitor": "IDENTICAL halves.",
+    "control:/login": "IDENTICAL halves, from an UNAUTHENTICATED context. /login carries staticData.isAuthFlow, and the shell mounts LowDiskNoticeMount behind `!isAuthFlowRoute`, so this route is the one place the PR is structurally incapable of showing anything.",
+    "control:settings-resources": "THE ONE CONTROL-PASS PAIR THAT MUST DIFFER. Settings -> Resources with real disk figures. BEFORE the Storage section ends after 'System disk' and 'Models folder'. AFTER a third row 'Cache files' is under them, reading '<total> in caches, of which <reclaimable> can be cleared now.', with Recheck / Details / Clear caches. Nothing is ever clicked that deletes anything.",
+    "toast:/chat": "BEFORE: no toast, at all, ever -- the merge base has no low-disk notice to mount. AFTER: a sonner warning toast, top-right, titled 'Disk space is running low' (NOT 'critically low' -- 12.4 GB is above the 5 GB critical line), describing '12.4 GB free of <total>. Clearing caches can free space.' with a 'Review caches' action button.",
+    "toast:/studio": "Same toast as toast:/chat, on the Train route. This is the whole point of mounting the notice in __root.tsx instead of on /studio: it is NOT a training-only warning.",
+    "toast:/images": "Same toast, over the Images workspace.",
+    "toast:/audio": "Same toast, over the Audio workspace.",
+    "toast:/video": "Same toast, over the Video workspace.",
+    "toast:/hub": "Same toast, over the Model Hub.",
+    "toast:/projects": "Same toast, over Projects.",
+    "toast:/export": "Same toast, over Export.",
+    "toast:/data-recipes": "Same toast, over Data recipes.",
+    "toast:/api-monitor": "Same toast, over the API monitor.",
+    "toast:/login": "NO TOAST ON EITHER HALF, with the same stub armed and the same 45 s window given as every shell route gets. If a toast appears here the PR leaks a warning into the login screen. AMENDED AFTER THE SMOKE RUN, and the amendment weakens the claim, so it is recorded rather than quietly folded in: the first draft said this pair isolates the `!isAuthFlowRoute` gate. It does not. The smoke run measured `system_requests_login: 0` -- an unauthenticated /login never calls /api/system at all, so the stub is armed and never consulted, and TWO independent reasons keep the toast away. The pair still proves the observable ('nothing appears on the login screen'); it does not attribute that to the gate. The gate is read from __root.tsx instead.",
+    "toast:settings-resources": "The toast fires OVER the open settings dialog. BEFORE: the dialog with a two-row Storage section and no toast. AFTER: the same dialog now showing the Cache files row, with the low-disk toast above it -- the two halves of the feature in one frame.",
+    "search:purge": "Settings dialog, the sidebar search box, query 'purge'. BEFORE: 'No results' -- 'purge' appears in no settings label on the merge base. AFTER: a Resources group with a 'Cache files' result, because the PR adds settings.resources.storage.caches.label to SETTINGS_SEARCH_INDEX and a keywords string containing 'purge', 'prune', 'uv', 'pip', 'triton' and 'xet' to SETTINGS_SEARCH_KEYWORDS."
+  },
+  "facts": {
+    "BEFORE": {
+      "stub_free_gb": 12.4,
+      "caches_endpoint_status": 404,
+      "control:/chat": {
+        "requested": "/chat",
+        "pathname": "/chat",
+        "redirected": false,
+        "title": "Chat - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/studio": {
+        "requested": "/studio",
+        "pathname": "/studio",
+        "redirected": false,
+        "title": "Train - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/images": {
+        "requested": "/images",
+        "pathname": "/images",
+        "redirected": false,
+        "title": "Images - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/audio": {
+        "requested": "/audio",
+        "pathname": "/audio",
+        "redirected": false,
+        "title": "Audio - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/video": {
+        "requested": "/video",
+        "pathname": "/video",
+        "redirected": false,
+        "title": "Video - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/hub": {
+        "requested": "/hub",
+        "pathname": "/hub",
+        "redirected": false,
+        "title": "Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/projects": {
+        "requested": "/projects",
+        "pathname": "/projects",
+        "redirected": false,
+        "title": "Projects - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/export": {
+        "requested": "/export",
+        "pathname": "/export",
+        "redirected": false,
+        "title": "Export - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/data-recipes": {
+        "requested": "/data-recipes",
+        "pathname": "/data-recipes",
+        "redirected": false,
+        "title": "Data Recipes - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/api-monitor": {
+        "requested": "/api-monitor",
+        "pathname": "/api-monitor",
+        "redirected": false,
+        "title": "API - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:settings-resources": {
+        "storage_section_text_chars": 170,
+        "cache_files_row": false,
+        "details_button": false,
+        "base_rows_present": true
+      },
+      "search:purge": {
+        "no_results": false,
+        "cache_files_hit": false,
+        "dialog_text_chars": 1066
+      },
+      "system_requests_control_pass": 7,
+      "real_disk_free_gb": 1022.67,
+      "real_disk_total_gb": 2079.11,
+      "toast:/chat": {
+        "requested": "/chat",
+        "pathname": "/chat",
+        "redirected": false,
+        "title": "Chat - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/studio": {
+        "requested": "/studio",
+        "pathname": "/studio",
+        "redirected": false,
+        "title": "Train - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/images": {
+        "requested": "/images",
+        "pathname": "/images",
+        "redirected": false,
+        "title": "Images - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/audio": {
+        "requested": "/audio",
+        "pathname": "/audio",
+        "redirected": false,
+        "title": "Audio - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/video": {
+        "requested": "/video",
+        "pathname": "/video",
+        "redirected": false,
+        "title": "Video - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/hub": {
+        "requested": "/hub",
+        "pathname": "/hub",
+        "redirected": false,
+        "title": "Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/projects": {
+        "requested": "/projects",
+        "pathname": "/projects",
+        "redirected": false,
+        "title": "Projects - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/export": {
+        "requested": "/export",
+        "pathname": "/export",
+        "redirected": false,
+        "title": "Export - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/data-recipes": {
+        "requested": "/data-recipes",
+        "pathname": "/data-recipes",
+        "redirected": false,
+        "title": "Data Recipes - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/api-monitor": {
+        "requested": "/api-monitor",
+        "pathname": "/api-monitor",
+        "redirected": false,
+        "title": "API - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:settings-resources": {
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "system_requests_toast_pass": 19,
+      "control:/login": {
+        "pathname": "/login",
+        "title": "Login - Unsloth",
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/login": {
+        "pathname": "/login",
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "system_requests_login": 0,
+      "routes_redirected": [],
+      "toast_routes_with_toast": [],
+      "control_routes_with_toast": [],
+      "shot_names": [
+        "before_01_control_chat.png",
+        "before_02_control_studio.png",
+        "before_03_control_images.png",
+        "before_04_control_audio.png",
+        "before_05_control_video.png",
+        "before_06_control_hub.png",
+        "before_07_control_projects.png",
+        "before_08_control_export.png",
+        "before_09_control_data-recipes.png",
+        "before_10_control_api-monitor.png",
+        "before_11_control_settings-resources.png",
+        "before_12_search_purge.png",
+        "before_13_toast_chat.png",
+        "before_14_toast_studio.png",
+        "before_15_toast_images.png",
+        "before_16_toast_audio.png",
+        "before_17_toast_video.png",
+        "before_18_toast_hub.png",
+        "before_19_toast_projects.png",
+        "before_20_toast_export.png",
+        "before_21_toast_data-recipes.png",
+        "before_22_toast_api-monitor.png",
+        "before_23_toast_settings-resources.png",
+        "before_24_control_login.png",
+        "before_25_toast_login.png"
+      ]
+    },
+    "AFTER": {
+      "stub_free_gb": 12.4,
+      "caches_endpoint_status": 200,
+      "cache_present_count": 15,
+      "cache_total_gb": 765.56,
+      "cache_reclaimable_gb": 743.24,
+      "control:/chat": {
+        "requested": "/chat",
+        "pathname": "/chat",
+        "redirected": false,
+        "title": "Chat - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/studio": {
+        "requested": "/studio",
+        "pathname": "/studio",
+        "redirected": false,
+        "title": "Train - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/images": {
+        "requested": "/images",
+        "pathname": "/images",
+        "redirected": false,
+        "title": "Images - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/audio": {
+        "requested": "/audio",
+        "pathname": "/audio",
+        "redirected": false,
+        "title": "Audio - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/video": {
+        "requested": "/video",
+        "pathname": "/video",
+        "redirected": false,
+        "title": "Video - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/hub": {
+        "requested": "/hub",
+        "pathname": "/hub",
+        "redirected": false,
+        "title": "Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/projects": {
+        "requested": "/projects",
+        "pathname": "/projects",
+        "redirected": false,
+        "title": "Projects - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/export": {
+        "requested": "/export",
+        "pathname": "/export",
+        "redirected": false,
+        "title": "Export - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/data-recipes": {
+        "requested": "/data-recipes",
+        "pathname": "/data-recipes",
+        "redirected": false,
+        "title": "Data Recipes - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:/api-monitor": {
+        "requested": "/api-monitor",
+        "pathname": "/api-monitor",
+        "redirected": false,
+        "title": "API - Unsloth",
+        "toast_ms": null,
+        "toast_held": null,
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "control:settings-resources": {
+        "storage_section_text_chars": 269,
+        "cache_files_row": true,
+        "details_button": true,
+        "base_rows_present": true
+      },
+      "search:purge": {
+        "no_results": false,
+        "cache_files_hit": true,
+        "dialog_text_chars": 1169
+      },
+      "system_requests_control_pass": 14,
+      "real_disk_free_gb": 1022.67,
+      "real_disk_total_gb": 2079.11,
+      "toast:/chat": {
+        "requested": "/chat",
+        "pathname": "/chat",
+        "redirected": false,
+        "title": "Chat - Unsloth",
+        "toast_ms": 804,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/studio": {
+        "requested": "/studio",
+        "pathname": "/studio",
+        "redirected": false,
+        "title": "Train - Unsloth",
+        "toast_ms": 844,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/images": {
+        "requested": "/images",
+        "pathname": "/images",
+        "redirected": false,
+        "title": "Images - Unsloth",
+        "toast_ms": 648,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/audio": {
+        "requested": "/audio",
+        "pathname": "/audio",
+        "redirected": false,
+        "title": "Audio - Unsloth",
+        "toast_ms": 629,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/video": {
+        "requested": "/video",
+        "pathname": "/video",
+        "redirected": false,
+        "title": "Video - Unsloth",
+        "toast_ms": 1356,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/hub": {
+        "requested": "/hub",
+        "pathname": "/hub",
+        "redirected": false,
+        "title": "Unsloth",
+        "toast_ms": 955,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/projects": {
+        "requested": "/projects",
+        "pathname": "/projects",
+        "redirected": false,
+        "title": "Projects - Unsloth",
+        "toast_ms": 682,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/export": {
+        "requested": "/export",
+        "pathname": "/export",
+        "redirected": false,
+        "title": "Export - Unsloth",
+        "toast_ms": 757,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/data-recipes": {
+        "requested": "/data-recipes",
+        "pathname": "/data-recipes",
+        "redirected": false,
+        "title": "Data Recipes - Unsloth",
+        "toast_ms": 1497,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:/api-monitor": {
+        "requested": "/api-monitor",
+        "pathname": "/api-monitor",
+        "redirected": false,
+        "title": "API - Unsloth",
+        "toast_ms": 649,
+        "toast_held": true,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "toast:settings-resources": {
+        "toast_ms": 955,
+        "toast_held": false,
+        "toast_count": 1,
+        "toast_texts": [
+          "Disk space is running low\n12.4 GB free of 2079 GB. Clearing caches can free space.\nReview caches"
+        ],
+        "low_disk_toast": true,
+        "critical_disk_toast": false
+      },
+      "system_requests_toast_pass": 12,
+      "control:/login": {
+        "pathname": "/login",
+        "title": "Login - Unsloth",
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "toast:/login": {
+        "pathname": "/login",
+        "toast_count": 0,
+        "toast_texts": [],
+        "low_disk_toast": false,
+        "critical_disk_toast": false
+      },
+      "system_requests_login": 0,
+      "routes_redirected": [],
+      "toast_routes_with_toast": [
+        "toast:/api-monitor",
+        "toast:/audio",
+        "toast:/chat",
+        "toast:/data-recipes",
+        "toast:/export",
+        "toast:/hub",
+        "toast:/images",
+        "toast:/projects",
+        "toast:/studio",
+        "toast:/video",
+        "toast:settings-resources"
+      ],
+      "control_routes_with_toast": [],
+      "shot_names": [
+        "after_01_control_chat.png",
+        "after_02_control_studio.png",
+        "after_03_control_images.png",
+        "after_04_control_audio.png",
+        "after_05_control_video.png",
+        "after_06_control_hub.png",
+        "after_07_control_projects.png",
+        "after_08_control_export.png",
+        "after_09_control_data-recipes.png",
+        "after_10_control_api-monitor.png",
+        "after_11_control_settings-resources.png",
+        "after_12_search_purge.png",
+        "after_13_toast_chat.png",
+        "after_14_toast_studio.png",
+        "after_15_toast_images.png",
+        "after_16_toast_audio.png",
+        "after_17_toast_video.png",
+        "after_18_toast_hub.png",
+        "after_19_toast_projects.png",
+        "after_20_toast_export.png",
+        "after_21_toast_data-recipes.png",
+        "after_22_toast_api-monitor.png",
+        "after_23_toast_settings-resources.png",
+        "after_24_control_login.png",
+        "after_25_toast_login.png"
+      ]
+    }
+  },
+  "pairs": [
+    {
+      "key": "control_chat",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_chat_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 5907,
+      "max_delta": 253,
+      "bbox": [
+        509,
+        294,
+        1014,
+        378
+      ]
+    },
+    {
+      "key": "control_studio",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_studio_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_images",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_images_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_audio",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_audio_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_video",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_video_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_hub",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_hub_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 121,
+      "max_delta": 123,
+      "bbox": [
+        672,
+        257,
+        834,
+        824
+      ]
+    },
+    {
+      "key": "control_projects",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_projects_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_export",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_export_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 0,
+      "bbox": null
+    },
+    {
+      "key": "control_data-recipes",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_data-recipes_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 3,
+      "bbox": [
+        365,
+        318,
+        1355,
+        849
+      ]
+    },
+    {
+      "key": "control_api-monitor",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_api-monitor_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 46,
+      "max_delta": 217,
+      "bbox": [
+        518,
+        158,
+        526,
+        166
+      ]
+    },
+    {
+      "key": "control_settings-resources",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_settings-resources_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 48680,
+      "max_delta": 231,
+      "bbox": [
+        512,
+        40,
+        1166,
+        858
+      ]
+    },
+    {
+      "key": "search_purge",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_search_purge_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 49480,
+      "max_delta": 253,
+      "bbox": [
+        264,
+        40,
+        1166,
+        858
+      ]
+    },
+    {
+      "key": "toast_chat",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_chat_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 10248,
+      "max_delta": 254,
+      "bbox": [
+        699,
+        48,
+        1434,
+        338
+      ]
+    },
+    {
+      "key": "toast_studio",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_studio_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 4623,
+      "max_delta": 253,
+      "bbox": [
+        337,
+        8,
+        1434,
+        844
+      ]
+    },
+    {
+      "key": "toast_images",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_images_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 4605,
+      "max_delta": 253,
+      "bbox": [
+        1066,
+        48,
+        1434,
+        174
+      ]
+    },
+    {
+      "key": "toast_audio",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_audio_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 4814,
+      "max_delta": 253,
+      "bbox": [
+        1066,
+        8,
+        1434,
+        134
+      ]
+    },
+    {
+      "key": "toast_video",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_video_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 4605,
+      "max_delta": 253,
+      "bbox": [
+        1066,
+        48,
+        1434,
+        174
+      ]
+    },
+    {
+      "key": "toast_hub",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_hub_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 6761,
+      "max_delta": 253,
+      "bbox": [
+        356,
+        8,
+        1434,
+        751
+      ]
+    },
+    {
+      "key": "toast_projects",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_projects_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 8156,
+      "max_delta": 253,
+      "bbox": [
+        964,
+        8,
+        1434,
+        134
+      ]
+    },
+    {
+      "key": "toast_export",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_export_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 4605,
+      "max_delta": 253,
+      "bbox": [
+        1066,
+        8,
+        1434,
+        134
+      ]
+    },
+    {
+      "key": "toast_data-recipes",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_data-recipes_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 15290,
+      "max_delta": 253,
+      "bbox": [
+        365,
+        8,
+        1434,
+        849
+      ]
+    },
+    {
+      "key": "toast_api-monitor",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_api-monitor_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 6509,
+      "max_delta": 253,
+      "bbox": [
+        323,
+        8,
+        1434,
+        684
+      ]
+    },
+    {
+      "key": "toast_settings-resources",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_settings-resources_before_after.png",
+      "expected_identical": false,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 72151,
+      "max_delta": 252,
+      "bbox": [
+        512,
+        40,
+        1434,
+        858
+      ]
+    },
+    {
+      "key": "control_login",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_control_login_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 2,
+      "bbox": [
+        6,
+        0,
+        1440,
+        664
+      ]
+    },
+    {
+      "key": "toast_login",
+      "composite": "/mnt/disks/unslothai/daniel3/workspace_17/pr_ui_scenes/out/10528/pr10528_toast_login_before_after.png",
+      "expected_identical": true,
+      "verdict": "OK",
+      "same_size": true,
+      "strong_px": 0,
+      "max_delta": 6,
+      "bbox": [
+        0,
+        0,
+        1440,
+        664
+      ]
+    }
+  ],
+  "allowed_strong_px": {
+    "control_chat": 8000,
+    "control_hub": 400,
+    "control_api-monitor": 200
+  }
+}
