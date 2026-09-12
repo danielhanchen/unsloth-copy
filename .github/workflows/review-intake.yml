@@ -1,0 +1,39 @@
+name: ChatGPT read-only review intake
+run-name: ChatGPT metadata-only intake
+on:
+  push:
+    branches: ['chatgpt-review-intake-*']
+    paths: ['.github/workflows/review-intake.yml', 'intake.py']
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+concurrency:
+  group: chatgpt-readonly-review-intake
+  cancel-in-progress: false
+jobs:
+  intake:
+    if: github.repository == 'danielhanchen/unsloth-staging-2' && github.actor == 'danielhanchen'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Read the trusted helper revision only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Collect projected metadata without reading candidate source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I intake.py
+      - name: Export projected metadata only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chatgpt-review-intake-metadata
+          path: temp/intake-output/result.json
+          if-no-files-found: error
+          retention-days: 1
